@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentcli"
+version = "0.2.0"
+description = "Agentic CLI embedding toolkit — unify Claude Code, Codex, and GitHub Copilot CLI under one session-aware API (async, streaming, token tracking, drift observability)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "saintiron", email = "saintiron82@gmail.com" },
+]
+keywords = [
+    "claude-code", "codex", "copilot", "agentic-cli",
+    "llm", "ai-agent", "multi-agent", "subprocess", "streaming",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/sungchulJE/agentcli"
+Repository = "https://github.com/sungchulJE/agentcli"
+Issues = "https://github.com/sungchulJE/agentcli/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentcli"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "agentcli/",
+    "tests/",
+    "examples/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
