@@ -145,6 +145,17 @@ def test_materialize_re_overwrites_marker_file(tmpdir_path):
     assert "첫 버전" not in v2
 
 
+def test_materialize_same_profile_produces_stable_instruction_file(tmpdir_path):
+    p = AgentProfile(name="stable", instructions="같은 지시문")
+    p.materialize(tmpdir_path)
+    first = (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
+
+    p.materialize(tmpdir_path)
+    second = (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
+
+    assert second == first
+
+
 def test_materialize_copies_skills(tmpdir_path):
     """skills_dir → cwd/.agents/skills/"""
     profile_root = tmpdir_path / "profile-src"
@@ -260,6 +271,30 @@ def test_drift_records_hash_in_metadata(tmpdir_path):
     assert "AGENTS.md" in hashes
 
 
+def test_drift_not_recorded_on_failed_new_call(tmpdir_path):
+    class FailingProvider(RecordingProvider):
+        provider_id = "failrec"
+
+        def invoke(self, messages, *, model="", timeout=120, session_id="",
+                   cwd=None, alias=""):
+            return LLMResponse(content="", provider=self.provider_id, model=model)
+
+    p = FailingProvider()
+    store = MemoryStore()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order(["failrec"])
+    client = LLMClient(store=store, registry=reg)
+    (tmpdir_path / "AGENTS.md").write_text("v1 지시문", encoding="utf-8")
+
+    resp = client.chat("hi", provider="failrec", owner="team",
+                       alias="bull", cwd=str(tmpdir_path))
+
+    assert resp.content == ""
+    assert resp.conversation_id == ""
+    assert store.list_by_owner("team") == []
+
+
 def test_drift_detects_file_change(tmpdir_path, caplog):
     client, _ = _make_client_with_rec()
     (tmpdir_path / "AGENTS.md").write_text("원본", encoding="utf-8")
@@ -306,3 +341,47 @@ def test_list_drifts_returns_rows(tmpdir_path):
     assert len(rows) == 1
     assert rows[0]["alias"] == "bull"
     assert "AGENTS.md" in rows[0]["cwd_hashes"]
+
+
+def test_get_alias_status_reports_fresh_and_stale(tmpdir_path):
+    client, _ = _make_client_with_rec()
+    agents = tmpdir_path / "AGENTS.md"
+    agents.write_text("v1", encoding="utf-8")
+
+    client.chat("hi", provider="rec", owner="team", alias="bull",
+                cwd=str(tmpdir_path))
+
+    fresh = client.get_alias_status("team", "bull", str(tmpdir_path))
+    assert fresh["exists"] is True
+    assert fresh["status"] == "fresh"
+    assert fresh["fresh"] is True
+    assert fresh["session_providers"] == ["rec"]
+
+    agents.write_text("v2", encoding="utf-8")
+    stat = agents.stat()
+    os.utime(agents, (stat.st_atime, stat.st_mtime + 1))
+    stale = client.get_alias_status("team", "bull", str(tmpdir_path))
+    assert stale["status"] == "stale"
+    assert stale["stale"] is True
+
+
+def test_clear_session_metadata_blanks_agentcli_handles_only(tmpdir_path):
+    client, _ = _make_client_with_rec()
+    (tmpdir_path / "AGENTS.md").write_text("x", encoding="utf-8")
+
+    resp = client.chat("hi", provider="rec", owner="team", alias="bull",
+                       cwd=str(tmpdir_path), system_prompt="system v1")
+    conv = client._store.get(resp.conversation_id)
+    assert conv.metadata["session_id:rec"]
+    assert conv.metadata["system_prompt_hash:rec"]
+    assert conv.metadata[DRIFT_KEY]
+
+    rows = client.clear_session_metadata(owner="team", alias="bull")
+
+    assert rows[0]["conversation_id"] == resp.conversation_id
+    conv = client._store.get(resp.conversation_id)
+    assert conv.metadata["session_id:rec"] == ""
+    assert conv.metadata["system_prompt_hash:rec"] == ""
+    assert conv.metadata[DRIFT_KEY]
+    status = client.get_alias_status("team", "bull", str(tmpdir_path))
+    assert status["session_providers"] == []

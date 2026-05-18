@@ -1,9 +1,40 @@
 """LLM 프로바이더 추상 인터페이스."""
 
 import asyncio
+import subprocess
 from abc import ABC, abstractmethod
 from typing import AsyncIterator
-from ..types import Message, LLMResponse, StreamChunk
+from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
+                     LLMResponse, ProviderHealth, StreamChunk)
+
+
+def build_session_prompt(messages: list[Message]) -> str:
+    """Build the prompt for CLI session providers.
+
+    Session providers own prior turns, so only durable system instructions and
+    the latest user request are injected. Earlier user/assistant messages are
+    intentionally excluded.
+    """
+    if not messages:
+        return ""
+
+    system_parts = [
+        m.content.strip()
+        for m in messages
+        if m.role == "system" and m.content.strip()
+    ]
+    latest_user = ""
+    for msg in reversed(messages):
+        if msg.role == "user":
+            latest_user = msg.content
+            break
+    if not latest_user:
+        latest_user = messages[-1].content
+
+    if not system_parts:
+        return latest_user
+    system_text = "\n\n".join(system_parts)
+    return f"System instructions:\n{system_text}\n\nUser request:\n{latest_user}"
 
 
 class LLMProvider(ABC):
@@ -67,5 +98,93 @@ class LLMProvider(ABC):
     @abstractmethod
     def list_models(self) -> list[dict]: ...
 
+    def resolve_model(self, model: str = "", *, strict: bool = False) -> str:
+        """모델 selector를 provider가 받는 실제 model id로 해석.
+
+        `list_models()` 항목의 `id`, `name`, `aliases`를 모두 selector로 받는다.
+        strict=False는 하위 호환을 위해 알 수 없는 문자열을 그대로 통과시킨다.
+        """
+        selector = (model or "").strip()
+        if not selector:
+            return ""
+
+        selector_l = selector.lower()
+        known: list[str] = []
+        for row in self.list_models():
+            model_id = str(row.get("id", "")).strip()
+            name = str(row.get("name", "")).strip()
+            aliases = [str(a).strip() for a in row.get("aliases", [])]
+            candidates = [model_id, name, *aliases]
+            known.extend(c for c in candidates if c)
+            if any(c and c.lower() == selector_l for c in candidates):
+                return model_id
+
+        if strict:
+            supported = ", ".join(sorted(set(known))) or "(none)"
+            raise ValueError(
+                f"unsupported model for {self.provider_id}: {selector}. "
+                f"supported selectors: {supported}")
+        return selector
+
+    def health_check(self, *, timeout: int = 10,
+                     cwd: str | None = None,
+                     probe: bool = False) -> ProviderHealth:
+        """Return a cheap provider health diagnosis.
+
+        Providers should override this when the CLI exposes auth/version
+        commands. The default can only report binary availability via
+        `is_available()`.
+        """
+        available = self.is_available()
+        if available:
+            return ProviderHealth(
+                provider=self.provider_id, ok=True, status="ok",
+                available=True, auth_ok=None,
+                message="provider reports available")
+        return ProviderHealth(
+            provider=self.provider_id, ok=False, status="binary_missing",
+            available=False, auth_ok=False,
+            error_type=ERROR_BINARY_MISSING,
+            message=f"{self.provider_id} CLI not found")
+
     @abstractmethod
     def is_available(self) -> bool: ...
+
+
+def run_health_command(cmd: list[str], *, timeout: int = 10,
+                       cwd: str | None = None,
+                       env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run a health command and normalize timeout into a CompletedProcess."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=cwd, env=env)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            cmd, 124,
+            stdout=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
+            stderr=f"timeout after {timeout}s")
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            cmd, 127, stdout="", stderr="command not found")
+
+
+def health_from_response(provider: str, resp: LLMResponse,
+                         *, binary: str = "", version: str = "") -> ProviderHealth:
+    if resp.content:
+        return ProviderHealth(
+            provider=provider, ok=True, status="ok", available=True,
+            binary=binary, version=version, auth_ok=True,
+            message="provider probe succeeded",
+            exit_code=resp.exit_code)
+    status = resp.error_type or "unknown"
+    if resp.error_type == ERROR_TIMEOUT:
+        status = "timeout"
+    return ProviderHealth(
+        provider=provider, ok=False, status=status, available=bool(binary),
+        binary=binary, version=version,
+        auth_ok=False if resp.error_type == ERROR_AUTH else True,
+        error_type=resp.error_type,
+        message=resp.error or "provider probe failed",
+        raw_stderr=resp.raw_stderr,
+        exit_code=resp.exit_code)

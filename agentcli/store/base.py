@@ -1,4 +1,14 @@
-"""대화 저장소 추상 인터페이스."""
+"""세션 라우팅/사용량 저장소 추상 인터페이스.
+
+`ConversationStore` is not a chat-history requirement for session providers.
+Claude/Codex/Copilot keep their own turn history in their native CLI sessions;
+agentcli stores only routing metadata (`session_id:<provider>`), aliases,
+instruction hashes, and usage rows for those providers.
+
+The message methods exist for future/non-session providers that need library
+managed context. Session-capable providers must not persist prompt/response
+content through this interface.
+"""
 
 from abc import ABC, abstractmethod
 from ..types import Conversation, Message
@@ -27,7 +37,12 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def get_messages(self, conversation_id: str, limit: int = 0,
-                     agent: str = "") -> list[Message]: ...
+                     agent: str = "") -> list[Message]:
+        """Return library-managed messages.
+
+        For session providers this should normally be empty because the CLI
+        session owns history. Non-session providers may use it for context.
+        """
 
     @abstractmethod
     def delete(self, conversation_id: str) -> None: ...

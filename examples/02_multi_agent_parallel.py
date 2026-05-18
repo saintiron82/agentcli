@@ -30,13 +30,6 @@ async def main():
         print(f"--- {alias} ({resp.session_id[:8]}…) ---")
         print(resp.content)
 
-    # Aggregate token usage per alias.
-    stats = client.get_token_stats("team", group_by="alias")
-    print("\nUsage by alias:")
-    for name, bucket in stats["groups"].items():
-        print(f"  {name}: tokens={bucket['total_tokens']} "
-              f"cached={bucket['total_cached']} calls={bucket['total_calls']}")
-
 
 if __name__ == "__main__":
     asyncio.run(main())

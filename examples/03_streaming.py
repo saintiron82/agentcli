@@ -12,7 +12,8 @@ async def main():
         provider="claude",
         owner="demo",
         alias="poet",
-        timeout=90,
+        idle_timeout=120,
+        wall_timeout=300,
     ):
         if chunk.type == "text":
             print(chunk.content, end="", flush=True)

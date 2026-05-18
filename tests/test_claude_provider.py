@@ -16,11 +16,38 @@ def test_is_available_not_found():
         assert not p.is_available()
 
 
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value=None)
+def test_health_check_binary_missing(mock_find):
+    h = ClaudeProvider().health_check()
+    assert h.ok is False
+    assert h.status == "binary_missing"
+    assert h.suggested_action
+
+
+@patch("agentcli.providers.claude.run_health_command")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_health_check_auth_required(mock_find, mock_run_health):
+    mock_run_health.side_effect = [
+        subprocess.CompletedProcess(["claude", "--version"], 0,
+                                    stdout="2.1.126", stderr=""),
+        subprocess.CompletedProcess(["claude", "auth", "status"], 1,
+                                    stdout="", stderr="not authenticated"),
+    ]
+    h = ClaudeProvider().health_check()
+    assert h.ok is False
+    assert h.status == "auth_required"
+    assert h.error_type == "auth"
+
+
 def test_list_models():
     p = ClaudeProvider()
     models = p.list_models()
     assert len(models) >= 3
     assert any(m["id"] == "sonnet" for m in models)
+    assert any(m["id"] == "claude-opus-4-7" for m in models)
+    assert any(m["id"] == "claude-sonnet-4-6" for m in models)
+    assert any(m["id"] == "claude-haiku-4-5" for m in models)
+    assert p.resolve_model("claude-sonnet-4-6", strict=True) == "claude-sonnet-4-6"
 
 
 def test_provider_id():
@@ -133,12 +160,33 @@ def test_invoke_with_model(mock_find, mock_run):
     assert cmd[idx + 1] == "sonnet"
 
 
+@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_includes_system_prompt_but_not_history(mock_find, mock_run):
+    mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    p = ClaudeProvider()
+    p.invoke([
+        Message(role="system", content="Follow GUIDE v2"),
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="new question"),
+    ])
+    cmd = mock_run.call_args[0][0]
+    prompt = cmd[cmd.index("-p") + 1]
+    assert "Follow GUIDE v2" in prompt
+    assert "new question" in prompt
+    assert "old question" not in prompt
+    assert "old answer" not in prompt
+
+
 @patch("agentcli.providers.claude.subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 120))
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_timeout(mock_find, mock_run):
     p = ClaudeProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
+    assert resp.error_type == "timeout"
+    assert resp.exit_code == 124
 
 
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value=None)
@@ -146,3 +194,4 @@ def test_invoke_not_found(mock_find):
     p = ClaudeProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
+    assert resp.error

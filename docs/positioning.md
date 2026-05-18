@@ -1,0 +1,78 @@
+# Project Positioning
+
+[English](positioning.md) | [한국어](positioning.ko.md)
+
+## One-sentence definition
+
+`agentcli` is a session-aware Python client layer for embedding the user's
+installed Claude Code, Codex, and GitHub Copilot CLI as application backends.
+
+## Why this exists
+
+Agentic coding CLIs have become useful runtime tools, but they were designed
+first for humans in terminals. They differ in session flags, output events,
+resume behavior, permission controls, model selectors, and auth failure shapes.
+
+Most apps start by calling one CLI with `subprocess.run(...)`. That works until
+the app needs more than one provider, resumable agents, streaming, health
+checks, usage accounting, fallback rules, and instruction freshness.
+
+`agentcli` packages that application-level client layer without taking ownership
+of the provider's native session history.
+
+## Core boundary
+
+The provider CLI owns:
+
+- login and credentials
+- native tool loop
+- native session history
+- provider-specific config and policy
+
+`agentcli` owns:
+
+- a stable Python client API
+- `owner + alias + cwd` app-level identity
+- provider session handles
+- usage and latency rows
+- instruction hash freshness
+- health-check normalization
+- streaming chunk and error normalization
+- explicit provider/model/fallback policy
+
+## Who should use it
+
+Use `agentcli` if you are building:
+
+- a desktop or web app that needs an AI coding/review/research backend
+- a multi-agent workflow where each role should keep its own native CLI session
+- a project automation tool that wants provider switching without rewriting CLI glue
+- a product that needs usage logs and session routing, not raw transcript storage
+
+## Who should not use it
+
+Do not use `agentcli` if you need:
+
+- a hosted API client for OpenAI/Anthropic/GitHub
+- a complete agent framework with its own planner and tool loop
+- a session capture/sync product that copies histories between tools
+- a CLI end-user app for voice, local models, or terminal UX
+
+## Difference from adjacent projects
+
+Some public packages focus on lower-level CLI execution contracts: command
+construction, subprocess lifecycle, provider facts, and transcript discovery.
+`agentcli` sits one level higher. It is designed for a host application that
+wants to keep named agents alive through `owner + alias + cwd` and persist only
+session handles plus operational metadata.
+
+Other packages focus on session capture, context transfer, or end-user CLI
+tools. `agentcli` is not in those categories. It is an embedding SDK for
+applications that already want to use the user's existing provider CLIs.
+
+## Release posture
+
+The project is public-beta quality. The code has package metadata, tests,
+typing marker, examples, changelog, and release notes. It is suitable for
+developer integration and feedback. It is not a 1.0 stability promise because
+provider CLIs change quickly.

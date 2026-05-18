@@ -8,25 +8,29 @@
   - 비세션 provider: 라이브러리가 content 원본을 저장하고 context_turns만큼
     프롬프트에 직렬화해 주입한다.
   - 실패 호출(content="")은 저장소에 어떤 흔적도 남기지 않는다 (원자성).
-  - Fallback은 세션 연속성을 포기한다: 전환된 provider는 새 세션으로 시작.
+  - Fallback은 명시적으로 켠 호출에서만 동작한다. 전환된 provider는 새 세션으로 시작.
   - 동기 `chat()` + 비동기 `chat_async()` + 스트리밍 `chat_stream()`을 제공.
 """
 
 import asyncio
 import hashlib
 import logging
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
-from .types import Message, LLMResponse, TokenUsage, StreamChunk
+from .types import (Message, LLMResponse, ProviderHealth, TokenUsage,
+                    StreamChunk, make_error_chunk, standardize_error_chunk)
 from .store.base import ConversationStore
 from .providers.registry import ProviderRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
 
 SESSION_KEY_FMT = "session_id:{provider}"
+SYSTEM_PROMPT_HASH_KEY_FMT = "system_prompt_hash:{provider}"
 DRIFT_KEY = "instructions_hashes"
-DRIFT_INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "AGENTS.override.md")
+DRIFT_INSTRUCTION_FILES = (
+    "AGENTS.md", "CLAUDE.md", "GUIDE.md", "AGENTS.override.md")
 
 # mtime 기반 해시 캐시 — 파일이 변경되지 않으면 재해시하지 않음.
 # {파일 절대경로: (mtime, hash16)}
@@ -65,55 +69,87 @@ def _compute_instructions_hashes(cwd: str | None) -> dict:
     return result
 
 
-# (provider_class, method_name) → bool : 메서드가 alias 파라미터를 받는지.
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _session_providers_from_metadata(metadata: dict) -> list[str]:
+    providers = [
+        k.split(":", 1)[1]
+        for k, value in metadata.items()
+        if k.startswith("session_id:") and value
+    ]
+    return sorted(set(providers))
+
+
+# (provider_class, method_name, param_name) → bool : 메서드가 파라미터를 받는지.
 # provider 클래스는 런타임에 바뀌지 않으므로 1회 계산 후 캐시.
-_ALIAS_SUPPORT_CACHE: dict[tuple[type, str], bool] = {}
+_PARAM_SUPPORT_CACHE: dict[tuple[type, str, str], bool] = {}
 
 
-def _method_accepts_alias(provider_obj, method_name: str) -> bool:
-    key = (type(provider_obj), method_name)
-    cached = _ALIAS_SUPPORT_CACHE.get(key)
+def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bool:
+    key = (type(provider_obj), method_name, param_name)
+    cached = _PARAM_SUPPORT_CACHE.get(key)
     if cached is not None:
         return cached
     import inspect
     method = getattr(provider_obj, method_name)
     params = inspect.signature(method).parameters
-    result = "alias" in params
-    _ALIAS_SUPPORT_CACHE[key] = result
+    result = param_name in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    _PARAM_SUPPORT_CACHE[key] = result
     return result
 
 
+def _supported_kwargs(provider_obj, method_name: str, kwargs: dict) -> dict:
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if _method_accepts_param(provider_obj, method_name, key)
+    }
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
-                       session_id, cwd, alias):
-    if _method_accepts_alias(provider_obj, "invoke"):
-        return provider_obj.invoke(
-            messages, model=model, timeout=timeout,
-            session_id=session_id, cwd=cwd, alias=alias)
-    return provider_obj.invoke(
-        messages, model=model, timeout=timeout,
-        session_id=session_id, cwd=cwd)
+                       session_id, cwd, alias, resume_by_alias=True):
+    kwargs = _supported_kwargs(provider_obj, "invoke", {
+        "model": model,
+        "timeout": timeout,
+        "session_id": session_id,
+        "cwd": cwd,
+        "alias": alias,
+        "resume_by_alias": resume_by_alias,
+    })
+    return provider_obj.invoke(messages, **kwargs)
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
-                                    session_id, cwd, alias):
-    if _method_accepts_alias(provider_obj, "invoke_async"):
-        return await provider_obj.invoke_async(
-            messages, model=model, timeout=timeout,
-            session_id=session_id, cwd=cwd, alias=alias)
-    return await provider_obj.invoke_async(
-        messages, model=model, timeout=timeout,
-        session_id=session_id, cwd=cwd)
+                                    session_id, cwd, alias,
+                                    resume_by_alias=True):
+    kwargs = _supported_kwargs(provider_obj, "invoke_async", {
+        "model": model,
+        "timeout": timeout,
+        "session_id": session_id,
+        "cwd": cwd,
+        "alias": alias,
+        "resume_by_alias": resume_by_alias,
+    })
+    return await provider_obj.invoke_async(messages, **kwargs)
 
 
 def _stream_with_alias(provider_obj, messages, *, model, timeout,
-                        session_id, cwd, alias):
-    if _method_accepts_alias(provider_obj, "stream_async"):
-        return provider_obj.stream_async(
-            messages, model=model, timeout=timeout,
-            session_id=session_id, cwd=cwd, alias=alias)
-    return provider_obj.stream_async(
-        messages, model=model, timeout=timeout,
-        session_id=session_id, cwd=cwd)
+                        session_id, cwd, alias, idle_timeout=None,
+                        wall_timeout=None, resume_by_alias=True):
+    kwargs = _supported_kwargs(provider_obj, "stream_async", {
+        "model": model,
+        "timeout": timeout,
+        "session_id": session_id,
+        "cwd": cwd,
+        "alias": alias,
+        "idle_timeout": idle_timeout,
+        "wall_timeout": wall_timeout,
+        "resume_by_alias": resume_by_alias,
+    })
+    return provider_obj.stream_async(messages, **kwargs)
 
 
 class LLMClient:
@@ -124,6 +160,10 @@ class LLMClient:
         self._registry = registry or create_default_registry()
         if fallback_order:
             self._registry.set_fallback_order(fallback_order)
+
+    def _store_lock(self):
+        lock = getattr(self._store, "_lock", None)
+        return lock if lock is not None else nullcontext()
 
     # ---------- 공용 준비/저장 로직 (sync/async 공유) ----------
 
@@ -152,6 +192,8 @@ class LLMClient:
                  system_prompt: str, context_turns: int,
                  agent: str,
                  inject_context: list[dict] | None,
+                 strict_model: bool = False,
+                 reset_on_instruction_change: bool = False,
                  alias: str = "",
                  cwd: str | None = None):
         """프로바이더 결정 → conversation resolve → messages 조립.
@@ -161,31 +203,45 @@ class LLMClient:
           2. alias가 명시되면 (owner, alias)로 조회/생성
           3. 둘 다 없으면 신규 conversation
 
-        Returns: (provider_id, provider_obj, conv, messages, session_id)
+        Returns:
+            (provider_id, provider_obj, conv, messages, fallback_messages,
+             session_id, model, created_conversation, resolved_alias,
+             alias_to_set, system_prompt_hash, force_new_session)
         """
         if not provider:
             chain = self._registry.get_fallback_chain()
             provider = chain[0] if chain else ""
 
+        provider_obj = self._registry.get(provider)
+        if provider_obj is not None:
+            model = provider_obj.resolve_model(model, strict=strict_model)
+
+        alias_existing = None
+        if alias:
+            alias_existing = self._store.find_by_alias(owner, alias)
+        if (conversation_id and alias_existing is not None
+                and alias_existing.id != conversation_id):
+            raise ValueError(
+                f"alias conflict for owner={owner!r}, alias={alias!r}: "
+                f"points to {alias_existing.id!r}, not {conversation_id!r}")
+
         conv = None
         if conversation_id:
             conv = self._store.get(conversation_id)
-        elif alias and owner:
-            conv = self._store.find_by_alias(owner, alias)
+        elif alias_existing is not None:
+            conv = alias_existing
+
+        created_conversation = False
         if conv is None:
             conv = self._store.create(owner, provider, model,
                                        conversation_id=conversation_id,
                                        alias=alias)
-        elif alias and not conv.alias:
-            # 기존 conversation에 alias 부여 (처음 호출 시 지정한 경우)
-            self._store.set_alias(conv.id, alias)
-            conv.alias = alias
+            created_conversation = alias_existing is None
+        resolved_alias = conv.alias or alias
+        alias_to_set = alias if alias and not conv.alias else ""
 
-        # 드리프트 체크: cwd의 지시 파일 해시 비교 + 저장
-        self._check_drift(conv, cwd)
-
-        provider_obj = self._registry.get(provider)
         is_session = bool(provider_obj and provider_obj.supports_sessions)
+        instruction_hashes = _compute_instructions_hashes(cwd)
 
         session_id = ""
         prev_messages: list[Message] = []
@@ -206,15 +262,76 @@ class LLMClient:
                     )
                     injected_messages.extend(ctx_msgs)
 
-        messages: list[Message] = []
-        if system_prompt:
-            messages.append(Message(role="system", content=system_prompt))
-        if injected_messages:
-            messages.extend(injected_messages)
-        if prev_messages:
-            messages.extend(prev_messages)
-        messages.append(Message(role="user", content=prompt, agent=agent))
-        return provider, provider_obj, conv, messages, session_id
+        system_prompt_hash = _hash_text(system_prompt) if system_prompt.strip() else ""
+        force_new_session = False
+        if is_session and reset_on_instruction_change and session_id:
+            prev_instruction_hashes = conv.metadata.get(DRIFT_KEY, {}) or {}
+            if (instruction_hashes and prev_instruction_hashes
+                    and instruction_hashes != prev_instruction_hashes):
+                force_new_session = True
+            prev_system_hash = conv.metadata.get(
+                SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider), "")
+            if system_prompt_hash and prev_system_hash and prev_system_hash != system_prompt_hash:
+                force_new_session = True
+            if force_new_session:
+                session_id = ""
+
+        include_system = bool(system_prompt)
+        if is_session and system_prompt_hash:
+            seen_hash = conv.metadata.get(
+                SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider), "")
+            include_system = not session_id or seen_hash != system_prompt_hash
+
+        def build_messages(*, include_system_prompt: bool) -> list[Message]:
+            built: list[Message] = []
+            if include_system_prompt and system_prompt:
+                built.append(Message(role="system", content=system_prompt))
+            if injected_messages:
+                built.extend(injected_messages)
+            if prev_messages:
+                built.extend(prev_messages)
+            built.append(Message(role="user", content=prompt, agent=agent))
+            return built
+
+        messages = build_messages(include_system_prompt=include_system)
+        # Fallback providers start fresh, so they must still receive the current
+        # system instructions even when the primary session has already seen them.
+        fallback_messages = build_messages(include_system_prompt=bool(system_prompt))
+        return (
+            provider, provider_obj, conv, messages, fallback_messages,
+            session_id, model, created_conversation, resolved_alias,
+            alias_to_set, system_prompt_hash, force_new_session,
+        )
+
+    def _discard_failed_prepare(self, conv_id: str,
+                                created_conversation: bool) -> bool:
+        """Remove a conversation created only for a failed call."""
+        if not created_conversation:
+            return False
+        with self._store_lock():
+            self._store.delete(conv_id)
+        return True
+
+    def _persist_success(self, conv, cwd: str | None, prompt: str,
+                         response: LLMResponse, agent: str,
+                         alias: str, alias_to_set: str = "",
+                         system_prompt_hash: str = "") -> None:
+        with self._store_lock():
+            if alias_to_set:
+                self._store.set_alias(conv.id, alias_to_set)
+                conv.alias = alias_to_set
+                alias = alias_to_set
+            # 드리프트 체크는 성공 호출에만 저장한다. 실패 호출은 store 원자성을 유지.
+            self._check_drift(conv, cwd)
+            response_provider = (
+                self._registry.get(response.provider) if response.provider else None)
+            if (system_prompt_hash and response_provider
+                    and response_provider.supports_sessions):
+                self._store.set_metadata(
+                    conv.id,
+                    SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=response.provider),
+                    system_prompt_hash)
+            self._persist(conv.id, prompt, response, agent, alias=alias)
 
     def _persist(self, conv_id: str, prompt: str,
                  response: LLMResponse, agent: str,
@@ -272,56 +389,107 @@ class LLMClient:
              agent: str = "",
              cwd: str | None = None,
              inject_context: list[dict] | None = None,
+             strict_model: bool = False,
+             reset_on_instruction_change: bool = False,
+             fallback: bool = False,
+             wall_timeout: int | None = None,
              ) -> LLMResponse:
-        provider, _, conv, messages, session_id = self._prepare(
-            prompt, provider, model, conversation_id, owner,
-            system_prompt, context_turns, agent, inject_context, alias, cwd)
+        with self._store_lock():
+            (provider, _, conv, messages, fallback_messages, session_id, model,
+             created_conversation, resolved_alias, alias_to_set,
+             system_prompt_hash, force_new_session) = self._prepare(
+                prompt, provider, model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd)
         conversation_id = conv.id
-        resolved_alias = conv.alias
 
         response = self._invoke_with_fallback(
-            provider, messages, model, timeout, session_id, cwd,
-            alias=resolved_alias)
+            provider, messages, fallback_messages, model,
+            wall_timeout or timeout, session_id, cwd,
+            alias=resolved_alias, resume_by_alias=not force_new_session,
+            allow_fallback=fallback)
         response.conversation_id = conversation_id
 
         if not response.content:
+            if self._discard_failed_prepare(conversation_id, created_conversation):
+                response.conversation_id = ""
             return response
 
-        self._persist(conversation_id, prompt, response, agent,
-                      alias=resolved_alias)
+        self._persist_success(conv, cwd, prompt, response, agent,
+                              resolved_alias, alias_to_set, system_prompt_hash)
         return response
 
     def _invoke_with_fallback(self, provider_id: str,
-                              messages: list[Message], model: str,
+                              messages: list[Message],
+                              fallback_messages: list[Message],
+                              model: str,
                               timeout: int, session_id: str,
                               cwd: str | None,
-                              *, alias: str = "") -> LLMResponse:
+                              *, alias: str = "",
+                              resume_by_alias: bool = True,
+                              allow_fallback: bool = False) -> LLMResponse:
+        last_resp: LLMResponse | None = None
+
+        # 1) primary 시도
         p = self._registry.get(provider_id)
         if p:
             resp = _invoke_with_alias(
                 p, messages, model=model, timeout=timeout,
-                session_id=session_id, cwd=cwd, alias=alias)
+                session_id=session_id, cwd=cwd, alias=alias,
+                resume_by_alias=resume_by_alias)
             if resp.content:
                 return resp
+            last_resp = resp
+            self._log_provider_failure(provider_id, resp)
+        else:
+            return LLMResponse(content="", provider=provider_id, model=model,
+                               tokens=TokenUsage(),
+                               error=f"unknown provider: {provider_id}",
+                               error_type="unknown")
 
-        current = provider_id
-        while True:
-            next_id = self._registry.get_next_fallback(current)
-            if not next_id:
-                break
-            logger.warning("[LLM] %s 실패 → %s fallback", current, next_id)
-            p = self._registry.get(next_id)
-            if p:
-                # Fallback은 세션 연속성 포기 — session_id 전달 안 함. alias는 유지.
-                resp = _invoke_with_alias(
-                    p, messages, model="", timeout=timeout,
-                    session_id="", cwd=cwd, alias=alias)
-                if resp.content:
-                    return resp
-            current = next_id
+        if not allow_fallback:
+            if last_resp is not None:
+                return last_resp
+            return LLMResponse(content="", provider=provider_id, model=model,
+                               tokens=TokenUsage(),
+                               error="no provider available",
+                               error_type="unknown")
 
+        # 2) 명시 fallback 호출에서만 체인 전체에서 primary 제외 provider를 시도
+        chain = self._registry.get_fallback_chain()
+        primary_type = (last_resp.error_type if last_resp else "") or ""
+        for next_id in chain:
+            if next_id == provider_id:
+                continue
+            np = self._registry.get(next_id)
+            if not np:
+                continue
+            logger.warning("[LLM] %s(%s) 실패 → %s fallback",
+                           provider_id, primary_type or "no-content", next_id)
+            # Fallback은 세션 연속성 포기 — session_id 전달 안 함. alias 유지.
+            resp = _invoke_with_alias(
+                np, fallback_messages, model="", timeout=timeout,
+                session_id="", cwd=cwd, alias=alias,
+                resume_by_alias=resume_by_alias)
+            if resp.content:
+                return resp
+            last_resp = resp
+            self._log_provider_failure(next_id, resp)
+
+        # 모두 실패: 가장 마지막 실패 사유 보존하여 반환
+        if last_resp is not None:
+            return last_resp
         return LLMResponse(content="", provider=provider_id, model=model,
-                           tokens=TokenUsage())
+                           tokens=TokenUsage(),
+                           error="no provider available",
+                           error_type="unknown")
+
+    @staticmethod
+    def _log_provider_failure(provider_id: str, resp: LLMResponse) -> None:
+        if resp.error:
+            logger.warning("[LLM] %s 실패(%s): %s",
+                           provider_id, resp.error_type or "?",
+                           resp.error[:200])
 
     # ---------- 비동기 chat ----------
 
@@ -334,56 +502,98 @@ class LLMClient:
                          agent: str = "",
                          cwd: str | None = None,
                          inject_context: list[dict] | None = None,
+                         strict_model: bool = False,
+                         reset_on_instruction_change: bool = False,
+                         fallback: bool = False,
+                         wall_timeout: int | None = None,
                          ) -> LLMResponse:
-        provider, _, conv, messages, session_id = self._prepare(
-            prompt, provider, model, conversation_id, owner,
-            system_prompt, context_turns, agent, inject_context, alias, cwd)
+        with self._store_lock():
+            (provider, _, conv, messages, fallback_messages, session_id, model,
+             created_conversation, resolved_alias, alias_to_set,
+             system_prompt_hash, force_new_session) = self._prepare(
+                prompt, provider, model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd)
         conversation_id = conv.id
-        resolved_alias = conv.alias
 
         response = await self._invoke_async_with_fallback(
-            provider, messages, model, timeout, session_id, cwd,
-            alias=resolved_alias)
+            provider, messages, fallback_messages, model,
+            wall_timeout or timeout, session_id, cwd,
+            alias=resolved_alias, resume_by_alias=not force_new_session,
+            allow_fallback=fallback)
         response.conversation_id = conversation_id
 
         if not response.content:
+            if self._discard_failed_prepare(conversation_id, created_conversation):
+                response.conversation_id = ""
             return response
 
         # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
-        await asyncio.to_thread(self._persist, conversation_id, prompt,
-                                response, agent, resolved_alias)
+        await asyncio.to_thread(self._persist_success, conv, cwd, prompt,
+                                response, agent, resolved_alias, alias_to_set,
+                                system_prompt_hash)
         return response
 
     async def _invoke_async_with_fallback(self, provider_id: str,
-                                          messages: list[Message], model: str,
+                                          messages: list[Message],
+                                          fallback_messages: list[Message],
+                                          model: str,
                                           timeout: int, session_id: str,
                                           cwd: str | None,
-                                          *, alias: str = "") -> LLMResponse:
+                                          *, alias: str = "",
+                                          resume_by_alias: bool = True,
+                                          allow_fallback: bool = False) -> LLMResponse:
+        last_resp: LLMResponse | None = None
+
         p = self._registry.get(provider_id)
         if p:
             resp = await _invoke_async_with_alias(
                 p, messages, model=model, timeout=timeout,
-                session_id=session_id, cwd=cwd, alias=alias)
+                session_id=session_id, cwd=cwd, alias=alias,
+                resume_by_alias=resume_by_alias)
             if resp.content:
                 return resp
+            last_resp = resp
+            self._log_provider_failure(provider_id, resp)
+        else:
+            return LLMResponse(content="", provider=provider_id, model=model,
+                               tokens=TokenUsage(),
+                               error=f"unknown provider: {provider_id}",
+                               error_type="unknown")
 
-        current = provider_id
-        while True:
-            next_id = self._registry.get_next_fallback(current)
-            if not next_id:
-                break
-            logger.warning("[LLM] %s 실패 → %s fallback (async)", current, next_id)
-            p = self._registry.get(next_id)
-            if p:
-                resp = await _invoke_async_with_alias(
-                    p, messages, model="", timeout=timeout,
-                    session_id="", cwd=cwd, alias=alias)
-                if resp.content:
-                    return resp
-            current = next_id
+        if not allow_fallback:
+            if last_resp is not None:
+                return last_resp
+            return LLMResponse(content="", provider=provider_id, model=model,
+                               tokens=TokenUsage(),
+                               error="no provider available",
+                               error_type="unknown")
 
+        chain = self._registry.get_fallback_chain()
+        primary_type = (last_resp.error_type if last_resp else "") or ""
+        for next_id in chain:
+            if next_id == provider_id:
+                continue
+            np = self._registry.get(next_id)
+            if not np:
+                continue
+            logger.warning("[LLM] %s(%s) 실패 → %s fallback (async)",
+                           provider_id, primary_type or "no-content", next_id)
+            resp = await _invoke_async_with_alias(
+                np, fallback_messages, model="", timeout=timeout,
+                session_id="", cwd=cwd, alias=alias,
+                resume_by_alias=resume_by_alias)
+            if resp.content:
+                return resp
+            last_resp = resp
+            self._log_provider_failure(next_id, resp)
+
+        if last_resp is not None:
+            return last_resp
         return LLMResponse(content="", provider=provider_id, model=model,
-                           tokens=TokenUsage())
+                           tokens=TokenUsage(),
+                           error="no provider available",
+                           error_type="unknown")
 
     # ---------- 스트리밍 chat ----------
 
@@ -396,6 +606,11 @@ class LLMClient:
                           agent: str = "",
                           cwd: str | None = None,
                           inject_context: list[dict] | None = None,
+                          strict_model: bool = False,
+                          reset_on_instruction_change: bool = False,
+                          fallback: bool = False,
+                          idle_timeout: int | None = None,
+                          wall_timeout: int | None = None,
                           ) -> AsyncIterator[StreamChunk]:
         """스트리밍 호출. 청크를 yield하면서 응답을 누적하고 완료 시 저장.
 
@@ -403,63 +618,155 @@ class LLMClient:
           - "text" | "thinking" | "tool_use" | "tool_result" | "event" | "error"
           - "done" — 마지막 청크. content(누적), session_id, usage 포함.
 
-        Fallback은 스트리밍 경로에서는 미지원 (원 provider 실패 시 "error" 후 종료).
-        Fallback이 필요하면 `chat_async()`를 사용.
+        fallback=True는 첫 출력 전 실패에만 다른 provider를 시도한다.
+        text/tool/event 등 어떤 출력이라도 나간 뒤 실패하면 provider를 바꾸지 않는다.
         """
-        provider, provider_obj, conv, messages, session_id = self._prepare(
-            prompt, provider, model, conversation_id, owner,
-            system_prompt, context_turns, agent, inject_context, alias, cwd)
+        with self._store_lock():
+            (provider, provider_obj, conv, messages, fallback_messages,
+             session_id, model, created_conversation, resolved_alias, alias_to_set,
+             system_prompt_hash, force_new_session) = self._prepare(
+                prompt, provider, model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd)
         conversation_id = conv.id
-        resolved_alias = conv.alias
 
         if provider_obj is None:
-            yield StreamChunk(type="error",
-                              content=f"unknown provider: {provider}")
-            return
-
-        text_parts: list[str] = []
-        final_sid = session_id
-        final_usage = TokenUsage()
-        latency_ms = 0
-
-        async for chunk in _stream_with_alias(
-                provider_obj, messages, model=model, timeout=timeout,
-                session_id=session_id, cwd=cwd, alias=resolved_alias):
-            if chunk.type == "text":
-                text_parts.append(chunk.content)
-            if chunk.session_id:
-                final_sid = chunk.session_id
-            if chunk.type == "done":
-                if chunk.usage is not None:
-                    final_usage = chunk.usage
-                latency_ms = int(chunk.data.get("latency_ms") or 0)
-                # done은 마지막에 다시 합쳐서 보냄 (content 누적 기준)
-                break
-            yield chunk
-
-        full_content = "".join(text_parts)
-
-        # 실패: 저장 안 함
-        if not full_content:
+            self._discard_failed_prepare(conversation_id, created_conversation)
+            yield make_error_chunk(f"unknown provider: {provider}",
+                                   provider=provider)
             yield StreamChunk(type="done", content="",
-                              session_id=final_sid, usage=final_usage,
                               data={"provider": provider, "model": model,
-                                    "latency_ms": latency_ms})
+                                    "latency_ms": 0})
             return
 
-        # 성공: 일반 경로와 동일하게 저장
-        synthetic = LLMResponse(
-            content=full_content, provider=provider, model=model,
-            tokens=final_usage, latency_ms=latency_ms,
-            session_id=final_sid, conversation_id=conversation_id)
-        await asyncio.to_thread(self._persist, conversation_id, prompt,
-                                synthetic, agent, resolved_alias)
+        attempts = [
+            (provider, provider_obj, messages, model, session_id,
+             not force_new_session)
+        ]
+        if fallback:
+            for next_id in self._registry.get_fallback_chain():
+                if next_id == provider:
+                    continue
+                next_provider = self._registry.get(next_id)
+                if next_provider is None:
+                    continue
+                attempts.append(
+                    (next_id, next_provider, fallback_messages, "", "",
+                     not force_new_session))
 
-        yield StreamChunk(type="done", content=full_content,
-                          session_id=final_sid, usage=final_usage,
-                          data={"provider": provider, "model": model,
-                                "latency_ms": latency_ms,
-                                "conversation_id": conversation_id})
+        last_error: StreamChunk | None = None
+        for attempt_index, (current_id, current_provider, current_messages,
+                            current_model, current_sid,
+                            resume_by_alias) in enumerate(attempts):
+            text_parts: list[str] = []
+            final_sid = current_sid
+            final_usage = TokenUsage()
+            latency_ms = 0
+            saw_error = False
+            emitted_output = False
+
+            try:
+                async for raw_chunk in _stream_with_alias(
+                        current_provider, current_messages,
+                        model=current_model, timeout=timeout,
+                        session_id=current_sid, cwd=cwd, alias=resolved_alias,
+                        idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                        resume_by_alias=resume_by_alias):
+                    if raw_chunk.session_id:
+                        final_sid = raw_chunk.session_id
+
+                    if raw_chunk.type == "done":
+                        if raw_chunk.content and not text_parts:
+                            text_parts.append(raw_chunk.content)
+                        if raw_chunk.usage is not None:
+                            final_usage = raw_chunk.usage
+                        latency_ms = int(raw_chunk.data.get("latency_ms") or 0)
+                        break
+
+                    if raw_chunk.type == "error":
+                        saw_error = True
+                        err_chunk = standardize_error_chunk(
+                            raw_chunk, provider=current_id)
+                        last_error = err_chunk
+                        if emitted_output:
+                            yield err_chunk
+                        continue
+
+                    emitted_output = True
+                    if raw_chunk.type == "text":
+                        text_parts.append(raw_chunk.content)
+                    yield raw_chunk
+            except Exception as exc:
+                saw_error = True
+                err_chunk = make_error_chunk(str(exc), provider=current_id)
+                last_error = err_chunk
+                if emitted_output:
+                    yield err_chunk
+
+            full_content = "".join(text_parts)
+            has_more_attempts = attempt_index < len(attempts) - 1
+
+            if saw_error:
+                if emitted_output:
+                    self._discard_failed_prepare(
+                        conversation_id, created_conversation)
+                    yield StreamChunk(
+                        type="done", content=full_content,
+                        session_id=final_sid, usage=final_usage,
+                        data={"provider": current_id, "model": current_model,
+                              "latency_ms": latency_ms, "error": True})
+                    return
+                if fallback and has_more_attempts:
+                    logger.warning(
+                        "[LLM] %s stream failed before output → fallback",
+                        current_id)
+                    continue
+                self._discard_failed_prepare(
+                    conversation_id, created_conversation)
+                if last_error is not None:
+                    yield last_error
+                yield StreamChunk(
+                    type="done", content="", session_id=final_sid,
+                    usage=final_usage,
+                    data={"provider": current_id, "model": current_model,
+                          "latency_ms": latency_ms, "error": True})
+                return
+
+            if full_content:
+                synthetic = LLMResponse(
+                    content=full_content, provider=current_id,
+                    model=current_model, tokens=final_usage,
+                    latency_ms=latency_ms, session_id=final_sid,
+                    conversation_id=conversation_id)
+                await asyncio.to_thread(
+                    self._persist_success, conv, cwd, prompt, synthetic,
+                    agent, resolved_alias, alias_to_set, system_prompt_hash)
+
+                yield StreamChunk(
+                    type="done", content=full_content,
+                    session_id=final_sid, usage=final_usage,
+                    data={"provider": current_id, "model": current_model,
+                          "latency_ms": latency_ms,
+                          "conversation_id": conversation_id})
+                return
+
+            empty_error = make_error_chunk(
+                "empty stream response", provider=current_id)
+            last_error = empty_error
+            if fallback and has_more_attempts and not emitted_output:
+                logger.warning(
+                    "[LLM] %s stream ended before output → fallback",
+                    current_id)
+                continue
+
+            self._discard_failed_prepare(conversation_id, created_conversation)
+            yield empty_error
+            yield StreamChunk(
+                type="done", content="", session_id=final_sid,
+                usage=final_usage,
+                data={"provider": current_id, "model": current_model,
+                      "latency_ms": latency_ms, "error": True})
+            return
 
     # ---------- 메타 API ----------
 
@@ -468,6 +775,48 @@ class LLMClient:
 
     def list_models(self, provider: str = "") -> list[dict]:
         return self._registry.list_models(provider)
+
+    def resolve_model(self, provider: str, model: str = "",
+                      *, strict: bool = True) -> str:
+        """provider의 모델 selector를 실제 CLI model id로 변환."""
+        p = self._registry.get(provider)
+        if p is None:
+            raise ValueError(f"unknown provider: {provider}")
+        return p.resolve_model(model, strict=strict)
+
+    def select_model(self, provider: str, model: str = "",
+                     *, strict: bool = True) -> str:
+        """`resolve_model()`의 의미가 드러나는 별칭."""
+        return self.resolve_model(provider, model, strict=strict)
+
+    def health_check(self, provider: str = "", *,
+                     timeout: int = 10,
+                     cwd: str | None = None,
+                     probe: bool = False
+                     ) -> ProviderHealth | dict[str, ProviderHealth]:
+        """Diagnose CLI binary/auth/quota readiness.
+
+        `probe=False` keeps checks cheap and uses provider-specific auth/status
+        commands where available. `probe=True` performs a minimal model call to
+        catch quota/usage-limit failures before production work starts.
+        """
+        if provider:
+            p = self._registry.get(provider)
+            if p is None:
+                return ProviderHealth(
+                    provider=provider, ok=False, status="unknown_provider",
+                    message=f"unknown provider: {provider}",
+                    suggested_action="Register the provider before calling health_check().")
+            return p.health_check(timeout=timeout, cwd=cwd, probe=probe)
+
+        result: dict[str, ProviderHealth] = {}
+        for row in self._registry.list_providers():
+            pid = row["id"]
+            p = self._registry.get(pid)
+            if p:
+                result[pid] = p.health_check(
+                    timeout=timeout, cwd=cwd, probe=probe)
+        return result
 
     def get_token_stats(self, owner: str = "", days: int = 7,
                         *, alias: str = "", provider: str = "",
@@ -514,9 +863,90 @@ class LLMClient:
                 "conversation_id": c.id,
                 "owner": c.owner,
                 "cwd_hashes": dict(hashes),
-                "session_providers": [
-                    k.split(":", 1)[1] for k in c.metadata
-                    if k.startswith("session_id:")],
+                "session_providers": _session_providers_from_metadata(
+                    c.metadata),
                 "updated_at": c.updated_at.isoformat(),
             })
         return rows
+
+    def get_alias_status(self, owner: str, alias: str,
+                         cwd: str | None = None) -> dict:
+        """Return UI-ready session/instruction status for one alias."""
+        current_hashes = _compute_instructions_hashes(cwd)
+        conv = self._store.find_by_alias(owner, alias)
+        if conv is None:
+            return {
+                "owner": owner,
+                "alias": alias,
+                "exists": False,
+                "status": "missing",
+                "fresh": False,
+                "stale": False,
+                "conversation_id": "",
+                "cwd_hashes": current_hashes,
+                "stored_hashes": {},
+                "session_providers": [],
+                "updated_at": "",
+            }
+
+        stored_hashes = dict(conv.metadata.get(DRIFT_KEY, {}) or {})
+        if current_hashes and stored_hashes:
+            status = "fresh" if current_hashes == stored_hashes else "stale"
+        else:
+            status = "unknown"
+        return {
+            "owner": conv.owner,
+            "alias": conv.alias,
+            "exists": True,
+            "status": status,
+            "fresh": status == "fresh",
+            "stale": status == "stale",
+            "conversation_id": conv.id,
+            "cwd_hashes": current_hashes,
+            "stored_hashes": stored_hashes,
+            "session_providers": _session_providers_from_metadata(
+                conv.metadata),
+            "updated_at": conv.updated_at.isoformat(),
+        }
+
+    def clear_session_metadata(self, *, owner: str,
+                               alias: str = "",
+                               provider: str = "") -> list[dict]:
+        """Clear agentcli-owned session handles only.
+
+        This never deletes native Claude/Codex/Copilot session files. It blanks
+        `session_id:<provider>` and matching `system_prompt_hash:<provider>` keys
+        in the configured store so the next call starts a fresh CLI session.
+        """
+        with self._store_lock():
+            if alias:
+                conv = self._store.find_by_alias(owner, alias)
+                convs = [conv] if conv is not None else []
+            else:
+                convs = self._store.list_by_owner(owner, limit=1000)
+
+            rows: list[dict] = []
+            for conv in convs:
+                keys_to_clear: list[str] = []
+                for key, value in conv.metadata.items():
+                    if not value:
+                        continue
+                    if not (key.startswith("session_id:")
+                            or key.startswith("system_prompt_hash:")):
+                        continue
+                    key_provider = key.split(":", 1)[1]
+                    if provider and key_provider != provider:
+                        continue
+                    keys_to_clear.append(key)
+
+                for key in keys_to_clear:
+                    self._store.set_metadata(conv.id, key, "")
+
+                if keys_to_clear:
+                    rows.append({
+                        "owner": conv.owner,
+                        "alias": conv.alias,
+                        "conversation_id": conv.id,
+                        "cleared_keys": keys_to_clear,
+                    })
+            return rows

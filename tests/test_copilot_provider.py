@@ -11,10 +11,23 @@ def test_provider_id():
     assert p.supports_streaming is True
 
 
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=(None, False))
+def test_health_check_binary_missing(mock_find):
+    h = CopilotProvider().health_check()
+    assert h.ok is False
+    assert h.status == "binary_missing"
+
+
 def test_list_models():
     p = CopilotProvider()
     models = p.list_models()
-    assert any(m["id"] == "gpt-4o" for m in models)
+    assert any(m["id"] == "gpt-5.5" for m in models)
+    assert any(m["id"] == "gpt-5.4" for m in models)
+    assert any(m["id"] == "gpt-5.3-codex" for m in models)
+    assert any(m["id"] == "claude-sonnet-4.6" for m in models)
+    assert any(m["id"] == "claude-opus-4.7" for m in models)
+    assert any(m["id"] == "gpt-4.1" for m in models)
 
 
 # ===== JSONL 파싱 =====
@@ -119,6 +132,20 @@ def test_invoke_alias_becomes_name_and_resume(mock_find, mock_env, mock_run):
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
+def test_invoke_can_disable_alias_resume(mock_find, mock_env, mock_run):
+    mock_run.return_value = MagicMock(returncode=0, stdout=_SAMPLE_STDOUT, stderr="")
+    p = CopilotProvider()
+    p.invoke([Message(role="user", content="hi")], alias="bull-agent",
+             resume_by_alias=False)
+    cmd = mock_run.call_args[0][0]
+    assert "--name=bull-agent" in cmd
+    assert "--resume=bull-agent" not in cmd
+
+
+@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
 def test_invoke_tools_and_cwd(mock_find, mock_env, mock_run):
     mock_run.return_value = MagicMock(returncode=0, stdout=_SAMPLE_STDOUT, stderr="")
     p = CopilotProvider(
@@ -138,12 +165,34 @@ def test_invoke_tools_and_cwd(mock_find, mock_env, mock_run):
     assert kwargs.get("cwd") == "/repo"
 
 
+@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
+def test_invoke_includes_system_prompt_but_not_history(mock_find, mock_env, mock_run):
+    mock_run.return_value = MagicMock(returncode=0, stdout=_SAMPLE_STDOUT, stderr="")
+    p = CopilotProvider()
+    p.invoke([
+        Message(role="system", content="Follow GUIDE v2"),
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="new question"),
+    ])
+    cmd = mock_run.call_args[0][0]
+    prompt = cmd[cmd.index("-p") + 1]
+    assert "Follow GUIDE v2" in prompt
+    assert "new question" in prompt
+    assert "old question" not in prompt
+    assert "old answer" not in prompt
+
+
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=(None, False))
 def test_invoke_not_found(mock_find):
     p = CopilotProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
+    assert resp.error
 
 
 @patch("agentcli.providers.copilot.subprocess.run",
@@ -155,3 +204,5 @@ def test_invoke_timeout(mock_find, mock_env, mock_run):
     p = CopilotProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
+    assert resp.error_type == "timeout"
+    assert resp.exit_code == 124

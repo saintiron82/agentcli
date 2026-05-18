@@ -22,19 +22,40 @@ import subprocess
 import time
 from typing import AsyncIterator
 
-from .base import LLMProvider
-from ..types import Message, LLMResponse, TokenUsage, StreamChunk
+from .base import (LLMProvider, build_session_prompt, health_from_response,
+                   run_health_command)
+from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
+                     ProviderHealth, TokenUsage, StreamChunk, classify_error)
 from ..utils import build_env
 
 logger = logging.getLogger(__name__)
 
 COPILOT_MODELS = [
-    {"id": "", "name": "기본 (자동)"},
-    {"id": "claude-sonnet-4.6", "name": "Claude Sonnet 4.6"},
-    {"id": "claude-sonnet", "name": "Claude Sonnet"},
-    {"id": "gpt-4o", "name": "GPT-4o"},
-    {"id": "gpt-5", "name": "GPT-5"},
-    {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+    {"id": "", "name": "기본", "aliases": ["default"]},
+    {
+        "id": "claude-sonnet-4.6",
+        "name": "Claude Sonnet 4.6",
+        "aliases": ["claude-sonnet", "sonnet"],
+    },
+    {"id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5"},
+    {"id": "claude-haiku-4.5", "name": "Claude Haiku 4.5"},
+    {"id": "claude-opus-4.7", "name": "Claude Opus 4.7"},
+    {"id": "claude-opus-4.6", "name": "Claude Opus 4.6"},
+    {
+        "id": "claude-opus-4.6-fast",
+        "name": "Claude Opus 4.6 fast",
+    },
+    {"id": "claude-opus-4.5", "name": "Claude Opus 4.5"},
+    {"id": "claude-sonnet-4", "name": "Claude Sonnet 4"},
+    {"id": "gpt-5.5", "name": "GPT-5.5"},
+    {"id": "gpt-5.4", "name": "GPT-5.4"},
+    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
+    {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
+    {"id": "gpt-5.2", "name": "GPT-5.2"},
+    {"id": "gpt-5.1", "name": "GPT-5.1"},
+    {"id": "gpt-5.4-mini", "name": "GPT-5.4 mini"},
+    {"id": "gpt-5-mini", "name": "GPT-5 mini"},
+    {"id": "gpt-4.1", "name": "GPT-4.1"},
 ]
 
 
@@ -76,10 +97,56 @@ class CopilotProvider(LLMProvider):
     def list_models(self) -> list[dict]:
         return list(COPILOT_MODELS)
 
+    def health_check(self, *, timeout: int = 10,
+                     cwd: str | None = None,
+                     probe: bool = False) -> ProviderHealth:
+        bin_path, use_gh = self._find_binary()
+        if not bin_path:
+            return ProviderHealth(
+                provider=self.provider_id, ok=False, status="binary_missing",
+                available=False, auth_ok=False,
+                error_type=ERROR_BINARY_MISSING,
+                message="Copilot CLI or gh CLI not found")
+
+        version_cmd = [bin_path, "copilot", "version"] if use_gh else [bin_path, "version"]
+        version_proc = run_health_command(version_cmd, timeout=timeout)
+        version = (version_proc.stdout or version_proc.stderr).strip()
+
+        if use_gh:
+            auth_proc = run_health_command(
+                [bin_path, "auth", "status"], timeout=timeout, cwd=cwd,
+                env=build_env())
+            auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
+            if auth_proc.returncode != 0:
+                return ProviderHealth(
+                    provider=self.provider_id, ok=False, status="auth_required",
+                    available=True, binary=bin_path, version=version,
+                    auth_ok=False, error_type=ERROR_AUTH,
+                    message=auth_msg or "GitHub authentication required",
+                    raw_stdout=auth_proc.stdout, raw_stderr=auth_proc.stderr,
+                    exit_code=auth_proc.returncode)
+            if not probe:
+                return ProviderHealth(
+                    provider=self.provider_id, ok=True, status="ok",
+                    available=True, binary=bin_path, version=version,
+                    auth_ok=True, message=auth_msg or "GitHub authenticated")
+
+        if probe:
+            resp = self.invoke(
+                [Message(role="user", content="Reply exactly OK.")],
+                timeout=timeout, cwd=cwd)
+            return health_from_response(
+                self.provider_id, resp, binary=bin_path, version=version)
+        return ProviderHealth(
+            provider=self.provider_id, ok=True, status="ok", available=True,
+            binary=bin_path, version=version, auth_ok=None,
+            message="Copilot binary available; run with probe=True to verify auth/quota")
+
     def _build_cmd(self, prompt: str, model: str,
                    session_id: str,
                    output_format: str = "text",
-                   alias: str = "") -> tuple[list[str] | None, bool]:
+                   alias: str = "",
+                   resume_by_alias: bool = True) -> tuple[list[str] | None, bool]:
         """(cmd, use_gh) 반환. session_id 발급은 CLI가 담당, 우리는 stdout에서 파싱."""
         bin_path, use_gh = self._find_binary()
         if not bin_path:
@@ -114,16 +181,14 @@ class CopilotProvider(LLMProvider):
         if self._effort:
             cmd += ["--effort", self._effort]
 
-        # alias → Copilot --name (CLI에서 사용자가 이름으로 재개 가능)
-        if alias:
-            cmd.append(f"--name={alias}")
-
         if session_id:
             cmd += [f"--resume={session_id}"]
         elif alias:
-            # session_id가 없지만 alias가 있으면 이름 기반 재개 시도.
-            # 첫 호출이면 Copilot이 새 세션을 만들고, 우리는 result.sessionId를 파싱.
-            cmd += [f"--resume={alias}"]
+            # 이름으로 기존 세션 재개를 시도하고, 없으면 같은 이름으로 새 세션을 만든다.
+            cmd.append(f"--name={alias}")
+            if resume_by_alias:
+                cmd.append(f"--resume={alias}")
+
         return cmd, use_gh
 
     # ---------- 동기 ----------
@@ -132,14 +197,19 @@ class CopilotProvider(LLMProvider):
                model: str = "", timeout: int = 120,
                session_id: str = "",
                cwd: str | None = None,
-               alias: str = "") -> LLMResponse:
-        empty = LLMResponse(content="", provider=self.provider_id, model=model)
-        prompt = messages[-1].content if messages else ""
+               alias: str = "",
+               resume_by_alias: bool = True) -> LLMResponse:
+        prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
-                                   output_format="json", alias=alias)
+                                   output_format="json", alias=alias,
+                                   resume_by_alias=resume_by_alias)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
-            return empty
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                session_id=session_id or alias,
+                                error="Copilot CLI not found",
+                                error_type=ERROR_BINARY_MISSING,
+                                exit_code=127)
 
         start = time.time()
         try:
@@ -149,24 +219,41 @@ class CopilotProvider(LLMProvider):
             latency = int((time.time() - start) * 1000)
 
             if result.returncode != 0:
+                msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
                 logger.error("Copilot 실패 (code=%d): %s",
-                             result.returncode, result.stderr[:300])
-                return empty
+                             result.returncode, msg)
+                return LLMResponse(
+                    content="", provider=self.provider_id, model=model,
+                    raw_stderr=result.stderr,
+                    session_id=session_id or alias,
+                    error=msg, error_type=classify_error(msg),
+                    exit_code=result.returncode)
 
             parsed = _parse_copilot_jsonl(result.stdout)
+            err = parsed.get("error", "")
             return LLMResponse(
-                content=parsed["text"],
+                content=parsed["text"] if not err else "",
                 provider=self.provider_id, model=model,
                 tokens=parsed["usage"], latency_ms=latency,
                 raw_stderr=result.stderr,
                 session_id=parsed["session_id"] or session_id or alias,
+                error=err,
+                error_type=classify_error(err) if err else "",
+                exit_code=result.returncode,
             )
         except subprocess.TimeoutExpired:
             logger.error("Copilot 타임아웃 (%d초)", timeout)
-            return empty
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                session_id=session_id or alias,
+                                error=f"timeout after {timeout}s",
+                                error_type="timeout",
+                                exit_code=124)
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
-            return empty
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                error="Copilot CLI not found",
+                                error_type=ERROR_BINARY_MISSING,
+                                exit_code=127)
 
     # ---------- 비동기 ----------
 
@@ -174,14 +261,19 @@ class CopilotProvider(LLMProvider):
                            model: str = "", timeout: int = 120,
                            session_id: str = "",
                            cwd: str | None = None,
-                           alias: str = "") -> LLMResponse:
-        empty = LLMResponse(content="", provider=self.provider_id, model=model)
-        prompt = messages[-1].content if messages else ""
+                           alias: str = "",
+                           resume_by_alias: bool = True) -> LLMResponse:
+        prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
-                                   output_format="json", alias=alias)
+                                   output_format="json", alias=alias,
+                                   resume_by_alias=resume_by_alias)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
-            return empty
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                session_id=session_id or alias,
+                                error="Copilot CLI not found",
+                                error_type=ERROR_BINARY_MISSING,
+                                exit_code=127)
 
         start = time.time()
         try:
@@ -198,28 +290,46 @@ class CopilotProvider(LLMProvider):
                 proc.kill()
                 await proc.wait()
                 logger.error("Copilot 타임아웃 (%d초)", timeout)
-                return empty
+                return LLMResponse(content="", provider=self.provider_id, model=model,
+                                    session_id=session_id or alias,
+                                    error=f"timeout after {timeout}s",
+                                    error_type="timeout",
+                                    exit_code=124)
             latency = int((time.time() - start) * 1000)
-
-            if proc.returncode != 0:
-                stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-                logger.error("Copilot 실패 (code=%d): %s",
-                             proc.returncode, stderr_txt[:300])
-                return empty
 
             stdout_txt = (stdout_b or b"").decode("utf-8", errors="replace")
             stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
+
+            if proc.returncode != 0:
+                msg = stderr_txt.strip()[:300] or f"exit={proc.returncode}"
+                logger.error("Copilot 실패 (code=%d): %s",
+                             proc.returncode, msg)
+                return LLMResponse(
+                    content="", provider=self.provider_id, model=model,
+                    raw_stderr=stderr_txt,
+                    session_id=session_id or alias,
+                    error=msg, error_type=classify_error(msg),
+                    exit_code=proc.returncode)
+
             parsed = _parse_copilot_jsonl(stdout_txt)
+            err = parsed.get("error", "")
             return LLMResponse(
-                content=parsed["text"],
+                content=parsed["text"] if not err else "",
                 provider=self.provider_id, model=model,
                 tokens=parsed["usage"], latency_ms=latency,
                 raw_stderr=stderr_txt,
                 session_id=parsed["session_id"] or session_id or alias,
+                error=err,
+                error_type=classify_error(err) if err else "",
+                exit_code=proc.returncode,
             )
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
-            return empty
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                session_id=session_id or alias,
+                                error="Copilot CLI not found",
+                                error_type=ERROR_BINARY_MISSING,
+                                exit_code=127)
 
     # ---------- 스트리밍 ----------
 
@@ -227,7 +337,10 @@ class CopilotProvider(LLMProvider):
                            model: str = "", timeout: int = 120,
                            session_id: str = "",
                            cwd: str | None = None,
-                           alias: str = "") -> AsyncIterator[StreamChunk]:
+                           alias: str = "",
+                           resume_by_alias: bool = True,
+                           idle_timeout: int | None = None,
+                           wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
 
         정규화:
@@ -236,9 +349,10 @@ class CopilotProvider(LLMProvider):
           result                  → session_id, usage 확정
           기타 session.*          → event
         """
-        prompt = messages[-1].content if messages else ""
+        prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
-                                   output_format="json", alias=alias)
+                                   output_format="json", alias=alias,
+                                   resume_by_alias=resume_by_alias)
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")
             return
@@ -257,18 +371,50 @@ class CopilotProvider(LLMProvider):
             final_usage = TokenUsage()
             final_sid = session_id or alias
             timed_out = False
-            deadline = start + timeout
+            # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
+            # 진행 청크가 들어오면 매번 last_activity 갱신.
+            last_activity = time.time()
+            idle_limit = idle_timeout if idle_timeout is not None else timeout
+            wall_deadline = start + wall_timeout if wall_timeout else None
 
             assert proc.stdout
             while True:
-                if time.time() > deadline:
+                read_timeout = idle_limit
+                if wall_deadline is not None:
+                    remaining = wall_deadline - time.time()
+                    if remaining <= 0:
+                        proc.kill()
+                        yield StreamChunk(
+                            type="error",
+                            content=f"wall timeout: {wall_timeout}s 초과",
+                            data={"error_type": "timeout",
+                                  "timeout_kind": "wall"})
+                        timed_out = True
+                        break
+                    read_timeout = min(read_timeout, remaining)
+                try:
+                    line_b = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=read_timeout)
+                except asyncio.TimeoutError:
                     proc.kill()
-                    yield StreamChunk(type="error", content="timeout")
+                    idle = int(time.time() - last_activity)
+                    timeout_kind = (
+                        "wall" if wall_deadline is not None
+                        and time.time() >= wall_deadline else "idle")
+                    content = (
+                        f"wall timeout: {wall_timeout}s 초과"
+                        if timeout_kind == "wall"
+                        else f"idle timeout: {idle}s 동안 청크 없음")
+                    yield StreamChunk(
+                        type="error",
+                        content=content,
+                        data={"error_type": "timeout",
+                              "timeout_kind": timeout_kind})
                     timed_out = True
                     break
-                line_b = await proc.stdout.readline()
                 if not line_b:
                     break
+                last_activity = time.time()
                 s = line_b.decode("utf-8", errors="replace").strip()
                 if not s:
                     continue
@@ -310,6 +456,8 @@ class CopilotProvider(LLMProvider):
                     yield StreamChunk(type="event", data=evt)
 
             if timed_out:
+                if proc and proc.returncode is None:
+                    await proc.wait()
                 return
 
             rc = await proc.wait()
@@ -349,11 +497,14 @@ def _parse_copilot_jsonl(stdout: str) -> dict:
       - session_id: result.sessionId
       - usage.completion_tokens: assistant.message.outputTokens 합계
         (Copilot은 input_tokens를 공개하지 않음)
+      - error: result.exitCode != 0 또는 error/assistant.error 이벤트의 message
     """
     text_parts: list[str] = []
     final_message_content = ""
     session_id = ""
     completion_tokens = 0
+    error_msg = ""
+    result_exit_code: int | None = None
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -378,9 +529,23 @@ def _parse_copilot_jsonl(stdout: str) -> dict:
             sid = evt.get("sessionId")
             if sid:
                 session_id = sid
+            if evt.get("exitCode") is not None:
+                result_exit_code = int(evt["exitCode"])
+            # 명시적 error 메시지가 result에 담겨 올 수도
+            if evt.get("error"):
+                e = evt["error"]
+                error_msg = e if isinstance(e, str) else str(e)
+        elif etype in ("error", "assistant.error", "session.error"):
+            data = evt.get("data") or {}
+            msg = data.get("message") or evt.get("message") or str(data)
+            if msg:
+                error_msg = msg
 
     # delta로 모은 게 있으면 우선, 없으면 최종 message content 사용
     text = "".join(text_parts) if text_parts else final_message_content
+    # exitCode != 0 이지만 별도 메시지가 없으면 일반 표기
+    if not error_msg and result_exit_code not in (None, 0):
+        error_msg = f"copilot exit={result_exit_code}"
 
     return {
         "text": text.strip(),
@@ -390,4 +555,5 @@ def _parse_copilot_jsonl(stdout: str) -> dict:
             completion_tokens=completion_tokens,
             total_tokens=completion_tokens,
             cached_tokens=0),
+        "error": error_msg,
     }

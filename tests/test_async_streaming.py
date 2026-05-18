@@ -214,6 +214,41 @@ def test_chat_stream_yields_text_chunks():
     assert stats["total_tokens"] == 6
 
 
+def test_chat_stream_passes_idle_and_wall_timeout():
+    class TimeoutAwareProvider(StreamingProvider):
+        provider_id = "timeoutp"
+
+        def __init__(self):
+            self.last_idle_timeout = None
+            self.last_wall_timeout = None
+
+        async def stream_async(self, messages, *, model="", timeout=120,
+                               session_id="", cwd=None, idle_timeout=None,
+                               wall_timeout=None):
+            self.last_idle_timeout = idle_timeout
+            self.last_wall_timeout = wall_timeout
+            yield StreamChunk(type="text", content="ok")
+            yield StreamChunk(type="done", content="ok",
+                              session_id=session_id or "sid")
+
+    p = TimeoutAwareProvider()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order(["timeoutp"])
+    client = LLMClient(store=MemoryStore(), registry=reg)
+
+    async def collect():
+        return [
+            c async for c in client.chat_stream(
+                "hi", provider="timeoutp", owner="b",
+                idle_timeout=7, wall_timeout=30)
+        ]
+
+    asyncio.run(collect())
+    assert p.last_idle_timeout == 7
+    assert p.last_wall_timeout == 30
+
+
 def test_chat_stream_failed_call_does_not_pollute():
     """스트리밍 중 text가 하나도 없으면 실패로 취급 → 저장 안 됨."""
     class FailStreamProvider(LLMProvider):
@@ -250,11 +285,151 @@ def test_chat_stream_failed_call_does_not_pollute():
         return out
 
     chunks = asyncio.run(collect())
-    # error 청크는 그대로 전달되어야 함
-    assert any(c.type == "error" for c in chunks)
+    # error 청크는 표준 필드를 채워 전달되어야 함
+    errors = [c for c in chunks if c.type == "error"]
+    assert errors
+    assert errors[0].data["provider"] == "fs"
+    assert errors[0].data["error_type"] == "unknown"
+    assert errors[0].data["recoverable"] is False
+    assert "suggested_action" in errors[0].data
+    assert "exit_code" in errors[0].data
     assert store.get_messages("bot:dead") == []
     stats = store.get_token_stats("b")
     assert stats["total_calls"] == 0
+
+
+def test_chat_stream_pre_output_fallback():
+    class FailBeforeOutput(LLMProvider):
+        provider_id = "primary"
+        supports_streaming = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages, **kw):
+            return LLMResponse(content="", provider=self.provider_id, model="")
+
+        async def stream_async(self, messages, **kw):
+            self.calls += 1
+            yield StreamChunk(type="error", content="rate limit")
+            yield StreamChunk(type="done", content="")
+
+        def list_models(self): return []
+        def is_available(self): return True
+
+    class FallbackStream(LLMProvider):
+        provider_id = "fallback"
+        supports_streaming = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages, **kw):
+            return LLMResponse(content="fallback ok",
+                               provider=self.provider_id, model="")
+
+        async def stream_async(self, messages, **kw):
+            self.calls += 1
+            yield StreamChunk(type="text", content="fallback ok")
+            yield StreamChunk(type="done", content="fallback ok",
+                              session_id="fb-sid",
+                              usage=TokenUsage(total_tokens=4),
+                              data={"provider": self.provider_id,
+                                    "latency_ms": 3})
+
+        def list_models(self): return []
+        def is_available(self): return True
+
+    primary = FailBeforeOutput()
+    fallback = FallbackStream()
+    store = MemoryStore()
+    reg = ProviderRegistry()
+    reg.register(primary)
+    reg.register(fallback)
+    reg.set_fallback_order(["primary", "fallback"])
+    client = LLMClient(store=store, registry=reg)
+
+    async def collect():
+        return [
+            c async for c in client.chat_stream(
+                "hi", provider="primary", owner="b", alias="s",
+                fallback=True)
+        ]
+
+    chunks = asyncio.run(collect())
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    assert [c.content for c in chunks if c.type == "text"] == ["fallback ok"]
+    assert not [c for c in chunks if c.type == "error"]
+    done = [c for c in chunks if c.type == "done"][0]
+    assert done.data["provider"] == "fallback"
+    assert done.content == "fallback ok"
+
+
+def test_chat_stream_does_not_fallback_after_output():
+    class PartialThenFail(LLMProvider):
+        provider_id = "primary"
+        supports_streaming = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages, **kw):
+            return LLMResponse(content="", provider=self.provider_id, model="")
+
+        async def stream_async(self, messages, **kw):
+            self.calls += 1
+            yield StreamChunk(type="text", content="partial")
+            yield StreamChunk(type="error", content="rate limit")
+            yield StreamChunk(type="done", content="")
+
+        def list_models(self): return []
+        def is_available(self): return True
+
+    class ShouldNotRun(LLMProvider):
+        provider_id = "fallback"
+        supports_streaming = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages, **kw):
+            return LLMResponse(content="bad", provider=self.provider_id,
+                               model="")
+
+        async def stream_async(self, messages, **kw):
+            self.calls += 1
+            yield StreamChunk(type="text", content="bad")
+            yield StreamChunk(type="done", content="bad")
+
+        def list_models(self): return []
+        def is_available(self): return True
+
+    primary = PartialThenFail()
+    fallback = ShouldNotRun()
+    store = MemoryStore()
+    reg = ProviderRegistry()
+    reg.register(primary)
+    reg.register(fallback)
+    reg.set_fallback_order(["primary", "fallback"])
+    client = LLMClient(store=store, registry=reg)
+
+    async def collect():
+        return [
+            c async for c in client.chat_stream(
+                "hi", provider="primary", owner="b",
+                conversation_id="stream-partial", fallback=True)
+        ]
+
+    chunks = asyncio.run(collect())
+    assert primary.calls == 1
+    assert fallback.calls == 0
+    assert [c.content for c in chunks if c.type == "text"] == ["partial"]
+    errors = [c for c in chunks if c.type == "error"]
+    assert errors[0].data["provider"] == "primary"
+    assert errors[0].data["error_type"] == "usage_limit"
+    assert store.get_messages("stream-partial") == []
+    assert store.get_token_stats("b")["total_calls"] == 0
 
 
 # ===== 4. chat_async도 세션 provider 규칙 준수 =====

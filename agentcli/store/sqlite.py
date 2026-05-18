@@ -1,15 +1,27 @@
-"""SQLite 대화 저장소."""
+"""SQLite-backed session metadata and usage store.
+
+Despite the generic `ConversationStore` interface, this is not intended to be a
+chat transcript database for session CLI providers. Claude/Codex/Copilot keep
+turn history in their own session files; SQLite persists only the app-side
+handles needed to resume them (`conversation_id`, `alias`,
+`session_id:<provider>`), instruction hashes, and token/latency usage logs.
+
+The `messages` table remains for non-session providers and backward-compatible
+store semantics. Session-capable providers should leave it empty.
+"""
 
 import json
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
+from threading import RLock
 from .base import ConversationStore
 from ..types import Conversation, Message
 
 
 class SQLiteStore(ConversationStore):
     def __init__(self, db_path: str = ":memory:"):
+        self._lock = RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         if db_path != ":memory:":
@@ -37,6 +49,9 @@ class SQLiteStore(ConversationStore):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_owner_alias
                 ON conversations(owner, alias) WHERE alias != '';
 
+            -- Only non-session providers should write prompt/response content.
+            -- Session providers store their native CLI session id in
+            -- conversations.metadata instead and leave this table empty.
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
@@ -261,11 +276,13 @@ class SQLiteStore(ConversationStore):
                         model: str = "", agent: str = "",
                         group_by: str | None = None) -> dict:
         """토큰 사용 통계 조회 (usage_log 기반, 다축 집계 지원)."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-
-        where = ["u.timestamp >= ?"]
-        params: list = [cutoff]
+        where = []
+        params: list = []
         join = ""
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            where.append("u.timestamp >= ?")
+            params.append(cutoff)
         if owner:
             join = "JOIN conversations c ON u.conversation_id = c.id"
             where.append("c.owner = ?")
@@ -288,7 +305,7 @@ class SQLiteStore(ConversationStore):
                    u.cached_tokens, u.latency_ms, u.provider, u.model,
                    u.agent, u.alias, u.timestamp
             FROM usage_log u {join}
-            WHERE {' AND '.join(where)}
+            WHERE {' AND '.join(where) if where else '1=1'}
         """
         rows = self._conn.execute(sql, params).fetchall()
 
@@ -327,6 +344,9 @@ class SQLiteStore(ConversationStore):
             out["group_by"] = group_by
             out["groups"] = groups
         return out
+
+
+SQLiteSessionStore = SQLiteStore
 
 
 def _sqlite_group_key(row, axis: str) -> str:

@@ -1,6 +1,8 @@
 from datetime import datetime
-from agentcli.store.sqlite import SQLiteStore
-from agentcli.types import Message
+from agentcli import LLMClient, ProviderRegistry
+from agentcli.providers.base import LLMProvider
+from agentcli.store.sqlite import SQLiteSessionStore, SQLiteStore
+from agentcli.types import LLMResponse, Message, TokenUsage
 
 
 def test_create_tables():
@@ -10,6 +12,10 @@ def test_create_tables():
     names = [r[0] for r in tables]
     assert "conversations" in names
     assert "messages" in names
+
+
+def test_sqlite_session_store_alias():
+    assert SQLiteSessionStore is SQLiteStore
 
 
 def test_create_and_get():
@@ -87,6 +93,16 @@ def test_token_stats():
     assert stats["by_provider"]["claude"] == 270
 
 
+def test_token_stats_days_zero_means_all_rows():
+    store = SQLiteStore(":memory:")
+    conv = store.create("bot1", "claude")
+    store.record_usage(conv.id, total_tokens=10, provider="claude")
+
+    stats = store.get_token_stats("bot1", days=0)
+    assert stats["total_tokens"] == 10
+    assert stats["total_calls"] == 1
+
+
 def test_set_metadata():
     store = SQLiteStore(":memory:")
     conv = store.create("bot1", "claude")
@@ -113,3 +129,40 @@ def test_record_usage_not_in_messages():
         "SELECT COUNT(*) AS n FROM usage_log WHERE conversation_id=?",
         (conv.id,)).fetchone()
     assert rows["n"] == 1
+
+
+def test_session_provider_does_not_write_messages_to_sqlite():
+    class SessionProvider(LLMProvider):
+        provider_id = "sess"
+        supports_sessions = True
+
+        def invoke(self, messages, *, model="", timeout=120,
+                   session_id="", cwd=None):
+            return LLMResponse(
+                content="ok", provider=self.provider_id, model=model,
+                session_id=session_id or "sid-1",
+                tokens=TokenUsage(total_tokens=7))
+
+        def list_models(self):
+            return []
+
+        def is_available(self):
+            return True
+
+    store = SQLiteStore(":memory:")
+    provider = SessionProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    registry.set_fallback_order(["sess"])
+    client = LLMClient(store=store, registry=registry)
+
+    resp = client.chat("hello", provider="sess", owner="bot", alias="worker")
+
+    assert resp.content == "ok"
+    assert store.get_messages(resp.conversation_id) == []
+    row = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?",
+        (resp.conversation_id,)).fetchone()
+    assert row["n"] == 0
+    stats = store.get_token_stats("bot")
+    assert stats["total_calls"] == 1

@@ -225,7 +225,7 @@ class AgentProfile:
         header = (
             f"{MANAGED_MARKER}\n"
             f"<!-- profile: {self.name} | source: {src} | "
-            f"hash: {self.hash()} | at: {datetime.now().isoformat()} -->\n"
+            f"hash: {self.hash()} -->\n"
             f"<!-- do-not-edit manually; regenerate via AgentProfile.materialize -->\n\n"
         )
         return header + text.rstrip() + "\n"

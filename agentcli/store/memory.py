@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime, timedelta
+from threading import RLock
 from .base import ConversationStore
 from ..types import Conversation, Message
 
@@ -45,6 +46,7 @@ def _group_key(row: dict, axis: str) -> str:
 
 class MemoryStore(ConversationStore):
     def __init__(self, max_conversations: int = 200, ttl_hours: int = 24):
+        self._lock = RLock()
         self._conversations: dict[str, Conversation] = {}
         self._messages: dict[str, list[Message]] = {}
         self._usage: dict[str, list[dict]] = {}

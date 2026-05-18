@@ -215,7 +215,7 @@ def test_filter_plus_group_by():
     client.chat("a", provider="claude", owner="u", alias="bull",
                 model="sonnet", conversation_id="c1")
     client.chat("b", provider="codex", owner="u", alias="bull",
-                model="o3", conversation_id="c2")
+                model="o3", conversation_id="c1")
     client.chat("c", provider="codex", owner="u", alias="bear",
                 model="o3", conversation_id="c3")
 

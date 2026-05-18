@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentcli"
-version = "0.2.0"
-description = "Agentic CLI embedding toolkit — unify Claude Code, Codex, and GitHub Copilot CLI under one session-aware API (async, streaming, token tracking, drift observability)."
+version = "0.4.0"
+description = "Lightweight session-aware Python API for Claude Code, Codex, and GitHub Copilot CLI."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -35,14 +35,16 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "twine>=5.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/sungchulJE/agentcli"
-Repository = "https://github.com/sungchulJE/agentcli"
-Issues = "https://github.com/sungchulJE/agentcli/issues"
+Homepage = "https://github.com/saintiron82/agentcli"
+Repository = "https://github.com/saintiron82/agentcli"
+Issues = "https://github.com/saintiron82/agentcli/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentcli"]
@@ -52,7 +54,9 @@ include = [
     "agentcli/",
     "tests/",
     "examples/",
+    "docs/",
     "README.md",
+    "README.ko.md",
     "LICENSE",
     "CHANGELOG.md",
     "pyproject.toml",

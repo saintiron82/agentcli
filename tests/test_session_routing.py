@@ -95,6 +95,30 @@ def test_session_provider_does_not_inject_prev_messages():
     assert contents == ["second"]  # 오직 현재 user 메시지만
 
 
+def test_session_provider_reuses_same_system_prompt_without_reinjecting():
+    p = FakeSessionProvider()
+    client = _make_client(p)
+
+    resp1 = client.chat("first", provider="sessprov", owner="bot1",
+                        system_prompt="GUIDE v1")
+    assert [m.role for m in p.last_messages] == ["system", "user"]
+
+    client.chat("second", provider="sessprov", owner="bot1",
+                conversation_id=resp1.conversation_id,
+                system_prompt="GUIDE v1")
+    # 같은 세션이 이미 같은 system hash를 봤으면 최신 user 요청만 보낸다.
+    assert [m.content for m in p.last_messages] == ["second"]
+
+    client.chat("third", provider="sessprov", owner="bot1",
+                conversation_id=resp1.conversation_id,
+                system_prompt="GUIDE v2")
+    contents = [m.content for m in p.last_messages]
+    assert "GUIDE v2" in contents
+    assert "third" in contents
+    assert "first" not in contents
+    assert "second" not in contents
+
+
 def test_session_provider_passes_session_id_on_resume():
     p = FakeSessionProvider()
     client = _make_client(p)
@@ -108,6 +132,34 @@ def test_session_provider_passes_session_id_on_resume():
     # 두 번째 호출 시 provider.invoke는 첫 호출에서 발급된 session_id를 받아야 한다.
     assert p.last_session_id == issued_sid
     assert resp2.session_id == issued_sid
+
+
+def test_reset_on_instruction_change_starts_new_session(tmp_path):
+    p = FakeSessionProvider()
+    store = MemoryStore()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order(["sessprov"])
+    client = LLMClient(store=store, registry=reg)
+    guide = tmp_path / "GUIDE.md"
+    guide.write_text("guide v1", encoding="utf-8")
+
+    resp1 = client.chat("hi", provider="sessprov", owner="bot1",
+                        conversation_id="conv", cwd=str(tmp_path))
+    assert resp1.session_id == "session-1"
+
+    client.chat("again", provider="sessprov", owner="bot1",
+                conversation_id="conv", cwd=str(tmp_path),
+                reset_on_instruction_change=True)
+    assert p.last_session_id == resp1.session_id
+
+    guide.write_text("guide v2", encoding="utf-8")
+    resp3 = client.chat("new guide", provider="sessprov", owner="bot1",
+                        conversation_id="conv", cwd=str(tmp_path),
+                        reset_on_instruction_change=True)
+
+    assert p.last_session_id == ""
+    assert resp3.session_id == "session-3"
 
 
 def test_session_provider_does_not_store_content():
@@ -203,7 +255,7 @@ class AlwaysFailProvider(LLMProvider):
 
 
 def test_failed_call_does_not_pollute_store():
-    """실패 호출은 messages, usage_log, metadata 어디에도 기록되지 않음."""
+    """실패한 신규 호출은 conversation/messages/usage/metadata 어디에도 남지 않음."""
     p = AlwaysFailProvider()
     store = MemoryStore()
     reg = ProviderRegistry()
@@ -214,15 +266,28 @@ def test_failed_call_does_not_pollute_store():
     resp = client.chat("doomed", provider="failprov", owner="bot1")
     assert resp.content == ""
 
-    conv_id = resp.conversation_id
-    # conversation은 생성되지만 그 안에는 어떤 흔적도 없어야 함.
-    assert store.get_messages(conv_id) == []
+    assert resp.conversation_id == ""
+    assert store.list_by_owner("bot1") == []
     stats = store.get_token_stats("bot1")
     assert stats["total_calls"] == 0
-    conv = store.get(conv_id)
-    # session_id metadata도 없음
-    key = SESSION_KEY_FMT.format(provider="failprov")
-    assert key not in conv.metadata
+
+
+def test_failed_call_does_not_assign_alias_to_existing_conversation():
+    """기존 conversation에 새 alias를 붙이는 호출도 성공 전에는 store를 바꾸지 않는다."""
+    p = AlwaysFailProvider()
+    store = MemoryStore()
+    conv = store.create("bot1", "failprov", conversation_id="existing")
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order(["failprov"])
+    client = LLMClient(store=store, registry=reg)
+
+    resp = client.chat("doomed", provider="failprov", owner="bot1",
+                       conversation_id=conv.id, alias="new-alias")
+    assert resp.content == ""
+    assert resp.conversation_id == conv.id
+    assert store.find_by_alias("bot1", "new-alias") is None
+    assert store.get(conv.id).alias == ""
 
 
 def test_stable_conversation_id_preserved():
@@ -256,10 +321,59 @@ def test_fallback_does_not_propagate_session_id():
     reg.set_fallback_order(["failprov", "plain"])
 
     client = LLMClient(store=MemoryStore(), registry=reg)
-    resp = client.chat("x", provider="failprov", owner="bot1")
+    resp = client.chat("x", provider="failprov", owner="bot1",
+                       fallback=True)
 
     # fallback provider가 session_id를 빈 상태로 받았는지 확인
     assert ok_plain.last_session_id == ""
     # 응답은 fallback provider의 것
     assert resp.content == "plain-reply"
     assert resp.provider == "plain"
+
+
+def test_fallback_receives_system_prompt_even_when_primary_suppresses_it():
+    class ToggleSessionProvider(FakeSessionProvider):
+        provider_id = "primary"
+
+        def __init__(self):
+            super().__init__()
+            self.fail = False
+
+        def invoke(self, messages, *, model="", timeout=120,
+                   session_id="", cwd=None):
+            self.last_messages = list(messages)
+            self.last_session_id = session_id
+            if self.fail:
+                return LLMResponse(content="", provider=self.provider_id,
+                                   model=model, error="usage limit",
+                                   error_type="usage_limit")
+            return super().invoke(messages, model=model, timeout=timeout,
+                                  session_id=session_id, cwd=cwd)
+
+    class FallbackSessionProvider(FakeSessionProvider):
+        provider_id = "fallback"
+
+    primary = ToggleSessionProvider()
+    fallback = FallbackSessionProvider()
+    store = MemoryStore()
+    reg = ProviderRegistry()
+    reg.register(primary)
+    reg.register(fallback)
+    reg.set_fallback_order(["primary", "fallback"])
+    client = LLMClient(store=store, registry=reg)
+
+    resp1 = client.chat("first", provider="primary", owner="bot1",
+                        conversation_id="conv", system_prompt="GUIDE v1")
+    assert resp1.provider == "primary"
+    primary.fail = True
+
+    resp2 = client.chat("second", provider="primary", owner="bot1",
+                        conversation_id="conv", system_prompt="GUIDE v1",
+                        fallback=True)
+
+    assert resp2.provider == "fallback"
+    assert [m.content for m in primary.last_messages] == ["second"]
+    fallback_contents = [m.content for m in fallback.last_messages]
+    assert "GUIDE v1" in fallback_contents
+    assert "second" in fallback_contents
+    assert "first" not in fallback_contents
