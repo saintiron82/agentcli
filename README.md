@@ -95,7 +95,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.0"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.1"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -261,6 +261,7 @@ successful call.
 # Raw totals
 stats = client.get_token_stats(owner="team")
 # {total_tokens, total_prompt, total_completion, total_cached,
+#  total_payload_prompt, prompt_tokens_unreliable_calls,
 #  total_latency_ms, total_calls, by_provider}
 
 # Group by alias / model / provider / agent / day
@@ -273,7 +274,13 @@ sonnet_only = client.get_token_stats(owner="team",
                                      provider="claude", model="sonnet")
 ```
 
-`total_cached` tracks Codex's `cached_input_tokens` (prompt caching). Copilot does not expose input tokens — `prompt_tokens` is 0 for Copilot calls.
+`total_prompt` remains the provider CLI reported prompt/input token count.
+For session CLIs this value is not a portable "payload size": Codex can include
+its internal agent context, Claude Code can report only a partial input count,
+and Copilot does not expose input tokens. Use `total_payload_prompt` for the
+small prompt string estimate that agentcli passed to the CLI, and check
+`prompt_tokens_unreliable_calls` before using provider-reported prompt totals
+for cost or comparison.
 
 ### Model selection
 
@@ -387,10 +394,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-223 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, and Codex/Copilot JSONL parsing.
+228 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, and Codex/Copilot JSONL parsing.
 
 ## Status
 
+- **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
 - Runtime deps: **none**.
 - Tested on macOS. Linux should work (same CLI invocation path); Windows partial (only via `gh copilot` wrapper).
@@ -400,7 +408,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.4.0 release note: [docs/releases/v0.4.0.md](docs/releases/v0.4.0.md) / [docs/releases/v0.4.0.ko.md](docs/releases/v0.4.0.ko.md)
+- v0.4.1 release note: [docs/releases/v0.4.1.md](docs/releases/v0.4.1.md) / [docs/releases/v0.4.1.ko.md](docs/releases/v0.4.1.ko.md)
 
 ## License
 

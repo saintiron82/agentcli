@@ -14,17 +14,17 @@ real Claude Code, Codex, and GitHub Copilot CLI behavior.
 3. Tag the commit:
 
    ```bash
-   git tag v0.4.0
+   git tag v0.4.1
    git push origin main --tags
    ```
 
-4. Create a simple GitHub Release named `v0.4.0` using
-   [docs/releases/v0.4.0.md](releases/v0.4.0.md) as the release note.
+4. Create a simple GitHub Release named `v0.4.1` using
+   [docs/releases/v0.4.1.md](releases/v0.4.1.md) as the release note.
 
 5. Users can install with:
 
    ```bash
-   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.0"
+   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.1"
    ```
 
 ## Stage 2: PyPI release

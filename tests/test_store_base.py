@@ -21,6 +21,9 @@ def test_concrete_subclass():
         def set_alias(self, conversation_id, alias): pass
         def record_usage(self, conversation_id, *, prompt_tokens=0,
                          completion_tokens=0, total_tokens=0, cached_tokens=0,
+                         payload_prompt_tokens=0,
+                         prompt_tokens_reliable=True,
+                         prompt_tokens_source="",
                          latency_ms=0, provider="", model="",
                          agent="", alias=""): pass
         def get_token_stats(self, owner="", days=7, *, alias="",

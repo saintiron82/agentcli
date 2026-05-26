@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1 — 2026-05-26
+
+### Fixed
+- Codex provider now resolves the CLI binary path before invocation, so Windows
+  installs such as `codex.CMD` are used consistently with health checks.
+- Provider prompt token reporting is now explicit about source and reliability:
+  `TokenUsage` carries `payload_prompt_tokens`,
+  `prompt_tokens_reliable`, and `prompt_tokens_source`.
+
+### Changed
+- Usage stats now include `total_payload_prompt` and
+  `prompt_tokens_unreliable_calls` so app integrations can separate the prompt
+  agentcli sent from provider CLI reported input usage.
+
 ## 0.4.0 — 2026-05-06
 
 ### Added

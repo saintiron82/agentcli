@@ -368,7 +368,9 @@ class CopilotProvider(LLMProvider):
                 env=build_env(), cwd=cwd)
 
             text_parts: list[str] = []
-            final_usage = TokenUsage()
+            final_usage = TokenUsage(
+                prompt_tokens_reliable=False,
+                prompt_tokens_source="copilot_not_reported")
             final_sid = session_id or alias
             timed_out = False
             # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
@@ -444,7 +446,9 @@ class CopilotProvider(LLMProvider):
                                 + int(data["outputTokens"]),
                             total_tokens=final_usage.total_tokens
                                 + int(data["outputTokens"]),
-                            cached_tokens=final_usage.cached_tokens)
+                            cached_tokens=final_usage.cached_tokens,
+                            prompt_tokens_reliable=False,
+                            prompt_tokens_source="copilot_not_reported")
                 elif etype == "result":
                     sid = evt.get("sessionId")
                     if sid:
@@ -554,6 +558,8 @@ def _parse_copilot_jsonl(stdout: str) -> dict:
             prompt_tokens=0,            # Copilot 미공개
             completion_tokens=completion_tokens,
             total_tokens=completion_tokens,
-            cached_tokens=0),
+            cached_tokens=0,
+            prompt_tokens_reliable=False,
+            prompt_tokens_source="copilot_not_reported"),
         "error": error_msg,
     }

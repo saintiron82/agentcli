@@ -14,6 +14,12 @@ class TokenUsage:
     # prompt 토큰 중 캐시 히트로 처리된 수 (Codex cached_input_tokens, Anthropic cache_read).
     # 일반적으로 단가가 1/10 수준이므로 비용 계산 시 분리 필요.
     cached_tokens: int = 0
+    # agentcli가 provider CLI에 직접 넘긴 prompt 문자열의 가벼운 추정치.
+    # provider CLI가 내부 agent 컨텍스트를 더하거나 일부 usage만 공개할 수 있어
+    # prompt_tokens와 별도로 보관한다.
+    payload_prompt_tokens: int = 0
+    prompt_tokens_reliable: bool = True
+    prompt_tokens_source: str = "provider_reported"
 
 
 @dataclass

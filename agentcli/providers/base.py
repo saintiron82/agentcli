@@ -37,6 +37,14 @@ def build_session_prompt(messages: list[Message]) -> str:
     return f"System instructions:\n{system_text}\n\nUser request:\n{latest_user}"
 
 
+def estimate_payload_prompt_tokens(prompt: str) -> int:
+    """Return a cheap estimate for the prompt string agentcli passed to the CLI."""
+    text = prompt.strip()
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
 class LLMProvider(ABC):
     provider_id: str = ""
     supports_sessions: bool = False

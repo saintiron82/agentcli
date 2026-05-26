@@ -18,6 +18,8 @@ class TaggedProvider(LLMProvider):
         self.supports_sessions = supports_sessions
         self.next_cached = 0
         self.next_model = ""
+        self.next_payload_prompt = 0
+        self.next_prompt_reliable = True
 
     def invoke(self, messages, *, model="", timeout=120, session_id="",
                cwd=None, alias=""):
@@ -26,7 +28,10 @@ class TaggedProvider(LLMProvider):
             model=model or self.next_model,
             tokens=TokenUsage(prompt_tokens=100, completion_tokens=50,
                               total_tokens=150,
-                              cached_tokens=self.next_cached),
+                              cached_tokens=self.next_cached,
+                              payload_prompt_tokens=self.next_payload_prompt,
+                              prompt_tokens_reliable=self.next_prompt_reliable,
+                              prompt_tokens_source="test_provider"),
             latency_ms=10,
             session_id=session_id or "sid-x")
 
@@ -65,6 +70,21 @@ def test_cached_tokens_stored_in_usage():
     assert stats["total_tokens"] == 150
 
 
+def test_payload_prompt_and_reliability_stored_in_usage():
+    p = TaggedProvider("claude")
+    p.next_payload_prompt = 8
+    p.next_prompt_reliable = False
+    store = MemoryStore()
+    client = _build_client([p], store=store)
+
+    client.chat("hi", provider="claude", owner="u",
+                conversation_id="c1", alias="bull")
+
+    stats = client.get_token_stats("u")
+    assert stats["total_payload_prompt"] == 8
+    assert stats["prompt_tokens_unreliable_calls"] == 1
+
+
 def test_cached_tokens_sqlite_stored():
     """SQLiteStore도 cached_tokens 컬럼에 저장."""
     p = TaggedProvider("claude")
@@ -76,6 +96,21 @@ def test_cached_tokens_sqlite_stored():
                 conversation_id="c1", alias="x")
     stats = client.get_token_stats("u")
     assert stats["total_cached"] == 20
+
+
+def test_payload_prompt_and_reliability_sqlite_stored():
+    p = TaggedProvider("claude")
+    p.next_payload_prompt = 8
+    p.next_prompt_reliable = False
+    store = SQLiteStore(":memory:")
+    client = _build_client([p], store=store)
+
+    client.chat("hi", provider="claude", owner="u",
+                conversation_id="c1", alias="x")
+
+    stats = client.get_token_stats("u")
+    assert stats["total_payload_prompt"] == 8
+    assert stats["prompt_tokens_unreliable_calls"] == 1
 
 
 # ===== 필터 =====

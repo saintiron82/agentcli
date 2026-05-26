@@ -95,10 +95,42 @@ def test_invoke_new_session(mock_env, mock_run):
     assert resp.tokens.prompt_tokens == 10
     assert resp.tokens.completion_tokens == 5
     cmd = mock_run.call_args[0][0]
-    assert cmd[0] == "codex"
+    assert cmd[0].endswith("codex")
     assert cmd[1] == "exec"
     assert "--json" in cmd
     assert "resume" not in cmd
+
+
+@patch("agentcli.providers.codex.shutil.which", return_value=r"C:\Users\u\AppData\Roaming\npm\codex.CMD")
+def test_build_cmd_uses_resolved_binary_path(mock_which):
+    p = CodexProvider()
+
+    cmd = p._build_cmd("hi", "", None, "")
+
+    assert cmd[0] == r"C:\Users\u\AppData\Roaming\npm\codex.CMD"
+
+
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            '{"type":"thread.started","thread_id":"tid-usage"}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"A"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":19000,'
+            '"cached_input_tokens":4480,"output_tokens":5}}\n'
+        ),
+        stderr="")
+    p = CodexProvider()
+
+    resp = p.invoke([Message(role="user", content="short prompt")])
+
+    assert resp.tokens.prompt_tokens == 19000
+    assert resp.tokens.payload_prompt_tokens > 0
+    assert resp.tokens.payload_prompt_tokens < resp.tokens.prompt_tokens
+    assert resp.tokens.prompt_tokens_reliable is False
+    assert resp.tokens.prompt_tokens_source == "codex_cli_reported"
 
 
 @patch("agentcli.providers.codex.subprocess.run")
@@ -112,7 +144,8 @@ def test_invoke_resume_session(mock_env, mock_run):
     p = CodexProvider()
     resp = p.invoke([Message(role="user", content="follow")], session_id="tid-existing")
     cmd = mock_run.call_args[0][0]
-    assert cmd[:3] == ["codex", "exec", "resume"]
+    assert cmd[0].endswith("codex")
+    assert cmd[1:3] == ["exec", "resume"]
     assert "tid-existing" in cmd
     # resume에는 -s sandbox 옵션이 없어야 함
     assert "-s" not in cmd

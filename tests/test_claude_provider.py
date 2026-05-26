@@ -80,6 +80,23 @@ def test_invoke_success(mock_find, mock_run):
 
 @patch("agentcli.providers.claude.subprocess.run")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_marks_claude_prompt_usage_as_provider_reported(mock_find, mock_run):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout='{"result":"응답입니다","usage":{"input_tokens":6,"output_tokens":2}}',
+        stderr="")
+    p = ClaudeProvider()
+
+    resp = p.invoke([Message(role="user", content="longer user prompt than six tokens")])
+
+    assert resp.tokens.prompt_tokens == 6
+    assert resp.tokens.payload_prompt_tokens > 0
+    assert resp.tokens.prompt_tokens_reliable is False
+    assert resp.tokens.prompt_tokens_source == "claude_cli_reported"
+
+
+@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_resume_session(mock_find, mock_run):
     mock_run.return_value = MagicMock(
         returncode=0, stdout='{"result":"ok"}', stderr="")

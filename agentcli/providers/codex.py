@@ -19,7 +19,8 @@ import subprocess
 import time
 from typing import AsyncIterator
 
-from .base import (LLMProvider, build_session_prompt, health_from_response,
+from .base import (LLMProvider, build_session_prompt,
+                   estimate_payload_prompt_tokens, health_from_response,
                    run_health_command)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
@@ -94,6 +95,9 @@ class CodexProvider(LLMProvider):
     def is_available(self) -> bool:
         return shutil.which("codex") is not None
 
+    def _find_binary(self) -> str | None:
+        return shutil.which("codex")
+
     def list_models(self) -> list[dict]:
         return list(CODEX_MODELS)
 
@@ -144,7 +148,7 @@ class CodexProvider(LLMProvider):
     def _build_cmd(self, prompt: str, model: str, cwd: str | None,
                    session_id: str) -> list[str]:
         """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립."""
-        cmd = ["codex", "exec"]
+        cmd = [self._find_binary() or "codex", "exec"]
         if session_id:
             cmd += ["resume", "--json"]
             if self._full_auto:
@@ -201,6 +205,9 @@ class CodexProvider(LLMProvider):
                     exit_code=result.returncode)
 
             parsed = _parse_jsonl_events(result.stdout)
+            parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+            parsed["usage"].prompt_tokens_reliable = False
+            parsed["usage"].prompt_tokens_source = "codex_cli_reported"
             err = parsed.get("error", "")
             return LLMResponse(
                 content=parsed["text"] if not err else "",
@@ -320,7 +327,10 @@ class CodexProvider(LLMProvider):
                 env=build_env(), cwd=cwd)
 
             text_parts: list[str] = []
-            final_usage = TokenUsage()
+            final_usage = TokenUsage(
+                payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                prompt_tokens_reliable=False,
+                prompt_tokens_source="codex_cli_reported")
             final_sid = session_id
             timed_out = False
             # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
@@ -409,7 +419,10 @@ class CodexProvider(LLMProvider):
                         prompt_tokens=pt,
                         completion_tokens=ct,
                         total_tokens=pt + ct,
-                        cached_tokens=cached)
+                        cached_tokens=cached,
+                        payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                        prompt_tokens_reliable=False,
+                        prompt_tokens_source="codex_cli_reported")
                 elif etype == "error":
                     msg = evt.get("message", "")
                     yield StreamChunk(type="error", content=msg, data=evt)
@@ -510,6 +523,8 @@ def _parse_jsonl_events(stdout: str) -> dict:
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
         cached_tokens=cached_tokens,
+        prompt_tokens_reliable=False,
+        prompt_tokens_source="codex_cli_reported",
     )
     return {
         "text": "".join(text_parts).strip(),

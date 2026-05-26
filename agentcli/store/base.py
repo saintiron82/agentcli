@@ -62,12 +62,18 @@ class ConversationStore(ABC):
     def record_usage(self, conversation_id: str, *,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      total_tokens: int = 0, cached_tokens: int = 0,
+                     payload_prompt_tokens: int = 0,
+                     prompt_tokens_reliable: bool = True,
+                     prompt_tokens_source: str = "",
                      latency_ms: int = 0,
                      provider: str = "", model: str = "",
                      agent: str = "", alias: str = "") -> None:
         """AI 호출의 토큰·지연시간을 기록.
 
         cached_tokens: prompt 중 캐시 히트 수 (비용 계산용).
+        payload_prompt_tokens: agentcli가 CLI에 넘긴 prompt 문자열의 추정 토큰 수.
+        prompt_tokens_reliable: prompt_tokens가 cross-provider 비교에 안전한지 여부.
+        prompt_tokens_source: prompt_tokens 출처.
         alias: 호출 시점의 Conversation alias (에이전트 축 집계용).
         agent: 메시지 작성자 에이전트 (멀티에이전트 한 세션 내 구분).
         """

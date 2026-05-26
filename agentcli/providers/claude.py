@@ -10,7 +10,8 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from .base import (LLMProvider, build_session_prompt, health_from_response,
+from .base import (LLMProvider, build_session_prompt,
+                   estimate_payload_prompt_tokens, health_from_response,
                    run_health_command)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
@@ -182,6 +183,9 @@ class ClaudeProvider(LLMProvider):
                 )
 
             content, tokens, err = _parse_claude_json(result.stdout)
+            tokens.payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+            tokens.prompt_tokens_reliable = False
+            tokens.prompt_tokens_source = "claude_cli_reported"
             return LLMResponse(
                 content=content if not err else "",
                 provider=self.provider_id, model=model,
@@ -300,7 +304,10 @@ class ClaudeProvider(LLMProvider):
                 cwd=cwd)
 
             total_content_parts: list[str] = []
-            final_usage = TokenUsage()
+            final_usage = TokenUsage(
+                payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                prompt_tokens_reliable=False,
+                prompt_tokens_source="claude_cli_reported")
             final_session_id = used_sid
             timed_out = False
 
@@ -395,7 +402,10 @@ class ClaudeProvider(LLMProvider):
                     ct = int(usage.get("output_tokens") or 0)
                     final_usage = TokenUsage(
                         prompt_tokens=pt, completion_tokens=ct,
-                        total_tokens=pt + ct)
+                        total_tokens=pt + ct,
+                        payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                        prompt_tokens_reliable=False,
+                        prompt_tokens_source="claude_cli_reported")
                     if evt.get("session_id"):
                         final_session_id = evt["session_id"]
                 else:

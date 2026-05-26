@@ -9,7 +9,8 @@ from ..types import Conversation, Message
 
 _BUCKET_KEYS = (
     "total_tokens", "total_prompt", "total_completion", "total_cached",
-    "total_latency_ms", "total_calls",
+    "total_payload_prompt", "total_latency_ms", "total_calls",
+    "prompt_tokens_unreliable_calls",
 )
 
 
@@ -22,8 +23,11 @@ def _accumulate(bucket: dict, row: dict) -> None:
     bucket["total_prompt"] += row.get("prompt_tokens", 0)
     bucket["total_completion"] += row.get("completion_tokens", 0)
     bucket["total_cached"] += row.get("cached_tokens", 0)
+    bucket["total_payload_prompt"] += row.get("payload_prompt_tokens", 0)
     bucket["total_latency_ms"] += row.get("latency_ms", 0)
     bucket["total_calls"] += 1
+    if not row.get("prompt_tokens_reliable", True):
+        bucket["prompt_tokens_unreliable_calls"] += 1
 
 
 def _group_key(row: dict, axis: str) -> str:
@@ -163,6 +167,9 @@ class MemoryStore(ConversationStore):
     def record_usage(self, conversation_id: str, *,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      total_tokens: int = 0, cached_tokens: int = 0,
+                     payload_prompt_tokens: int = 0,
+                     prompt_tokens_reliable: bool = True,
+                     prompt_tokens_source: str = "",
                      latency_ms: int = 0,
                      provider: str = "", model: str = "",
                      agent: str = "", alias: str = "") -> None:
@@ -179,6 +186,9 @@ class MemoryStore(ConversationStore):
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "cached_tokens": cached_tokens,
+            "payload_prompt_tokens": payload_prompt_tokens,
+            "prompt_tokens_reliable": prompt_tokens_reliable,
+            "prompt_tokens_source": prompt_tokens_source,
             "latency_ms": latency_ms,
             "provider": provider,
             "model": model,

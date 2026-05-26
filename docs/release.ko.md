@@ -13,16 +13,16 @@ API가 아직 beta이고 실제 Claude Code, Codex, GitHub Copilot CLI 환경에
 3. 커밋에 태그를 붙입니다.
 
    ```bash
-   git tag v0.4.0
+   git tag v0.4.1
    git push origin main --tags
    ```
 
-4. [docs/releases/v0.4.0.ko.md](releases/v0.4.0.ko.md)를 기준으로 GitHub Release `v0.4.0`을 간단히 만듭니다.
+4. [docs/releases/v0.4.1.ko.md](releases/v0.4.1.ko.md)를 기준으로 GitHub Release `v0.4.1`을 간단히 만듭니다.
 
 5. 사용자는 다음 명령으로 설치할 수 있습니다.
 
    ```bash
-   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.0"
+   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.1"
    ```
 
 ## 2단계: PyPI 릴리즈

@@ -76,6 +76,9 @@ class SQLiteStore(ConversationStore):
                 completion_tokens INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
                 cached_tokens INTEGER DEFAULT 0,
+                payload_prompt_tokens INTEGER DEFAULT 0,
+                prompt_tokens_reliable INTEGER DEFAULT 1,
+                prompt_tokens_source TEXT DEFAULT '',
                 latency_ms INTEGER DEFAULT 0,
                 provider TEXT DEFAULT '',
                 model TEXT DEFAULT '',
@@ -94,6 +97,9 @@ class SQLiteStore(ConversationStore):
             "ALTER TABLE conversations ADD COLUMN alias TEXT DEFAULT ''",
             "ALTER TABLE usage_log ADD COLUMN cached_tokens INTEGER DEFAULT 0",
             "ALTER TABLE usage_log ADD COLUMN alias TEXT DEFAULT ''",
+            "ALTER TABLE usage_log ADD COLUMN payload_prompt_tokens INTEGER DEFAULT 0",
+            "ALTER TABLE usage_log ADD COLUMN prompt_tokens_reliable INTEGER DEFAULT 1",
+            "ALTER TABLE usage_log ADD COLUMN prompt_tokens_source TEXT DEFAULT ''",
         ):
             try:
                 self._conn.execute(alter)
@@ -249,6 +255,9 @@ class SQLiteStore(ConversationStore):
     def record_usage(self, conversation_id: str, *,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      total_tokens: int = 0, cached_tokens: int = 0,
+                     payload_prompt_tokens: int = 0,
+                     prompt_tokens_reliable: bool = True,
+                     prompt_tokens_source: str = "",
                      latency_ms: int = 0,
                      provider: str = "", model: str = "",
                      agent: str = "", alias: str = "") -> None:
@@ -261,11 +270,13 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             """INSERT INTO usage_log (conversation_id, timestamp,
                prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+               payload_prompt_tokens, prompt_tokens_reliable, prompt_tokens_source,
                latency_ms, provider, model, agent, alias)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (conversation_id, datetime.now().isoformat(),
              prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-             latency_ms, provider, model, agent, alias))
+             payload_prompt_tokens, 1 if prompt_tokens_reliable else 0,
+             prompt_tokens_source, latency_ms, provider, model, agent, alias))
         self._conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?",
             (datetime.now().isoformat(), conversation_id))
@@ -302,8 +313,10 @@ class SQLiteStore(ConversationStore):
 
         sql = f"""
             SELECT u.prompt_tokens, u.completion_tokens, u.total_tokens,
-                   u.cached_tokens, u.latency_ms, u.provider, u.model,
-                   u.agent, u.alias, u.timestamp
+                   u.cached_tokens, u.payload_prompt_tokens,
+                   u.prompt_tokens_reliable, u.prompt_tokens_source,
+                   u.latency_ms, u.provider, u.model, u.agent, u.alias,
+                   u.timestamp
             FROM usage_log u {join}
             WHERE {' AND '.join(where) if where else '1=1'}
         """
@@ -311,7 +324,8 @@ class SQLiteStore(ConversationStore):
 
         total = {k: 0 for k in (
             "total_tokens", "total_prompt", "total_completion",
-            "total_cached", "total_latency_ms", "total_calls")}
+            "total_cached", "total_payload_prompt", "total_latency_ms",
+            "total_calls", "prompt_tokens_unreliable_calls")}
         by_provider: dict[str, int] = {}
         groups: dict[str, dict] = {}
 
@@ -320,8 +334,11 @@ class SQLiteStore(ConversationStore):
             total["total_prompt"] += r["prompt_tokens"]
             total["total_completion"] += r["completion_tokens"]
             total["total_cached"] += r["cached_tokens"] or 0
+            total["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
             total["total_latency_ms"] += r["latency_ms"] or 0
             total["total_calls"] += 1
+            if not bool(r["prompt_tokens_reliable"]):
+                total["prompt_tokens_unreliable_calls"] += 1
             p = r["provider"] or "unknown"
             by_provider[p] = by_provider.get(p, 0) + r["total_tokens"]
             if group_by:
@@ -329,14 +346,19 @@ class SQLiteStore(ConversationStore):
                 if key not in groups:
                     groups[key] = {k: 0 for k in (
                         "total_tokens", "total_prompt", "total_completion",
-                        "total_cached", "total_latency_ms", "total_calls")}
+                        "total_cached", "total_payload_prompt",
+                        "total_latency_ms", "total_calls",
+                        "prompt_tokens_unreliable_calls")}
                 g = groups[key]
                 g["total_tokens"] += r["total_tokens"]
                 g["total_prompt"] += r["prompt_tokens"]
                 g["total_completion"] += r["completion_tokens"]
                 g["total_cached"] += r["cached_tokens"] or 0
+                g["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
                 g["total_latency_ms"] += r["latency_ms"] or 0
                 g["total_calls"] += 1
+                if not bool(r["prompt_tokens_reliable"]):
+                    g["prompt_tokens_unreliable_calls"] += 1
 
         out = dict(total)
         out["by_provider"] = by_provider
