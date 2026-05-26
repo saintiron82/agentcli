@@ -95,7 +95,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -394,10 +394,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-228 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, and Codex/Copilot JSONL parsing.
+230 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, and Codex/Copilot JSONL parsing.
 
 ## Status
 
+- **0.4.2** — Codex bootstrap greeting filtering and one-time resume retry for greeting-only first turns.
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
 - Runtime deps: **none**.
@@ -408,7 +409,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.4.1 release note: [docs/releases/v0.4.1.md](docs/releases/v0.4.1.md) / [docs/releases/v0.4.1.ko.md](docs/releases/v0.4.1.ko.md)
+- v0.4.2 release note: [docs/releases/v0.4.2.md](docs/releases/v0.4.2.md) / [docs/releases/v0.4.2.ko.md](docs/releases/v0.4.2.ko.md)
 
 ## License
 

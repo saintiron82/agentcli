@@ -75,6 +75,19 @@ def test_parse_jsonl_events_ignores_non_json_lines():
     assert result["text"] == "ok"
 
 
+def test_parse_jsonl_events_ignores_codex_initial_greeting():
+    stdout = '\n'.join([
+        '{"type":"thread.started","thread_id":"tid-greeting"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"Ready. What would you like me to work on?"}}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"label\\": \\"news\\"}"}}',
+        '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":20}}',
+    ])
+
+    result = _parse_jsonl_events(stdout)
+
+    assert result["text"] == '{"label": "news"}'
+
+
 # ===== invoke (신규 세션) =====
 
 @patch("agentcli.providers.codex.subprocess.run")
@@ -131,6 +144,38 @@ def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run
     assert resp.tokens.payload_prompt_tokens < resp.tokens.prompt_tokens
     assert resp.tokens.prompt_tokens_reliable is False
     assert resp.tokens.prompt_tokens_source == "codex_cli_reported"
+
+
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, mock_run):
+    mock_run.side_effect = [
+        MagicMock(
+            returncode=0,
+            stdout=(
+                '{"type":"thread.started","thread_id":"tid-greeting"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Ready. What would you like me to work on?"}}\n'
+                '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}\n'
+            ),
+            stderr=""),
+        MagicMock(
+            returncode=0,
+            stdout=(
+                '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n'
+                '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":5}}\n'
+            ),
+            stderr=""),
+    ]
+    p = CodexProvider()
+
+    resp = p.invoke([Message(role="user", content="real task")])
+
+    assert resp.content == "done"
+    assert resp.session_id == "tid-greeting"
+    assert mock_run.call_count == 2
+    second_cmd = mock_run.call_args_list[1][0][0]
+    assert second_cmd[1:3] == ["exec", "resume"]
+    assert "tid-greeting" in second_cmd
 
 
 @patch("agentcli.providers.codex.subprocess.run")

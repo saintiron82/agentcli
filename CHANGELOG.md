@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2 — 2026-05-26
+
+### Fixed
+- Codex provider now ignores the native CLI bootstrap greeting
+  (`Ready. What would you like me to work on?`) when parsing JSONL output.
+- If a new Codex session returns only that bootstrap greeting, agentcli retries
+  the same prompt once by resuming the newly created Codex thread.
+
 ## 0.4.1 — 2026-05-26
 
 ### Fixed

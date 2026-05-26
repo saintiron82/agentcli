@@ -29,6 +29,10 @@ from ..utils import build_env
 
 logger = logging.getLogger(__name__)
 
+_CODEX_INITIAL_GREETINGS = {
+    "ready. what would you like me to work on?",
+}
+
 CODEX_MODELS = [
     {"id": "", "name": "기본", "aliases": ["default"]},
     {
@@ -208,6 +212,31 @@ class CodexProvider(LLMProvider):
             parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
             parsed["usage"].prompt_tokens_reliable = False
             parsed["usage"].prompt_tokens_source = "codex_cli_reported"
+            if _needs_initial_greeting_retry(parsed, session_id):
+                first_thread_id = parsed["thread_id"]
+                retry_result = subprocess.run(
+                    self._build_cmd(prompt, model, cwd, first_thread_id),
+                    capture_output=True, text=True, timeout=timeout,
+                    stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
+                latency = int((time.time() - start) * 1000)
+                if retry_result.returncode != 0:
+                    msg = ((retry_result.stderr or "").strip()[:300]
+                           or f"exit={retry_result.returncode}")
+                    logger.error("Codex greeting retry 실패 (code=%d): %s",
+                                 retry_result.returncode, msg)
+                    return LLMResponse(
+                        content="", provider=self.provider_id, model=model,
+                        raw_stderr=retry_result.stderr,
+                        session_id=parsed["thread_id"],
+                        error=msg, error_type=classify_error(msg),
+                        exit_code=retry_result.returncode)
+                parsed = _parse_jsonl_events(retry_result.stdout)
+                parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+                parsed["usage"].prompt_tokens_reliable = False
+                parsed["usage"].prompt_tokens_source = "codex_cli_reported"
+                if not parsed["thread_id"]:
+                    parsed["thread_id"] = first_thread_id
+                result = retry_result
             err = parsed.get("error", "")
             return LLMResponse(
                 content=parsed["text"] if not err else "",
@@ -398,6 +427,8 @@ class CodexProvider(LLMProvider):
                     itype = item.get("type", "")
                     if itype == "agent_message":
                         text = item.get("text", "")
+                        if _is_codex_initial_greeting(text) and not text_parts:
+                            continue
                         if text:
                             text_parts.append(text)
                             yield StreamChunk(type="text", content=text,
@@ -483,6 +514,7 @@ def _parse_jsonl_events(stdout: str) -> dict:
     completion_tokens = 0
     cached_tokens = 0
     error_msg = ""
+    ignored_initial_greeting = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -502,6 +534,9 @@ def _parse_jsonl_events(stdout: str) -> dict:
             if item.get("type") == "agent_message":
                 t = item.get("text", "")
                 if t:
+                    if _is_codex_initial_greeting(t) and not text_parts:
+                        ignored_initial_greeting = True
+                        continue
                     text_parts.append(t)
         elif etype == "turn.completed":
             u = evt.get("usage") or {}
@@ -531,4 +566,19 @@ def _parse_jsonl_events(stdout: str) -> dict:
         "thread_id": thread_id,
         "usage": usage,
         "error": error_msg,
+        "ignored_initial_greeting": ignored_initial_greeting,
     }
+
+
+def _is_codex_initial_greeting(text: str) -> bool:
+    return text.strip().lower() in _CODEX_INITIAL_GREETINGS
+
+
+def _needs_initial_greeting_retry(parsed: dict, session_id: str) -> bool:
+    return (
+        not session_id
+        and bool(parsed.get("ignored_initial_greeting"))
+        and not parsed.get("text")
+        and bool(parsed.get("thread_id"))
+        and not parsed.get("error")
+    )

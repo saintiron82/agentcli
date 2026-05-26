@@ -79,7 +79,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 pip install agentcli
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -182,12 +182,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 228개 테스트는 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, Codex/Copilot JSONL parsing을 다룹니다.
+현재 230개 테스트는 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.4.1`
-- 릴리즈 노트: [docs/releases/v0.4.1.ko.md](docs/releases/v0.4.1.ko.md)
+- 현재 릴리즈: `0.4.2`
+- 릴리즈 노트: [docs/releases/v0.4.2.ko.md](docs/releases/v0.4.2.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 
 ## 라이선스

@@ -30,7 +30,7 @@ from .profile import AgentProfile, AgentRegistry, set_default_client
 try:
     __version__ = _pkg_version("agentcli")
 except PackageNotFoundError:
-    __version__ = "0.4.1"
+    __version__ = "0.4.2"
 
 __all__ = [
     "__version__",
