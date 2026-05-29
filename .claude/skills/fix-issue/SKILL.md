@@ -14,7 +14,7 @@ disable-model-invocation: true
 
 **철칙 2 (언어)**: 이 스킬이 만드는 모든 **커밋 메시지**, **PR 제목**, **PR 본문**, **이슈 코멘트**, **릴리즈 노트 한국어 파일** 의 한국어 부분은 **반드시 한국어**로 작성한다. 코드 주석, 변수명, CLI 명령어, 외부 식별자(예: `--resume`, `session_id`)는 영어 그대로. 코드 안의 사람-가독 설명 주석도 한국어 우선. (영문 릴리즈 노트 `.md`는 영어 유지 — 한·영 짝 규칙 그대로.)
 
-**철칙 3 (감시자 통과)**: Stage 4.5에서 적대적 reviewer subagent가 `request-changes`를 내면 Stage 5(병합)로 진입 금지. 사용자가 reviewer 의견을 검토하고 (a) 후속 커밋을 추가하거나 (b) 명시적으로 무시하라고 지시한 뒤에만 Stage 5 진입.
+**철칙 3 (3계층 합의 통과)**: Stage 4.5에서 `/triad-review` 스킬을 호출하여 3 reviewer + 상호 평가 + 통합 조율을 수행한다. 합의 verdict가 `request-changes`면 Stage 5(병합)로 진입 금지. 사용자가 (a) 블로커 수정 커밋을 추가하거나 (b) 명시적으로 무시하라고 지시한 뒤에만 Stage 5 진입.
 
 ---
 
@@ -141,25 +141,21 @@ disable-model-invocation: true
 
 ---
 
-## Stage 4.5: 적대적 리뷰 (Adversarial Review)
+## Stage 4.5: 3계층 리뷰 + 통합 조율 (Triad Review)
 
-**목표**: 막 생성된 PR을 까칠하고 수준 높은 senior reviewer 페르소나의 subagent가 검사 → 발견 사항을 PR 코멘트로 남기고 → 통과/차단 판정을 내린 상태. 차단되면 Stage 5 진입 금지.
+**목표**: 막 생성된 PR을 세 시각(까칠 senior / 실용주의 베테랑 / 테스트 중심)의 reviewer가 분석 → 상호 평가 → 통합 합의 verdict를 도출. 합의가 `request-changes`면 Stage 5 진입 금지.
 
-1. **reviewer subagent spawn** — Agent 도구 사용:
-   - `subagent_type`: `general-purpose` 또는 `task-orchestrator` (코드 리뷰 기능을 가진 가장 적합한 것)
-   - 프롬프트 핵심 요소 (한국어로 전달):
-     - 페르소나: "당신은 매우 까칠하고 비판적인 senior staff engineer 수준의 reviewer다. 본 PR을 절대 호의적으로 보지 않는다. agentcli의 하드 제약(`@CLAUDE.md` 참고: 런타임 의존성 0개, 3-프로바이더 정규화 계약, 세션=CLI 단일 진실, 한·영 문서 짝, '고아/orphan' 용어 금지)을 어겼는지 우선 검사한다."
-     - 입력: PR URL (`https://github.com/saintiron82/agentcli/pull/<PR번호>`), 베이스/헤드 브랜치명, 이슈 번호, 원인·해결 요약
-     - 검사 6축: 보안 / 성능 / 아키텍처(3-프로바이더 정규화 계약 위반 여부 포함) / 컨벤션(한·영 doc 짝, 커밋·PR 한국어, 금지 용어) / 복잡도 / 에러 핸들링·테스트 커버리지
-     - 산출물 요구: 발견 사항을 **확실도(certainty: high/medium/low) + 심각도(severity: blocker/major/minor/nit)** 로 분류한 표. 그리고 마지막 줄에 정확히 다음 중 하나의 verdict: `VERDICT: approve` / `VERDICT: comment` / `VERDICT: request-changes`.
-     - reviewer subagent 자신이 직접 `gh pr review <PR번호> --comment --body "<발견사항 한국어 요약>"` 을 실행하여 PR에 코멘트로 남긴다. `request-changes`인 경우 `--request-changes` 옵션 사용.
-2. **subagent 결과 파싱**:
-   - 마지막 줄에서 `VERDICT:` 추출
+1. **`/triad-review <PR번호>` 호출** — 별도 스킬 (`@.claude/skills/triad-review/SKILL.md`).
+   - Phase 1: 세 reviewer 병렬 spawn → 각자 PR에 코멘트
+   - Phase 2: 상호 평가 (cross-review) — 각자 다른 두 명의 리뷰를 동의/반박/보완으로 재평가
+   - Phase 3: 통합 조율 → 합의 verdict + 발견 사항 통합 분류 (블로커 / major-merge-then-followup / minor / 오버스펙)
+   - Phase 4: PR에 통합 합의 코멘트 한 번 첨부 + 사용자 보고
+2. **합의 verdict 처리**:
    - `approve` → Stage 5 게이트 통과
-   - `comment` → 사용자에게 reviewer의 발견 사항 요약을 전달하고, Stage 5 진입 여부를 명시적으로 확인받음 (AskUserQuestion). 사용자가 "그대로 진행" 하면 Stage 5 진입, "수정 먼저" 하면 Stage 3로 되돌아감.
-   - `request-changes` → **Stage 5 차단**. 사용자에게 reviewer 의견 전달, 후속 커밋 추가 (Stage 3로 되돌아가 회귀 테스트 보강·수정) 또는 명시적 무시 지시 후에만 Stage 5 진입.
-3. **사용자 무시 지시**: 사용자가 reviewer 의견을 "이번엔 무시하고 진행" 이라고 명시적으로 말한 경우, 그 결정과 사유를 PR 코멘트로 추가 기록(`gh pr comment <PR번호> --body "..."` 한국어)한 뒤 Stage 5 진입.
-4. TaskUpdate: adversarial-review = completed (verdict와 함께).
+   - `comment` → 사용자에게 합의된 major-merge-then-followup 항목 전달, Stage 5 진입 여부 명시 확인 (AskUserQuestion). 사용자가 "follow-up issue 만들고 머지" 선택하면 `gh issue create` 로 각 항목별 issue 생성 후 Stage 5.
+   - `request-changes` → **Stage 5 차단**. 사용자에게 합의된 블로커 목록 전달, 후속 커밋 추가 (Stage 3로 되돌아가 수정) 또는 명시적 무시 지시 후에만 Stage 5 진입.
+3. **사용자 무시 지시**: 사용자가 "이번엔 무시하고 진행" 이라고 명시적으로 말한 경우, 그 결정과 사유를 PR 코멘트로 추가 기록 (`gh pr comment <PR번호> --body "..."` 한국어)한 뒤 Stage 5 진입.
+4. TaskUpdate: adversarial-review = completed (합의 verdict 메타데이터 포함).
 
 ---
 
