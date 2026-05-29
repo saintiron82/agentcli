@@ -8,9 +8,13 @@ disable-model-invocation: true
 
 인자: `$ARGUMENTS` = GitHub 이슈 번호 (필수). 예: `/fix-issue 4` → `saintiron82/agentcli#4`.
 
-이 스킬은 **6단계**(Stage 0 준비 + Stage 1~5)를 차례로 수행한다. 각 단계는 명시적 게이트가 있어 실패 시 다음 단계로 넘어가지 않는다. 모든 단계의 진행을 TaskCreate로 추적하라.
+이 스킬은 **7단계**(Stage 0 준비 + Stage 1~4 + Stage 4.5 적대적 리뷰 + Stage 5)를 차례로 수행한다. 각 단계는 명시적 게이트가 있어 실패 시 다음 단계로 넘어가지 않는다. 모든 단계의 진행을 TaskCreate로 추적하라.
 
-**철칙**: 모든 변경은 Stage 0에서 만든 `fix/issue-<번호>-<slug>` 브랜치 위에서만 일어난다. `main`에 직접 커밋·푸시 금지. 병합은 Stage 5에서, 태그는 병합된 `main` 위에서만 찍는다.
+**철칙 1 (브랜치 격리)**: 모든 변경은 Stage 0에서 만든 `fix/issue-<번호>-<slug>` 브랜치 위에서만 일어난다. `main`에 직접 커밋·푸시 금지. 병합은 Stage 5에서, 태그는 병합된 `main` 위에서만 찍는다.
+
+**철칙 2 (언어)**: 이 스킬이 만드는 모든 **커밋 메시지**, **PR 제목**, **PR 본문**, **이슈 코멘트**, **릴리즈 노트 한국어 파일** 의 한국어 부분은 **반드시 한국어**로 작성한다. 코드 주석, 변수명, CLI 명령어, 외부 식별자(예: `--resume`, `session_id`)는 영어 그대로. 코드 안의 사람-가독 설명 주석도 한국어 우선. (영문 릴리즈 노트 `.md`는 영어 유지 — 한·영 짝 규칙 그대로.)
+
+**철칙 3 (감시자 통과)**: Stage 4.5에서 적대적 reviewer subagent가 `request-changes`를 내면 Stage 5(병합)로 진입 금지. 사용자가 reviewer 의견을 검토하고 (a) 후속 커밋을 추가하거나 (b) 명시적으로 무시하라고 지시한 뒤에만 Stage 5 진입.
 
 ---
 
@@ -34,7 +38,7 @@ disable-model-invocation: true
    ```
    - 브랜치 이름: `fix/issue-<번호>-<3~5단어-kebab-slug>` (예: `fix/issue-4-claude-p-session-deadlock`)
    - 이 브랜치를 벗어나서 어떤 파일도 만들거나 고치지 말 것.
-5. TaskCreate로 5개 태스크 등록: reproduce / root-cause / fix / release-prep / merge-and-tag.
+5. TaskCreate로 6개 태스크 등록: reproduce / root-cause / fix / release-prep / adversarial-review / merge-and-tag.
 
 ---
 
@@ -127,19 +131,41 @@ disable-model-invocation: true
    - `python -m build` 성공
    - `python -m twine check dist/*` 통과
    - 한·영 문서 짝 + CHANGELOG 항목 존재
-4. **커밋 + 푸시 + PR** (모두 fix 브랜치 위 — main에 직접 커밋 금지):
-   - 커밋 메시지: `fix(<scope>): <one-line summary> (#${ARGUMENTS})`
+4. **커밋 + 푸시 + PR** (모두 fix 브랜치 위 — main에 직접 커밋 금지). 모든 텍스트는 **한국어** (철칙 2):
+   - 커밋 메시지 형식: `fix(<scope>): <한 줄 요약> (#${ARGUMENTS})` — 한 줄 요약과 본문 모두 한국어
    - `git push -u origin fix/issue-${ARGUMENTS}-<slug>`
    - `gh pr create --base main --head fix/issue-${ARGUMENTS}-<slug>` 로 PR 생성
-   - PR 제목: `Fix #${ARGUMENTS}: <summary>`
-   - PR 본문: 이슈 링크 (`Fixes #${ARGUMENTS}`), 원인 요약(Stage 2), 변경 요약(Stage 3), upgrade notes
-5. TaskUpdate: release-prep = completed. PR URL을 사용자에게 보고하고 Stage 5 진입 확인을 받아라.
+   - PR 제목: `이슈 #${ARGUMENTS} 수정: <한국어 한 줄 요약>`
+   - PR 본문 (한국어): `Fixes #${ARGUMENTS}` 자동 close 트리거, 원인 요약(Stage 2), 변경 요약(Stage 3), 업그레이드 노트
+5. TaskUpdate: release-prep = completed. PR URL을 사용자에게 보고하고 **Stage 4.5 (적대적 리뷰)** 진입.
+
+---
+
+## Stage 4.5: 적대적 리뷰 (Adversarial Review)
+
+**목표**: 막 생성된 PR을 까칠하고 수준 높은 senior reviewer 페르소나의 subagent가 검사 → 발견 사항을 PR 코멘트로 남기고 → 통과/차단 판정을 내린 상태. 차단되면 Stage 5 진입 금지.
+
+1. **reviewer subagent spawn** — Agent 도구 사용:
+   - `subagent_type`: `general-purpose` 또는 `task-orchestrator` (코드 리뷰 기능을 가진 가장 적합한 것)
+   - 프롬프트 핵심 요소 (한국어로 전달):
+     - 페르소나: "당신은 매우 까칠하고 비판적인 senior staff engineer 수준의 reviewer다. 본 PR을 절대 호의적으로 보지 않는다. agentcli의 하드 제약(`@CLAUDE.md` 참고: 런타임 의존성 0개, 3-프로바이더 정규화 계약, 세션=CLI 단일 진실, 한·영 문서 짝, '고아/orphan' 용어 금지)을 어겼는지 우선 검사한다."
+     - 입력: PR URL (`https://github.com/saintiron82/agentcli/pull/<PR번호>`), 베이스/헤드 브랜치명, 이슈 번호, 원인·해결 요약
+     - 검사 6축: 보안 / 성능 / 아키텍처(3-프로바이더 정규화 계약 위반 여부 포함) / 컨벤션(한·영 doc 짝, 커밋·PR 한국어, 금지 용어) / 복잡도 / 에러 핸들링·테스트 커버리지
+     - 산출물 요구: 발견 사항을 **확실도(certainty: high/medium/low) + 심각도(severity: blocker/major/minor/nit)** 로 분류한 표. 그리고 마지막 줄에 정확히 다음 중 하나의 verdict: `VERDICT: approve` / `VERDICT: comment` / `VERDICT: request-changes`.
+     - reviewer subagent 자신이 직접 `gh pr review <PR번호> --comment --body "<발견사항 한국어 요약>"` 을 실행하여 PR에 코멘트로 남긴다. `request-changes`인 경우 `--request-changes` 옵션 사용.
+2. **subagent 결과 파싱**:
+   - 마지막 줄에서 `VERDICT:` 추출
+   - `approve` → Stage 5 게이트 통과
+   - `comment` → 사용자에게 reviewer의 발견 사항 요약을 전달하고, Stage 5 진입 여부를 명시적으로 확인받음 (AskUserQuestion). 사용자가 "그대로 진행" 하면 Stage 5 진입, "수정 먼저" 하면 Stage 3로 되돌아감.
+   - `request-changes` → **Stage 5 차단**. 사용자에게 reviewer 의견 전달, 후속 커밋 추가 (Stage 3로 되돌아가 회귀 테스트 보강·수정) 또는 명시적 무시 지시 후에만 Stage 5 진입.
+3. **사용자 무시 지시**: 사용자가 reviewer 의견을 "이번엔 무시하고 진행" 이라고 명시적으로 말한 경우, 그 결정과 사유를 PR 코멘트로 추가 기록(`gh pr comment <PR번호> --body "..."` 한국어)한 뒤 Stage 5 진입.
+4. TaskUpdate: adversarial-review = completed (verdict와 함께).
 
 ---
 
 ## Stage 5: 병합 + 태그 + 배포 (Merge & Tag & Publish)
 
-**목표**: main에 병합되고, 태그가 푸시되고, (선택) PyPI까지 올라간 상태. **모든 단계는 사용자 확인 후 한 단계씩 진행** — 자동 실행 금지.
+**목표**: main에 병합되고, 태그가 푸시되고, (선택) PyPI까지 올라간 상태. **모든 단계는 사용자 확인 후 한 단계씩 진행** — 자동 실행 금지. **사전 조건**: Stage 4.5에서 verdict가 `approve`이거나, `comment`/`request-changes` 후 사용자 명시 진행 지시가 있어야 한다.
 
 1. **병합** (사용자 확인 후):
    ```bash
@@ -157,7 +183,7 @@ disable-model-invocation: true
    ```bash
    python -m twine upload dist/*
    ```
-4. **이슈 마무리**: 사용자 확인 후 `gh issue comment ${ARGUMENTS}`로 수정된 버전과 PR 링크를 남기고, 적절하면 `gh issue close ${ARGUMENTS}`. 자동 close 금지 — PR이 `Fixes #N`을 포함하면 squash merge 시 자동으로 닫히지만, 그것이 의도였는지 확인.
+4. **이슈 마무리**: 사용자 확인 후 `gh issue comment ${ARGUMENTS}`로 수정된 버전과 PR 링크를 한국어로 남기고, 적절하면 `gh issue close ${ARGUMENTS}`. 자동 close 금지 — PR이 `Fixes #N`을 포함하면 squash merge 시 자동으로 닫히지만, 그것이 의도였는지 확인.
 5. **정리**: 로컬 fix 브랜치 삭제 (`gh pr merge --delete-branch`가 원격은 정리하지만 로컬은 별도):
    ```bash
    git branch -d fix/issue-${ARGUMENTS}-<slug>
@@ -171,12 +197,15 @@ disable-model-invocation: true
 - `main` 브랜치에서 직접 커밋·푸시 — 모든 변경은 `fix/issue-*` 브랜치 위에서만
 - 더러운 워킹트리에서 시작 — Stage 0 검증 통과 전 한 줄도 고치지 말 것
 - 병합 전에 태그 찍기 — 태그는 반드시 PR이 main에 병합된 직후 main 위에서만
+- **Stage 4.5 적대적 리뷰를 건너뛰고 Stage 5로 직행 — verdict가 `request-changes`인데 무시하고 머지하기**
+- 커밋 메시지·PR 제목·PR 본문을 영어로 작성 (이 스킬의 규칙은 한국어. 영문 릴리즈 노트 `.md`만 예외)
 - 재현 못한 채로 수정 들어가기 — "아마 여기겠지" 추측 수정 금지
 - `[project].dependencies`에 새 패키지 추가
 - claude만 고치고 codex/copilot 정규화 계약 깨기
 - 사용자 확인 없이 `gh pr merge`, `git tag`, `git push`, `twine upload`, `gh issue close` 실행
 - README.md만 고치고 README.ko.md 빼먹기 (또는 그 반대)
 - 한 PR에 무관한 리팩토링 끼워 넣기
+- "고아" / "orphan" 용어 사용 (`@CLAUDE.md` 글로벌 룰)
 
 ## 임시 파일 정리
 
