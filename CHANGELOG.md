@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.3 — 2026-05-29
+
+### Fixed
+- Claude provider no longer attaches `--resume <session_id>` to the `-p`
+  (print/single-shot) invocation. The two modes are structurally incompatible
+  and the combination caused a 5-minute hang on Windows when the SQLite
+  session manager replayed a stale session_id ([#4]).
+- `ClaudeProvider.supports_sessions` is now `False`, reflecting that
+  `claude -p` cannot resume a prior interactive session. The library no
+  longer stores or replays `session_id:claude` metadata. `--session-id`
+  is still emitted per call as a fresh per-call identifier for usage logs.
+
+### Changed
+- `LLMClient.get_alias_status(...)` will no longer report claude in
+  `session_providers` for new calls — this is by design since `-p` is
+  stateless. Pre-existing stored `session_id:claude` metadata in your
+  SQLite store is harmless but unused.
+
+[#4]: https://github.com/saintiron82/agentcli/issues/4
+
 ## 0.4.2 — 2026-05-26
 
 ### Fixed

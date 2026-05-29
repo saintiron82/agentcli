@@ -95,7 +95,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.3"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -355,9 +355,14 @@ use: durable session handles and usage logs, not conversation history.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
-| `ClaudeProvider` | ✅ | ✅ | Library-generated UUID via `--session-id` |
+| `ClaudeProvider` | ❌ (stateless `-p`) | ✅ | Per-call UUID via `--session-id` (audit only) |
 | `CodexProvider` | ✅ | ✅ | Parsed from `thread.started.thread_id` |
 | `CopilotProvider` | ✅ | ✅ | Parsed from `result.sessionId` |
+
+`ClaudeProvider` runs `claude -p` (single-shot/stateless). `--resume` is
+incompatible with `-p`, so the library does not store or replay session
+metadata for claude (see issue #4). A fresh `--session-id` is still passed
+per call so usage rows have a stable per-call identifier.
 
 ## Security notes
 
@@ -398,6 +403,7 @@ pytest
 
 ## Status
 
+- **0.4.3** — Claude provider declared stateless: `-p` mode no longer pairs with `--resume`, fixing a 5-minute Windows hang (#4).
 - **0.4.2** — Codex bootstrap greeting filtering and one-time resume retry for greeting-only first turns.
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
@@ -409,7 +415,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.4.2 release note: [docs/releases/v0.4.2.md](docs/releases/v0.4.2.md) / [docs/releases/v0.4.2.ko.md](docs/releases/v0.4.2.ko.md)
+- v0.4.3 release note: [docs/releases/v0.4.3.md](docs/releases/v0.4.3.md) / [docs/releases/v0.4.3.ko.md](docs/releases/v0.4.3.ko.md)
 
 ## License
 

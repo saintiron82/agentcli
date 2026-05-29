@@ -47,7 +47,12 @@ CLAUDE_MODELS = [
 
 class ClaudeProvider(LLMProvider):
     provider_id = "claude"
-    supports_sessions = True
+    # `claude -p`는 single-shot/stateless이며 `--resume`은 인터랙티브 모드 전용이다.
+    # 두 모드를 같이 호출하면 Windows에서 5분+ hang (issue #4). 라이브러리는
+    # claude를 stateless로 선언하여 상위 client가 session_id를 저장·재생하지
+    # 않도록 한다. `--session-id <new-uuid>`는 새 세션 식별자 부여 용도로 계속
+    # 사용된다 (resume과 무관).
+    supports_sessions = False
     supports_streaming = True
 
     def __init__(self,
@@ -141,12 +146,11 @@ class ClaudeProvider(LLMProvider):
         if self._disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._disallowed_tools)]
 
-        if session_id:
-            cmd += ["--resume", session_id]
-            used_session_id = session_id
-        else:
-            used_session_id = str(uuid.uuid4())
-            cmd += ["--session-id", used_session_id]
+        # issue #4: `-p` mode는 stateless라 `--resume`을 붙이면 인터랙티브
+        # 입력 대기로 폴백되어 Windows에서 데드락. session_id가 들어와도
+        # resume 시도 없이 새 식별자만 부여한다.
+        used_session_id = str(uuid.uuid4())
+        cmd += ["--session-id", used_session_id]
         return cmd, used_session_id
 
     def invoke(self, messages: list[Message], *,
