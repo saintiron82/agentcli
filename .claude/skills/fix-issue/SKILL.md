@@ -8,9 +8,13 @@ disable-model-invocation: true
 
 인자: `$ARGUMENTS` = GitHub 이슈 번호 (필수). 예: `/fix-issue 4` → `saintiron82/agentcli#4`.
 
-이 스킬은 **6단계**(Stage 0 준비 + Stage 1~5)를 차례로 수행한다. 각 단계는 명시적 게이트가 있어 실패 시 다음 단계로 넘어가지 않는다. 모든 단계의 진행을 TaskCreate로 추적하라.
+이 스킬은 **7단계**(Stage 0 준비 + Stage 1~4 + Stage 4.5 적대적 리뷰 + Stage 5)를 차례로 수행한다. 각 단계는 명시적 게이트가 있어 실패 시 다음 단계로 넘어가지 않는다. 모든 단계의 진행을 TaskCreate로 추적하라.
 
-**철칙**: 모든 변경은 Stage 0에서 만든 `fix/issue-<번호>-<slug>` 브랜치 위에서만 일어난다. `main`에 직접 커밋·푸시 금지. 병합은 Stage 5에서, 태그는 병합된 `main` 위에서만 찍는다.
+**철칙 1 (브랜치 격리)**: 모든 변경은 Stage 0에서 만든 `fix/issue-<번호>-<slug>` 브랜치 위에서만 일어난다. `main`에 직접 커밋·푸시 금지. 병합은 Stage 5에서, 태그는 병합된 `main` 위에서만 찍는다.
+
+**철칙 2 (언어)**: 이 스킬이 만드는 모든 **커밋 메시지**, **PR 제목**, **PR 본문**, **이슈 코멘트**, **릴리즈 노트 한국어 파일** 의 한국어 부분은 **반드시 한국어**로 작성한다. 코드 주석, 변수명, CLI 명령어, 외부 식별자(예: `--resume`, `session_id`)는 영어 그대로. 코드 안의 사람-가독 설명 주석도 한국어 우선. (영문 릴리즈 노트 `.md`는 영어 유지 — 한·영 짝 규칙 그대로.)
+
+**철칙 3 (3계층 합의 통과)**: Stage 4.5에서 `/triad-review` 스킬을 호출하여 3 reviewer + 상호 평가 + 통합 조율을 수행한다. 합의 verdict가 `request-changes`면 Stage 5(병합)로 진입 금지. 사용자가 (a) 블로커 수정 커밋을 추가하거나 (b) 명시적으로 무시하라고 지시한 뒤에만 Stage 5 진입.
 
 ---
 
@@ -34,7 +38,7 @@ disable-model-invocation: true
    ```
    - 브랜치 이름: `fix/issue-<번호>-<3~5단어-kebab-slug>` (예: `fix/issue-4-claude-p-session-deadlock`)
    - 이 브랜치를 벗어나서 어떤 파일도 만들거나 고치지 말 것.
-5. TaskCreate로 5개 태스크 등록: reproduce / root-cause / fix / release-prep / merge-and-tag.
+5. TaskCreate로 6개 태스크 등록: reproduce / root-cause / fix / release-prep / adversarial-review / merge-and-tag.
 
 ---
 
@@ -127,19 +131,37 @@ disable-model-invocation: true
    - `python -m build` 성공
    - `python -m twine check dist/*` 통과
    - 한·영 문서 짝 + CHANGELOG 항목 존재
-4. **커밋 + 푸시 + PR** (모두 fix 브랜치 위 — main에 직접 커밋 금지):
-   - 커밋 메시지: `fix(<scope>): <one-line summary> (#${ARGUMENTS})`
+4. **커밋 + 푸시 + PR** (모두 fix 브랜치 위 — main에 직접 커밋 금지). 모든 텍스트는 **한국어** (철칙 2):
+   - 커밋 메시지 형식: `fix(<scope>): <한 줄 요약> (#${ARGUMENTS})` — 한 줄 요약과 본문 모두 한국어
    - `git push -u origin fix/issue-${ARGUMENTS}-<slug>`
    - `gh pr create --base main --head fix/issue-${ARGUMENTS}-<slug>` 로 PR 생성
-   - PR 제목: `Fix #${ARGUMENTS}: <summary>`
-   - PR 본문: 이슈 링크 (`Fixes #${ARGUMENTS}`), 원인 요약(Stage 2), 변경 요약(Stage 3), upgrade notes
-5. TaskUpdate: release-prep = completed. PR URL을 사용자에게 보고하고 Stage 5 진입 확인을 받아라.
+   - PR 제목: `이슈 #${ARGUMENTS} 수정: <한국어 한 줄 요약>`
+   - PR 본문 (한국어): `Fixes #${ARGUMENTS}` 자동 close 트리거, 원인 요약(Stage 2), 변경 요약(Stage 3), 업그레이드 노트
+5. TaskUpdate: release-prep = completed. PR URL을 사용자에게 보고하고 **Stage 4.5 (적대적 리뷰)** 진입.
+
+---
+
+## Stage 4.5: 3계층 리뷰 + 통합 조율 (Triad Review)
+
+**목표**: 막 생성된 PR을 세 시각(까칠 senior / 실용주의 베테랑 / 테스트 중심)의 reviewer가 분석 → 상호 평가 → 통합 합의 verdict를 도출. 합의가 `request-changes`면 Stage 5 진입 금지.
+
+1. **`/triad-review <PR번호>` 호출** — 별도 스킬 (`@.claude/skills/triad-review/SKILL.md`).
+   - Phase 1: 세 reviewer 병렬 spawn → 각자 PR에 코멘트
+   - Phase 2: 상호 평가 (cross-review) — 각자 다른 두 명의 리뷰를 동의/반박/보완으로 재평가
+   - Phase 3: 통합 조율 → 합의 verdict + 발견 사항 통합 분류 (블로커 / major-merge-then-followup / minor / 오버스펙)
+   - Phase 4: PR에 통합 합의 코멘트 한 번 첨부 + 사용자 보고
+2. **합의 verdict 처리**:
+   - `approve` → Stage 5 게이트 통과
+   - `comment` → 사용자에게 합의된 major-merge-then-followup 항목 전달, Stage 5 진입 여부 명시 확인 (AskUserQuestion). 사용자가 "follow-up issue 만들고 머지" 선택하면 `gh issue create` 로 각 항목별 issue 생성 후 Stage 5.
+   - `request-changes` → **Stage 5 차단**. 사용자에게 합의된 블로커 목록 전달, 후속 커밋 추가 (Stage 3로 되돌아가 수정) 또는 명시적 무시 지시 후에만 Stage 5 진입.
+3. **사용자 무시 지시**: 사용자가 "이번엔 무시하고 진행" 이라고 명시적으로 말한 경우, 그 결정과 사유를 PR 코멘트로 추가 기록 (`gh pr comment <PR번호> --body "..."` 한국어)한 뒤 Stage 5 진입.
+4. TaskUpdate: adversarial-review = completed (합의 verdict 메타데이터 포함).
 
 ---
 
 ## Stage 5: 병합 + 태그 + 배포 (Merge & Tag & Publish)
 
-**목표**: main에 병합되고, 태그가 푸시되고, (선택) PyPI까지 올라간 상태. **모든 단계는 사용자 확인 후 한 단계씩 진행** — 자동 실행 금지.
+**목표**: main에 병합되고, 태그가 푸시되고, (선택) PyPI까지 올라간 상태. **모든 단계는 사용자 확인 후 한 단계씩 진행** — 자동 실행 금지. **사전 조건**: Stage 4.5에서 verdict가 `approve`이거나, `comment`/`request-changes` 후 사용자 명시 진행 지시가 있어야 한다.
 
 1. **병합** (사용자 확인 후):
    ```bash
@@ -157,7 +179,7 @@ disable-model-invocation: true
    ```bash
    python -m twine upload dist/*
    ```
-4. **이슈 마무리**: 사용자 확인 후 `gh issue comment ${ARGUMENTS}`로 수정된 버전과 PR 링크를 남기고, 적절하면 `gh issue close ${ARGUMENTS}`. 자동 close 금지 — PR이 `Fixes #N`을 포함하면 squash merge 시 자동으로 닫히지만, 그것이 의도였는지 확인.
+4. **이슈 마무리**: 사용자 확인 후 `gh issue comment ${ARGUMENTS}`로 수정된 버전과 PR 링크를 한국어로 남기고, 적절하면 `gh issue close ${ARGUMENTS}`. 자동 close 금지 — PR이 `Fixes #N`을 포함하면 squash merge 시 자동으로 닫히지만, 그것이 의도였는지 확인.
 5. **정리**: 로컬 fix 브랜치 삭제 (`gh pr merge --delete-branch`가 원격은 정리하지만 로컬은 별도):
    ```bash
    git branch -d fix/issue-${ARGUMENTS}-<slug>
@@ -171,12 +193,15 @@ disable-model-invocation: true
 - `main` 브랜치에서 직접 커밋·푸시 — 모든 변경은 `fix/issue-*` 브랜치 위에서만
 - 더러운 워킹트리에서 시작 — Stage 0 검증 통과 전 한 줄도 고치지 말 것
 - 병합 전에 태그 찍기 — 태그는 반드시 PR이 main에 병합된 직후 main 위에서만
+- **Stage 4.5 적대적 리뷰를 건너뛰고 Stage 5로 직행 — verdict가 `request-changes`인데 무시하고 머지하기**
+- 커밋 메시지·PR 제목·PR 본문을 영어로 작성 (이 스킬의 규칙은 한국어. 영문 릴리즈 노트 `.md`만 예외)
 - 재현 못한 채로 수정 들어가기 — "아마 여기겠지" 추측 수정 금지
 - `[project].dependencies`에 새 패키지 추가
 - claude만 고치고 codex/copilot 정규화 계약 깨기
 - 사용자 확인 없이 `gh pr merge`, `git tag`, `git push`, `twine upload`, `gh issue close` 실행
 - README.md만 고치고 README.ko.md 빼먹기 (또는 그 반대)
 - 한 PR에 무관한 리팩토링 끼워 넣기
+- "고아" / "orphan" 용어 사용 (`@CLAUDE.md` 글로벌 룰)
 
 ## 임시 파일 정리
 
