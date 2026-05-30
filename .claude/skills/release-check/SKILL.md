@@ -1,6 +1,6 @@
 ---
 name: release-check
-description: Run the agentcli release checklist locally — pytest, build, twine check — and surface the tag/upload commands for the current version. Use when preparing a release or verifying the tree is release-ready.
+description: Use when preparing an agentcli release or verifying the working tree is release-ready. Triggers include `/release-check`, "릴리즈 점검", "pytest + build + twine 확인 후 태그 명령 알려줘". Does not execute git tag / push / twine upload — surfaces them for the user to confirm.
 ---
 
 # Release check for agentcli

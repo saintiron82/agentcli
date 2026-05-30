@@ -1,6 +1,6 @@
 ---
 name: sync-i18n
-description: Diff each English/Korean documentation pair (README, positioning, release, per-version release notes) and propose updates to bring them back in sync. Use when one side has changed and the other needs to follow, or to audit drift before a release.
+description: Use when one side of agentcli's English/Korean doc pairs (README, positioning, release, per-version release notes) has changed and the other needs to follow, or to audit drift before a release. Triggers include `/sync-i18n`, "한·영 문서 짝 확인", "i18n drift 점검", ".ko.md 누락 검사".
 ---
 
 # i18n parity check for agentcli
