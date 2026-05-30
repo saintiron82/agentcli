@@ -53,7 +53,8 @@ def test_list_models():
 def test_provider_id():
     p = ClaudeProvider()
     assert p.provider_id == "claude"
-    assert p.supports_sessions is True
+    # issue #4: claude -p 모드는 stateless이므로 supports_sessions=False
+    assert p.supports_sessions is False
 
 
 @patch("agentcli.providers.claude.subprocess.run")
@@ -97,18 +98,17 @@ def test_invoke_marks_claude_prompt_usage_as_provider_reported(mock_find, mock_r
 
 @patch("agentcli.providers.claude.subprocess.run")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
-def test_invoke_resume_session(mock_find, mock_run):
+def test_invoke_session_id_ignored_in_print_mode(mock_find, mock_run):
+    """issue #4: `-p` 모드는 stateless라 외부 session_id를 받아도 `--resume`
+    하지 않고 새 식별자를 발급한다 (Windows hang 우회)."""
     mock_run.return_value = MagicMock(
         returncode=0, stdout='{"result":"ok"}', stderr="")
     p = ClaudeProvider()
     resp = p.invoke([Message(role="user", content="hi")], session_id="abc-123")
     cmd = mock_run.call_args[0][0]
-    assert "--resume" in cmd
-    idx = cmd.index("--resume")
-    assert cmd[idx + 1] == "abc-123"
-    assert resp.session_id == "abc-123"
-    # 재개 시에는 --session-id 가 없어야 함
-    assert "--session-id" not in cmd
+    assert "--resume" not in cmd, "issue #4: -p + --resume은 데드락 유발"
+    assert "--session-id" in cmd
+    assert resp.session_id and resp.session_id != "abc-123"
 
 
 @patch("agentcli.providers.claude.subprocess.run")
