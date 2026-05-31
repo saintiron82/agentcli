@@ -150,9 +150,16 @@ class CodexProvider(LLMProvider):
             message=auth_msg or "Codex CLI authenticated")
 
     def _build_cmd(self, prompt: str, model: str, cwd: str | None,
-                   session_id: str) -> list[str]:
-        """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립."""
-        cmd = [self._find_binary() or "codex", "exec"]
+                   session_id: str) -> list[str] | None:
+        """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
+
+        바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
+        binary_missing 으로 실패 처리). claude/copilot 와 동일 패턴.
+        """
+        bin_path = self._find_binary()
+        if not bin_path:
+            return None
+        cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
             if self._full_auto:
@@ -189,6 +196,14 @@ class CodexProvider(LLMProvider):
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
+        if cmd is None:
+            logger.error("codex CLI를 찾을 수 없습니다")
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                session_id=session_id,
+                error="codex CLI not found",
+                error_type=ERROR_BINARY_MISSING,
+                exit_code=127)
 
         start = time.time()
         try:
@@ -269,6 +284,14 @@ class CodexProvider(LLMProvider):
                            cwd: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
+        if cmd is None:
+            logger.error("codex CLI를 찾을 수 없습니다")
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                session_id=session_id,
+                error="codex CLI not found",
+                error_type=ERROR_BINARY_MISSING,
+                exit_code=127)
 
         start = time.time()
         try:
@@ -344,6 +367,9 @@ class CodexProvider(LLMProvider):
         """
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
+        if cmd is None:
+            yield StreamChunk(type="error", content="codex CLI not found")
+            return
 
         start = time.time()
         proc = None
