@@ -19,9 +19,9 @@ import subprocess
 import time
 from typing import AsyncIterator
 
-from .base import (LLMProvider, build_session_prompt,
+from .base import (LLMProvider, StreamState, build_session_prompt,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command)
+                   run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -150,9 +150,16 @@ class CodexProvider(LLMProvider):
             message=auth_msg or "Codex CLI authenticated")
 
     def _build_cmd(self, prompt: str, model: str, cwd: str | None,
-                   session_id: str) -> list[str]:
-        """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립."""
-        cmd = [self._find_binary() or "codex", "exec"]
+                   session_id: str) -> list[str] | None:
+        """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
+
+        바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
+        binary_missing 으로 실패 처리). claude/copilot 와 동일 패턴.
+        """
+        bin_path = self._find_binary()
+        if not bin_path:
+            return None
+        cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
             if self._full_auto:
@@ -189,6 +196,14 @@ class CodexProvider(LLMProvider):
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
+        if cmd is None:
+            logger.error("codex CLI를 찾을 수 없습니다")
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                session_id=session_id,
+                error="codex CLI not found",
+                error_type=ERROR_BINARY_MISSING,
+                exit_code=127)
 
         start = time.time()
         try:
@@ -269,60 +284,58 @@ class CodexProvider(LLMProvider):
                            cwd: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
+        if cmd is None:
+            logger.error("codex CLI를 찾을 수 없습니다")
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                session_id=session_id,
+                error="codex CLI not found",
+                error_type=ERROR_BINARY_MISSING,
+                exit_code=127)
 
         start = time.time()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=build_env(), cwd=cwd)
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("Codex 타임아웃 (%d초)", timeout)
-                return LLMResponse(content="", provider=self.provider_id,
-                                    model=model, session_id=session_id,
-                                    error=f"timeout after {timeout}s",
-                                    error_type="timeout",
-                                    exit_code=124)
-            latency = int((time.time() - start) * 1000)
-
-            if proc.returncode != 0:
-                stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-                msg = stderr_txt.strip()[:300] or f"exit={proc.returncode}"
-                logger.error("Codex 실패 (code=%d): %s",
-                             proc.returncode, msg)
-                return LLMResponse(
-                    content="", provider=self.provider_id, model=model,
-                    raw_stderr=stderr_txt, session_id=session_id,
-                    error=msg, error_type=classify_error(msg),
-                    exit_code=proc.returncode)
-
-            stdout_txt = (stdout_b or b"").decode("utf-8", errors="replace")
-            stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-            parsed = _parse_jsonl_events(stdout_txt)
-            err = parsed.get("error", "")
-            return LLMResponse(
-                content=parsed["text"] if not err else "",
-                provider=self.provider_id, model=model,
-                tokens=parsed["usage"], latency_ms=latency,
-                raw_stderr=stderr_txt,
-                session_id=parsed["thread_id"] or session_id,
-                error=err,
-                error_type=classify_error(err) if err else "",
-                exit_code=proc.returncode,
-            )
+            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                cmd, timeout=timeout, cwd=cwd,
+                env=build_env(), use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 error="codex CLI not found",
                                 error_type=ERROR_BINARY_MISSING,
                                 exit_code=127)
+        if timed_out:
+            logger.error("Codex 타임아웃 (%d초)", timeout)
+            return LLMResponse(content="", provider=self.provider_id,
+                                model=model, session_id=session_id,
+                                error=f"timeout after {timeout}s",
+                                error_type="timeout",
+                                exit_code=124)
+        latency = int((time.time() - start) * 1000)
+        stderr_txt = stderr_b.decode("utf-8", errors="replace")
+
+        if rc != 0:
+            msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            logger.error("Codex 실패 (code=%d): %s", rc, msg)
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                raw_stderr=stderr_txt, session_id=session_id,
+                error=msg, error_type=classify_error(msg),
+                exit_code=rc)
+
+        stdout_txt = stdout_b.decode("utf-8", errors="replace")
+        parsed = _parse_jsonl_events(stdout_txt)
+        err = parsed.get("error", "")
+        return LLMResponse(
+            content=parsed["text"] if not err else "",
+            provider=self.provider_id, model=model,
+            tokens=parsed["usage"], latency_ms=latency,
+            raw_stderr=stderr_txt,
+            session_id=parsed["thread_id"] or session_id,
+            error=err,
+            error_type=classify_error(err) if err else "",
+            exit_code=rc,
+        )
 
     # ---------- 스트리밍 ----------
 
@@ -334,166 +347,81 @@ class CodexProvider(LLMProvider):
                            wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
         """Codex exec --json JSONL 이벤트 스트리밍.
 
+        공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
+        에 위임. Codex 의 JSONL event 해석만 ``_dispatch_stream_event`` 에서.
+
         정규화 매핑:
-          thread.started       → event (+ session_id)
-          turn.started         → event
-          item.completed(agent_message)   → text
-          item.completed(reasoning)       → thinking
+          thread.started                              → event (+ session_id)
+          item.completed(agent_message)               → text
+          item.completed(reasoning)                   → thinking
           item.completed(command_execution/tool_call) → tool_use
-          turn.completed       → (usage 저장, 마지막 done 청크에서 방출)
+          turn.completed                              → (usage 저장)
+          error / turn.failed                         → error
         """
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id)
-
-        start = time.time()
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=build_env(), cwd=cwd)
-
-            text_parts: list[str] = []
-            final_usage = TokenUsage(
+        if cmd is None:
+            yield StreamChunk(type="error", content="codex CLI not found")
+            return
+        state = StreamState(
+            final_session_id=session_id,
+            final_usage=TokenUsage(
                 payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
                 prompt_tokens_reliable=False,
+                prompt_tokens_source="codex_cli_reported"))
+        async for chunk in self._run_stream_template(
+                cmd, state, model=model, cwd=cwd, timeout=timeout,
+                idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                env=build_env()):
+            yield chunk
+
+    async def _dispatch_stream_event(self, evt: dict,
+                                     state: StreamState) -> AsyncIterator[StreamChunk]:
+        """Codex JSONL event 정규화."""
+        etype = evt.get("type", "")
+        if etype == "thread.started":
+            if evt.get("thread_id"):
+                state.final_session_id = evt["thread_id"]
+            yield StreamChunk(type="event", data=evt,
+                              session_id=state.final_session_id)
+        elif etype == "item.completed":
+            item = evt.get("item") or {}
+            itype = item.get("type", "")
+            if itype == "agent_message":
+                text = item.get("text", "")
+                if _is_codex_initial_greeting(text) and not state.text_parts:
+                    return  # 초기 인사 무시
+                if text:
+                    state.text_parts.append(text)
+                    yield StreamChunk(type="text", content=text, data=item)
+            elif itype == "reasoning":
+                yield StreamChunk(type="thinking",
+                                  content=item.get("text", ""), data=item)
+            elif itype in ("command_execution", "tool_call"):
+                yield StreamChunk(type="tool_use", data=item)
+            else:
+                yield StreamChunk(type="event", data=evt)
+        elif etype == "turn.completed":
+            u = evt.get("usage") or {}
+            pt = int(u.get("input_tokens") or 0)
+            ct = int(u.get("output_tokens") or 0)
+            cached = int(u.get("cached_input_tokens") or 0)
+            prev = state.final_usage
+            state.final_usage = TokenUsage(
+                prompt_tokens=pt, completion_tokens=ct,
+                total_tokens=pt + ct, cached_tokens=cached,
+                payload_prompt_tokens=(prev.payload_prompt_tokens if prev else 0),
+                prompt_tokens_reliable=False,
                 prompt_tokens_source="codex_cli_reported")
-            final_sid = session_id
-            timed_out = False
-            # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
-            # 진행 중 청크가 들어오면 매번 last_activity 갱신 → 사고/도구 호출 시간은
-            # timeout에서 차감되지 않는다.
-            last_activity = time.time()
-            idle_limit = idle_timeout if idle_timeout is not None else timeout
-            wall_deadline = start + wall_timeout if wall_timeout else None
-
-            assert proc.stdout
-            while True:
-                read_timeout = idle_limit
-                if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
-                    if remaining <= 0:
-                        proc.kill()
-                        yield StreamChunk(
-                            type="error",
-                            content=f"wall timeout: {wall_timeout}s 초과",
-                            data={"error_type": "timeout",
-                                  "timeout_kind": "wall"})
-                        timed_out = True
-                        break
-                    read_timeout = min(read_timeout, remaining)
-                try:
-                    line_b = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=read_timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    idle = int(time.time() - last_activity)
-                    timeout_kind = (
-                        "wall" if wall_deadline is not None
-                        and time.time() >= wall_deadline else "idle")
-                    content = (
-                        f"wall timeout: {wall_timeout}s 초과"
-                        if timeout_kind == "wall"
-                        else f"idle timeout: {idle}s 동안 청크 없음")
-                    yield StreamChunk(
-                        type="error",
-                        content=content,
-                        data={"error_type": "timeout",
-                              "timeout_kind": timeout_kind})
-                    timed_out = True
-                    break
-                if not line_b:
-                    break
-                last_activity = time.time()
-                s = line_b.decode("utf-8", errors="replace").strip()
-                if not s:
-                    continue
-                try:
-                    evt = json.loads(s)
-                except json.JSONDecodeError:
-                    yield StreamChunk(type="event", data={"raw": s})
-                    continue
-
-                etype = evt.get("type", "")
-                if etype == "thread.started":
-                    if evt.get("thread_id"):
-                        final_sid = evt["thread_id"]
-                    yield StreamChunk(type="event", data=evt,
-                                       session_id=final_sid)
-                elif etype == "item.completed":
-                    item = evt.get("item") or {}
-                    itype = item.get("type", "")
-                    if itype == "agent_message":
-                        text = item.get("text", "")
-                        if _is_codex_initial_greeting(text) and not text_parts:
-                            continue
-                        if text:
-                            text_parts.append(text)
-                            yield StreamChunk(type="text", content=text,
-                                               data=item)
-                    elif itype == "reasoning":
-                        yield StreamChunk(type="thinking",
-                                           content=item.get("text", ""),
-                                           data=item)
-                    elif itype in ("command_execution", "tool_call"):
-                        yield StreamChunk(type="tool_use", data=item)
-                    else:
-                        yield StreamChunk(type="event", data=evt)
-                elif etype == "turn.completed":
-                    u = evt.get("usage") or {}
-                    pt = int(u.get("input_tokens") or 0)
-                    ct = int(u.get("output_tokens") or 0)
-                    cached = int(u.get("cached_input_tokens") or 0)
-                    final_usage = TokenUsage(
-                        prompt_tokens=pt,
-                        completion_tokens=ct,
-                        total_tokens=pt + ct,
-                        cached_tokens=cached,
-                        payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
-                        prompt_tokens_reliable=False,
-                        prompt_tokens_source="codex_cli_reported")
-                elif etype == "error":
-                    msg = evt.get("message", "")
-                    yield StreamChunk(type="error", content=msg, data=evt)
-                elif etype == "turn.failed":
-                    err = evt.get("error") or {}
-                    msg = err.get("message", "")
-                    yield StreamChunk(type="error", content=msg, data=evt)
-                else:
-                    yield StreamChunk(type="event", data=evt)
-
-            if timed_out:
-                if proc and proc.returncode is None:
-                    await proc.wait()
-                return
-
-            rc = await proc.wait()
-            if rc != 0 and not text_parts:
-                err_b = b""
-                if proc.stderr:
-                    err_b = await proc.stderr.read()
-                yield StreamChunk(
-                    type="error",
-                    content=err_b.decode("utf-8", errors="replace")[:500],
-                    data={"returncode": rc})
-                return
-
-            yield StreamChunk(
-                type="done",
-                content="".join(text_parts),
-                session_id=final_sid, usage=final_usage,
-                data={"provider": self.provider_id, "model": model,
-                      "latency_ms": int((time.time() - start) * 1000)})
-        except FileNotFoundError:
-            yield StreamChunk(type="error", content="codex CLI not found")
-        except Exception as e:
-            logger.exception("Codex stream 예외")
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            yield StreamChunk(type="error", content=str(e))
+        elif etype == "error":
+            yield StreamChunk(type="error",
+                              content=evt.get("message", ""), data=evt)
+        elif etype == "turn.failed":
+            err = evt.get("error") or {}
+            yield StreamChunk(type="error",
+                              content=err.get("message", ""), data=evt)
+        else:
+            yield StreamChunk(type="event", data=evt)
 
 
 # ---------- JSONL 이벤트 파싱 유틸 ----------

@@ -22,8 +22,9 @@ import subprocess
 import time
 from typing import AsyncIterator
 
-from .base import (LLMProvider, build_session_prompt, health_from_response,
-                   run_health_command)
+from .base import (LLMProvider, StreamState, build_session_prompt,
+                   health_from_response, run_health_command,
+                   run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
                      ProviderHealth, TokenUsage, StreamChunk, classify_error)
 from ..utils import build_env
@@ -277,52 +278,9 @@ class CopilotProvider(LLMProvider):
 
         start = time.time()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=build_env(), cwd=cwd)
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("Copilot 타임아웃 (%d초)", timeout)
-                return LLMResponse(content="", provider=self.provider_id, model=model,
-                                    session_id=session_id or alias,
-                                    error=f"timeout after {timeout}s",
-                                    error_type="timeout",
-                                    exit_code=124)
-            latency = int((time.time() - start) * 1000)
-
-            stdout_txt = (stdout_b or b"").decode("utf-8", errors="replace")
-            stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-
-            if proc.returncode != 0:
-                msg = stderr_txt.strip()[:300] or f"exit={proc.returncode}"
-                logger.error("Copilot 실패 (code=%d): %s",
-                             proc.returncode, msg)
-                return LLMResponse(
-                    content="", provider=self.provider_id, model=model,
-                    raw_stderr=stderr_txt,
-                    session_id=session_id or alias,
-                    error=msg, error_type=classify_error(msg),
-                    exit_code=proc.returncode)
-
-            parsed = _parse_copilot_jsonl(stdout_txt)
-            err = parsed.get("error", "")
-            return LLMResponse(
-                content=parsed["text"] if not err else "",
-                provider=self.provider_id, model=model,
-                tokens=parsed["usage"], latency_ms=latency,
-                raw_stderr=stderr_txt,
-                session_id=parsed["session_id"] or session_id or alias,
-                error=err,
-                error_type=classify_error(err) if err else "",
-                exit_code=proc.returncode,
-            )
+            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                cmd, timeout=timeout, cwd=cwd,
+                env=build_env(), use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -330,6 +288,39 @@ class CopilotProvider(LLMProvider):
                                 error="Copilot CLI not found",
                                 error_type=ERROR_BINARY_MISSING,
                                 exit_code=127)
+        if timed_out:
+            logger.error("Copilot 타임아웃 (%d초)", timeout)
+            return LLMResponse(content="", provider=self.provider_id, model=model,
+                                session_id=session_id or alias,
+                                error=f"timeout after {timeout}s",
+                                error_type="timeout",
+                                exit_code=124)
+        latency = int((time.time() - start) * 1000)
+        stdout_txt = stdout_b.decode("utf-8", errors="replace")
+        stderr_txt = stderr_b.decode("utf-8", errors="replace")
+
+        if rc != 0:
+            msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            logger.error("Copilot 실패 (code=%d): %s", rc, msg)
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                raw_stderr=stderr_txt,
+                session_id=session_id or alias,
+                error=msg, error_type=classify_error(msg),
+                exit_code=rc)
+
+        parsed = _parse_copilot_jsonl(stdout_txt)
+        err = parsed.get("error", "")
+        return LLMResponse(
+            content=parsed["text"] if not err else "",
+            provider=self.provider_id, model=model,
+            tokens=parsed["usage"], latency_ms=latency,
+            raw_stderr=stderr_txt,
+            session_id=parsed["session_id"] or session_id or alias,
+            error=err,
+            error_type=classify_error(err) if err else "",
+            exit_code=rc,
+        )
 
     # ---------- 스트리밍 ----------
 
@@ -343,11 +334,14 @@ class CopilotProvider(LLMProvider):
                            wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
 
+        공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
+        에 위임. Copilot 의 JSON event 해석만 ``_dispatch_stream_event`` 에서.
+
         정규화:
           assistant.message_delta → text (증분)
-          assistant.message       → (무시, delta 합산으로 충분)
-          result                  → session_id, usage 확정
-          기타 session.*          → event
+          assistant.message       → (delta 누적이 부족하면 content 보충, outputTokens 누적)
+          result                  → session_id 갱신
+          assistant.tool_* / tool.* → tool_use
         """
         prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
@@ -356,139 +350,52 @@ class CopilotProvider(LLMProvider):
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")
             return
-
-        start = time.time()
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=build_env(), cwd=cwd)
-
-            text_parts: list[str] = []
-            final_usage = TokenUsage(
+        state = StreamState(
+            final_session_id=session_id or alias,
+            final_usage=TokenUsage(
                 prompt_tokens_reliable=False,
-                prompt_tokens_source="copilot_not_reported")
-            final_sid = session_id or alias
-            timed_out = False
-            # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
-            # 진행 청크가 들어오면 매번 last_activity 갱신.
-            last_activity = time.time()
-            idle_limit = idle_timeout if idle_timeout is not None else timeout
-            wall_deadline = start + wall_timeout if wall_timeout else None
+                prompt_tokens_source="copilot_not_reported"))
+        async for chunk in self._run_stream_template(
+                cmd, state, model=model, cwd=cwd, timeout=timeout,
+                idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                env=build_env()):
+            yield chunk
 
-            assert proc.stdout
-            while True:
-                read_timeout = idle_limit
-                if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
-                    if remaining <= 0:
-                        proc.kill()
-                        yield StreamChunk(
-                            type="error",
-                            content=f"wall timeout: {wall_timeout}s 초과",
-                            data={"error_type": "timeout",
-                                  "timeout_kind": "wall"})
-                        timed_out = True
-                        break
-                    read_timeout = min(read_timeout, remaining)
-                try:
-                    line_b = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=read_timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    idle = int(time.time() - last_activity)
-                    timeout_kind = (
-                        "wall" if wall_deadline is not None
-                        and time.time() >= wall_deadline else "idle")
-                    content = (
-                        f"wall timeout: {wall_timeout}s 초과"
-                        if timeout_kind == "wall"
-                        else f"idle timeout: {idle}s 동안 청크 없음")
-                    yield StreamChunk(
-                        type="error",
-                        content=content,
-                        data={"error_type": "timeout",
-                              "timeout_kind": timeout_kind})
-                    timed_out = True
-                    break
-                if not line_b:
-                    break
-                last_activity = time.time()
-                s = line_b.decode("utf-8", errors="replace").strip()
-                if not s:
-                    continue
-                try:
-                    evt = json.loads(s)
-                except json.JSONDecodeError:
-                    yield StreamChunk(type="event", data={"raw": s})
-                    continue
-
-                etype = evt.get("type", "")
-                if etype == "assistant.message_delta":
-                    delta = ((evt.get("data") or {}).get("deltaContent") or "")
-                    if delta:
-                        text_parts.append(delta)
-                        yield StreamChunk(type="text", content=delta, data=evt)
-                elif etype == "assistant.message":
-                    # 최종 메시지 — delta 누적이 부족하면 여기 content 사용
-                    data = evt.get("data") or {}
-                    if not text_parts and data.get("content"):
-                        text_parts.append(data["content"])
-                        yield StreamChunk(type="text",
-                                           content=data["content"], data=evt)
-                    if data.get("outputTokens"):
-                        final_usage = TokenUsage(
-                            prompt_tokens=final_usage.prompt_tokens,
-                            completion_tokens=final_usage.completion_tokens
-                                + int(data["outputTokens"]),
-                            total_tokens=final_usage.total_tokens
-                                + int(data["outputTokens"]),
-                            cached_tokens=final_usage.cached_tokens,
-                            prompt_tokens_reliable=False,
-                            prompt_tokens_source="copilot_not_reported")
-                elif etype == "result":
-                    sid = evt.get("sessionId")
-                    if sid:
-                        final_sid = sid
-                elif etype and (etype.startswith("assistant.tool_")
-                                or etype.startswith("tool.")):
-                    yield StreamChunk(type="tool_use", data=evt)
-                else:
-                    yield StreamChunk(type="event", data=evt)
-
-            if timed_out:
-                if proc and proc.returncode is None:
-                    await proc.wait()
-                return
-
-            rc = await proc.wait()
-            if rc != 0 and not text_parts:
-                err_b = b""
-                if proc.stderr:
-                    err_b = await proc.stderr.read()
-                yield StreamChunk(
-                    type="error",
-                    content=err_b.decode("utf-8", errors="replace")[:500],
-                    data={"returncode": rc})
-                return
-
-            yield StreamChunk(
-                type="done",
-                content="".join(text_parts),
-                session_id=final_sid, usage=final_usage,
-                data={"provider": self.provider_id, "model": model,
-                      "latency_ms": int((time.time() - start) * 1000)})
-        except FileNotFoundError:
-            yield StreamChunk(type="error", content="Copilot CLI not found")
-        except Exception as e:
-            logger.exception("Copilot stream 예외")
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            yield StreamChunk(type="error", content=str(e))
+    async def _dispatch_stream_event(self, evt: dict,
+                                     state: StreamState) -> AsyncIterator[StreamChunk]:
+        """Copilot CLI JSON event 정규화."""
+        etype = evt.get("type", "")
+        if etype == "assistant.message_delta":
+            delta = ((evt.get("data") or {}).get("deltaContent") or "")
+            if delta:
+                state.text_parts.append(delta)
+                yield StreamChunk(type="text", content=delta, data=evt)
+        elif etype == "assistant.message":
+            # 최종 메시지 — delta 누적 부족 시 content 보충, outputTokens 누적
+            data = evt.get("data") or {}
+            if not state.text_parts and data.get("content"):
+                state.text_parts.append(data["content"])
+                yield StreamChunk(type="text",
+                                  content=data["content"], data=evt)
+            if data.get("outputTokens"):
+                prev = state.final_usage
+                added = int(data["outputTokens"])
+                state.final_usage = TokenUsage(
+                    prompt_tokens=(prev.prompt_tokens if prev else 0),
+                    completion_tokens=(prev.completion_tokens if prev else 0) + added,
+                    total_tokens=(prev.total_tokens if prev else 0) + added,
+                    cached_tokens=(prev.cached_tokens if prev else 0),
+                    prompt_tokens_reliable=False,
+                    prompt_tokens_source="copilot_not_reported")
+        elif etype == "result":
+            sid = evt.get("sessionId")
+            if sid:
+                state.final_session_id = sid
+        elif etype and (etype.startswith("assistant.tool_")
+                        or etype.startswith("tool.")):
+            yield StreamChunk(type="tool_use", data=evt)
+        else:
+            yield StreamChunk(type="event", data=evt)
 
 
 # ---------- JSONL 파싱 유틸 ----------

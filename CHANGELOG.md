@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.5.0 — 2026-05-31
+
+Internal refactor — `providers/` 3-provider 중복 골격을 base 의 template
+method + helper 로 흡수. 사용자 API (`LLMClient.chat/chat_async/chat_stream`,
+`LLMResponse`, `StreamChunk`) 와 동작은 변경 없음. 신규 provider 추가 비용
+감소 + 한 provider 만 수정해서 다른 둘과 어긋날 위험 감소가 목적 ([#7]).
+
+### Added
+- `LLMProvider._run_stream_template(cmd, state, ...)`: 3-provider 공통
+  스트리밍 골격 (subprocess 생성 → readline + idle/wall timeout → JSON
+  파싱 → `_dispatch_stream_event` hook → done/error + cleanup).
+- `LLMProvider._dispatch_stream_event(evt, state)`: 정규화된 chunk 변환을
+  위한 provider hook. default 는 raw `event` chunk.
+- `StreamState` dataclass (base): `text_parts`, `final_session_id`,
+  `final_usage`, `extra`.
+- `run_subprocess_async(cmd, ...)` helper (base): `invoke_async` 공통
+  subprocess + timeout 패턴. `(stdout, stderr, returncode, timed_out)` 반환.
+- `tests/test_provider_normalization.py`: 3-provider 정규화 계약 회귀
+  테스트 51건 — declarative attribute / 메서드 시그니처 / `list_models`
+  shape / `resolve_model` / 바이너리 부재 path / `StreamChunk` 정규화
+  타입 집합 / `build_session_prompt` 공유 사용.
+- `repairman.adapter.yaml`: RePairMan 프로젝트 어댑터.
+
+### Changed
+- `ClaudeProvider.stream_async`: 487줄 → 391줄. 공통 골격은 base 위임,
+  `_dispatch_stream_event` 가 system/assistant/user/result 해석.
+- `CodexProvider.stream_async`: 600줄 → 512줄. thread.started/item.completed/
+  turn.completed/error/turn.failed 해석.
+- `CopilotProvider.stream_async`: 565줄 → 472줄. assistant.message_delta/
+  message/result/tool_* 해석.
+- 3-provider `invoke_async`: `run_subprocess_async` 사용으로 proc + timeout
+  + cleanup 시퀀스 일원화.
+- `providers/` 총합: 1894줄 → 1845줄. 중복 ~280줄이 base 한 곳으로 이동.
+
+### Fixed
+- `CodexProvider._build_cmd` 가 바이너리 없을 때 `"codex"` 문자열로 fallback
+  하던 정규화 계약 위반을 수정. claude/copilot 와 동일하게 `None` 반환 →
+  호출자가 즉시 `exit_code=127`, `error_type=binary_missing` 으로 실패한다.
+  회귀 테스트가 시작 단계에서 잡았다.
+
+### Compatibility
+- 사용자 코드 변경 불필요. `LLMClient` API 시그니처·동작·streaming chunk
+  순서·`LLMResponse` 필드 모두 그대로.
+- 3-provider 정규화 계약 (chunk type 7종, session_single_source, zero
+  runtime deps) 보존.
+- 신규 provider 를 추가할 때는 hook 4개 (`_build_cmd`, `_dispatch_stream_event`,
+  `invoke`, `health_check`) 만 구현하면 된다.
+
+[#7]: https://github.com/saintiron82/agentcli/issues/7
+
 ## 0.4.3 — 2026-05-29
 
 ### Fixed
