@@ -1,0 +1,160 @@
+# RePairMan project adapter for agentcli
+# Schema: ~/.claude/skills/repairman/references/project-adapter.md
+# Validation: python <repairman-skill-dir>/scripts/repairman_check.py validate-card <card.md> --adapter repairman.adapter.yaml
+
+project:
+  name: agentcli
+  description: >
+    Python library wrapping three external agentic CLIs (claude, codex,
+    copilot/gh copilot) into one session-aware client API. Not an agent
+    framework or a hosted LLM client.
+
+tracker:
+  type: github_issues
+  repo: saintiron82/agentcli
+  package_card_location: pr_description_or_first_comment
+  status_field: github_label
+  status_map:
+    in_progress: in-progress
+    ready_for_verification: ready-for-verification
+
+integration:
+  trunk: main
+  protected_branches: [main]
+  branch_naming:
+    refactor: "refactor/<package-slug>"
+    fix: "fix/issue-<number>-<slug>"
+    chore: "chore/<topic>"
+    feat: "feat/<slug>"
+  merge_method: squash
+  required_footers: []
+
+architecture:
+  service_boundaries:
+    - id: client
+      path: agentcli/client.py
+      description: Public entry point. Wraps providers and store; owns fallback/aliasing.
+    - id: providers
+      path: agentcli/providers/
+      description: Three normalized provider implementations (claude/codex/copilot) over external CLIs.
+    - id: store
+      path: agentcli/store/
+      description: Session metadata persistence (MemoryStore, SQLiteStore).
+    - id: profile
+      path: agentcli/profile.py
+      description: AgentProfile and instruction hashing.
+    - id: types
+      path: agentcli/types.py
+      description: Shared dataclasses (Message, TokenUsage, normalized chunks).
+
+  forbidden_shortcuts:
+    - "providers/ importing from client.py (circular)"
+    - "client.py subprocess'ing external CLIs directly (must go through providers/)"
+    - "store/ depending on providers/ specifics (must stay provider-agnostic)"
+
+  canonical_apis:
+    - "LLMClient.chat / chat_async / chat_stream"
+    - "LLMProvider.invoke / invoke_async / stream_async"
+    - "Store.upsert / get / delete"
+
+  data_ownership:
+    sessions: store
+    instructions: profile
+    chunks: providers
+    user_facing_text: client (only entry-point error formatting)
+
+  ai_entrypoints:
+    - ClaudeProvider (subprocess to `claude -p`)
+    - CodexProvider (subprocess to `codex exec`)
+    - CopilotProvider (subprocess to `gh copilot` or `copilot`)
+
+  protected_contracts:
+    - id: three_provider_normalization
+      description: >
+        Claude, Codex, Copilot providers must share signature, session flags,
+        streaming chunk types, and permission flags. Per-provider declarative
+        differences (e.g. supports_sessions) are allowed when documented in
+        the base class; behavioural divergence is not.
+      evidence_paths:
+        - agentcli/providers/base.py
+        - agentcli/providers/claude.py
+        - agentcli/providers/codex.py
+        - agentcli/providers/copilot.py
+        - README.md  # comparison table
+
+    - id: normalized_chunks
+      description: >
+        Streaming chunk types are fixed: text, thinking, tool_use, tool_result,
+        event, error, done. Adding a new chunk type requires updating all three
+        providers + types.py + README chunk-type docs in one package.
+      evidence_paths:
+        - agentcli/types.py
+        - agentcli/providers/*.py
+        - README.md
+
+    - id: session_single_source
+      description: >
+        The CLI session is the single source of truth for history. Library
+        stores only session_id per provider; never re-injects prior user or
+        assistant turns into prompts. system_prompt / AgentProfile.instructions
+        are injected only when the instruction hash changes.
+      evidence_paths:
+        - agentcli/store/
+        - agentcli/profile.py
+        - agentcli/client.py
+
+    - id: zero_runtime_dependencies
+      description: >
+        [project.dependencies] in pyproject.toml stays empty. Dev tools only
+        go in [project.optional-dependencies].dev. Any package adding a runtime
+        dep is a contract migration.
+      evidence_paths:
+        - pyproject.toml
+
+evidence_roots:
+  source: [agentcli/]
+  tests: [tests/]
+  docs: [docs/, README.md, README.ko.md, CHANGELOG.md, CLAUDE.md]
+  generated: [dist/, .pytest_cache/, .venv/, __pycache__/]
+  migrations: []
+  fixtures: [tests/conftest.py]
+  deployment: [pyproject.toml]
+
+validation:
+  unit_test: "pytest"
+  single_test: "pytest tests/test_<file>.py -k <name>"
+  build: "python -m build"
+  validate_dist: "python -m twine check dist/*"
+  contract_tests: []  # implicit in unit tests (normalized contract is asserted there)
+  smoke_tests: []
+  lint: null   # no linter configured (CLAUDE.md: do not introduce one unless asked)
+  type_check: null
+  required_artifacts: [dist/*.whl, dist/*.tar.gz]
+
+audit:
+  primary_skill: triad-review   # agentcli local adapter (Korean personas, agentcli rules)
+  fallback_skill: merge-gate
+  severity_model: [critical, important, follow_up, accepted_tradeoff]
+  tradeoff_accepter: human_owner
+
+package_policy:
+  express_lane:
+    max_loc: 30
+    max_files: 1
+    deletion_only: true
+  max_package_loc: 500
+  allowed_mixed_packages: []        # no mixing
+  default_package_branch_prefix: "refactor/"
+
+rollback:
+  method: git_revert
+  migration_rollback: not_applicable   # no DB migrations
+  partial_merge_recovery_owner: human_owner
+
+language:
+  preferred_card_language: ko
+  prose_language: ko
+  comments_language: ko_or_en   # ko 우선; 코드 변수/CLI/외부 식별자는 영어 유지
+  pr_text_language: ko          # 커밋·PR·이슈 코멘트 모두 한국어
+  release_notes_language: ko_and_en   # 한·영 짝 (CLAUDE.md 룰)
+  banned_terms: ["고아", "orphan"]
