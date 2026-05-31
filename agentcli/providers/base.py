@@ -159,6 +159,56 @@ class LLMProvider(ABC):
     def is_available(self) -> bool: ...
 
 
+async def run_subprocess_async(
+    cmd: list[str], *, timeout: int,
+    cwd: str | None = None,
+    env: dict | None = None,
+    use_stdin_devnull: bool = False,
+) -> tuple[bytes, bytes, int, bool]:
+    """Run an async subprocess with a single-shot communicate() + timeout.
+
+    3-provider invoke_async 공통 패턴 (proc 생성 → communicate(timeout) →
+    timeout 시 kill+wait) 을 한 곳에서 처리한다.
+
+    Returns:
+        ``(stdout, stderr, returncode, timed_out)``.
+        ``timed_out=True`` 면 ``stdout=b""``, ``stderr`` 는 encoded timeout
+        메시지, ``returncode=124``. 이 경우 호출자는 그대로 timeout LLMResponse
+        를 작성하면 된다.
+
+    Raises:
+        ``FileNotFoundError`` — 호출자가 잡아서 binary_missing 으로 정규화.
+
+    Args:
+        cmd: subprocess argv 리스트.
+        timeout: 초 단위 wall timeout (``asyncio.wait_for`` 에 직접 전달).
+        cwd: subprocess cwd.
+        env: subprocess env. ``None`` 이면 부모 환경 상속.
+        use_stdin_devnull: True 면 stdin 을 ``/dev/null`` 로 닫는다 (codex/copilot
+            처럼 stdin 입력 대기를 막아야 하는 CLI 용).
+    """
+    kwargs: dict = {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if use_stdin_devnull:
+        kwargs["stdin"] = asyncio.subprocess.DEVNULL
+    if env is not None:
+        kwargs["env"] = env
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+
+    proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return b"", f"timeout after {timeout}s".encode(), 124, True
+    return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
+
+
 def run_health_command(cmd: list[str], *, timeout: int = 10,
                        cwd: str | None = None,
                        env: dict | None = None) -> subprocess.CompletedProcess:

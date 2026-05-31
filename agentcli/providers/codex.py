@@ -21,7 +21,7 @@ from typing import AsyncIterator
 
 from .base import (LLMProvider, build_session_prompt,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command)
+                   run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -295,57 +295,47 @@ class CodexProvider(LLMProvider):
 
         start = time.time()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=build_env(), cwd=cwd)
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("Codex 타임아웃 (%d초)", timeout)
-                return LLMResponse(content="", provider=self.provider_id,
-                                    model=model, session_id=session_id,
-                                    error=f"timeout after {timeout}s",
-                                    error_type="timeout",
-                                    exit_code=124)
-            latency = int((time.time() - start) * 1000)
-
-            if proc.returncode != 0:
-                stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-                msg = stderr_txt.strip()[:300] or f"exit={proc.returncode}"
-                logger.error("Codex 실패 (code=%d): %s",
-                             proc.returncode, msg)
-                return LLMResponse(
-                    content="", provider=self.provider_id, model=model,
-                    raw_stderr=stderr_txt, session_id=session_id,
-                    error=msg, error_type=classify_error(msg),
-                    exit_code=proc.returncode)
-
-            stdout_txt = (stdout_b or b"").decode("utf-8", errors="replace")
-            stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-            parsed = _parse_jsonl_events(stdout_txt)
-            err = parsed.get("error", "")
-            return LLMResponse(
-                content=parsed["text"] if not err else "",
-                provider=self.provider_id, model=model,
-                tokens=parsed["usage"], latency_ms=latency,
-                raw_stderr=stderr_txt,
-                session_id=parsed["thread_id"] or session_id,
-                error=err,
-                error_type=classify_error(err) if err else "",
-                exit_code=proc.returncode,
-            )
+            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                cmd, timeout=timeout, cwd=cwd,
+                env=build_env(), use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 error="codex CLI not found",
                                 error_type=ERROR_BINARY_MISSING,
                                 exit_code=127)
+        if timed_out:
+            logger.error("Codex 타임아웃 (%d초)", timeout)
+            return LLMResponse(content="", provider=self.provider_id,
+                                model=model, session_id=session_id,
+                                error=f"timeout after {timeout}s",
+                                error_type="timeout",
+                                exit_code=124)
+        latency = int((time.time() - start) * 1000)
+        stderr_txt = stderr_b.decode("utf-8", errors="replace")
+
+        if rc != 0:
+            msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            logger.error("Codex 실패 (code=%d): %s", rc, msg)
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                raw_stderr=stderr_txt, session_id=session_id,
+                error=msg, error_type=classify_error(msg),
+                exit_code=rc)
+
+        stdout_txt = stdout_b.decode("utf-8", errors="replace")
+        parsed = _parse_jsonl_events(stdout_txt)
+        err = parsed.get("error", "")
+        return LLMResponse(
+            content=parsed["text"] if not err else "",
+            provider=self.provider_id, model=model,
+            tokens=parsed["usage"], latency_ms=latency,
+            raw_stderr=stderr_txt,
+            session_id=parsed["thread_id"] or session_id,
+            error=err,
+            error_type=classify_error(err) if err else "",
+            exit_code=rc,
+        )
 
     # ---------- 스트리밍 ----------
 

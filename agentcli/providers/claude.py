@@ -12,7 +12,7 @@ from typing import AsyncIterator
 
 from .base import (LLMProvider, build_session_prompt,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command)
+                   run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -228,54 +228,45 @@ class ClaudeProvider(LLMProvider):
 
         start = time.time()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd)
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("Claude 타임아웃 (%d초)", timeout)
-                return LLMResponse(content="", provider=self.provider_id,
-                                    model=model, session_id=used_sid,
-                                    error=f"timeout after {timeout}s",
-                                    error_type="timeout",
-                                    exit_code=124)
-            latency = int((time.time() - start) * 1000)
-
-            if proc.returncode != 0:
-                stderr_txt = (stderr_b or b"").decode("utf-8", errors="replace")
-                logger.error("Claude 실패 (code=%d): %s",
-                             proc.returncode, stderr_txt[:300])
-                msg = stderr_txt.strip()[:300] or f"exit={proc.returncode}"
-                return LLMResponse(
-                    content="", provider=self.provider_id, model=model,
-                    raw_stderr=stderr_txt, session_id=used_sid,
-                    error=msg, error_type=classify_error(msg),
-                    exit_code=proc.returncode)
-
-            content, tokens, err = _parse_claude_json(
-                (stdout_b or b"").decode("utf-8", errors="replace"))
-            return LLMResponse(
-                content=content if not err else "",
-                provider=self.provider_id, model=model,
-                tokens=tokens, latency_ms=latency,
-                raw_stderr=(stderr_b or b"").decode("utf-8", errors="replace"),
-                session_id=used_sid,
-                error=err,
-                error_type=classify_error(err) if err else "",
-                exit_code=proc.returncode,
-            )
+            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                cmd, timeout=timeout, cwd=cwd)
         except FileNotFoundError:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 error="Claude CLI not found",
                                 error_type=ERROR_BINARY_MISSING,
                                 exit_code=127)
+        if timed_out:
+            logger.error("Claude 타임아웃 (%d초)", timeout)
+            return LLMResponse(content="", provider=self.provider_id,
+                                model=model, session_id=used_sid,
+                                error=f"timeout after {timeout}s",
+                                error_type="timeout",
+                                exit_code=124)
+        latency = int((time.time() - start) * 1000)
+
+        if rc != 0:
+            stderr_txt = stderr_b.decode("utf-8", errors="replace")
+            logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
+            msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            return LLMResponse(
+                content="", provider=self.provider_id, model=model,
+                raw_stderr=stderr_txt, session_id=used_sid,
+                error=msg, error_type=classify_error(msg),
+                exit_code=rc)
+
+        stderr_txt = stderr_b.decode("utf-8", errors="replace")
+        content, tokens, err = _parse_claude_json(
+            stdout_b.decode("utf-8", errors="replace"))
+        return LLMResponse(
+            content=content if not err else "",
+            provider=self.provider_id, model=model,
+            tokens=tokens, latency_ms=latency,
+            raw_stderr=stderr_txt, session_id=used_sid,
+            error=err,
+            error_type=classify_error(err) if err else "",
+            exit_code=rc,
+        )
 
     async def stream_async(self, messages: list[Message], *,
                            model: str = "", timeout: int = 120,
