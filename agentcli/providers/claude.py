@@ -10,7 +10,7 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from .base import (LLMProvider, build_session_prompt,
+from .base import (LLMProvider, StreamState, build_session_prompt,
                    estimate_payload_prompt_tokens, health_from_response,
                    run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
@@ -276,6 +276,9 @@ class ClaudeProvider(LLMProvider):
                            wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
+        공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
+        에 위임. Claude 의 JSON event 해석만 ``_dispatch_stream_event`` 에서.
+
         이벤트 예:
           {"type":"system","subtype":"init","session_id":"..."}
           {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
@@ -288,154 +291,64 @@ class ClaudeProvider(LLMProvider):
         if cmd is None:
             yield StreamChunk(type="error", content="Claude CLI not found")
             return
-
-        start = time.time()
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd)
-
-            total_content_parts: list[str] = []
-            final_usage = TokenUsage(
+        state = StreamState(
+            final_session_id=used_sid,
+            final_usage=TokenUsage(
                 payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
                 prompt_tokens_reliable=False,
-                prompt_tokens_source="claude_cli_reported")
-            final_session_id = used_sid
-            timed_out = False
+                prompt_tokens_source="claude_cli_reported"))
+        async for chunk in self._run_stream_template(
+                cmd, state, model=model, cwd=cwd, timeout=timeout,
+                idle_timeout=idle_timeout, wall_timeout=wall_timeout):
+            yield chunk
 
-            # `timeout`은 wall-clock deadline이 아니라 **마지막 청크 이후 idle 한도**.
-            # Claude가 thinking/tool_use 같은 진행 청크를 보내면 카운트가 리셋되므로
-            # "장시간 사고 중"인 정상 동작은 잘못 끊지 않는다.
-            last_activity = time.time()
-            idle_limit = idle_timeout if idle_timeout is not None else timeout
-            wall_deadline = start + wall_timeout if wall_timeout else None
-            assert proc.stdout
-            while True:
-                read_timeout = idle_limit
-                if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
-                    if remaining <= 0:
-                        proc.kill()
-                        yield StreamChunk(
-                            type="error",
-                            content=f"wall timeout: {wall_timeout}s 초과",
-                            data={"error_type": "timeout",
-                                  "timeout_kind": "wall"})
-                        timed_out = True
-                        break
-                    read_timeout = min(read_timeout, remaining)
-                try:
-                    line_bytes = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=read_timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    idle = int(time.time() - last_activity)
-                    timeout_kind = (
-                        "wall" if wall_deadline is not None
-                        and time.time() >= wall_deadline else "idle")
-                    logger.error("Claude %s timeout (%ds since last chunk)",
-                                 timeout_kind, idle)
-                    content = (
-                        f"wall timeout: {wall_timeout}s 초과"
-                        if timeout_kind == "wall"
-                        else f"idle timeout: {idle}s 동안 청크 없음")
-                    yield StreamChunk(
-                        type="error",
-                        content=content,
-                        data={"error_type": "timeout",
-                              "timeout_kind": timeout_kind})
-                    timed_out = True
-                    break
-                if not line_bytes:
-                    break
-                last_activity = time.time()
-                line = line_bytes.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    yield StreamChunk(type="event", data={"raw": line})
-                    continue
-
-                etype = evt.get("type", "")
-                if etype == "system" and evt.get("session_id"):
-                    final_session_id = evt["session_id"]
-                    yield StreamChunk(type="event", data=evt,
-                                      session_id=final_session_id)
-                elif etype == "assistant":
-                    msg = evt.get("message") or {}
-                    for block in msg.get("content") or []:
-                        btype = block.get("type")
-                        if btype == "text":
-                            text = block.get("text", "")
-                            if text:
-                                total_content_parts.append(text)
-                                yield StreamChunk(type="text", content=text,
-                                                  data=block)
-                        elif btype == "thinking":
-                            yield StreamChunk(type="thinking",
-                                              content=block.get("thinking", ""),
-                                              data=block)
-                        elif btype == "tool_use":
-                            yield StreamChunk(type="tool_use", data=block)
-                        else:
-                            yield StreamChunk(type="event", data=block)
-                elif etype == "user":
-                    msg = evt.get("message") or {}
-                    for block in msg.get("content") or []:
-                        if block.get("type") == "tool_result":
-                            yield StreamChunk(type="tool_result", data=block)
-                        else:
-                            yield StreamChunk(type="event", data=block)
-                elif etype == "result":
-                    usage = evt.get("usage") or {}
-                    pt = int(usage.get("input_tokens") or 0)
-                    ct = int(usage.get("output_tokens") or 0)
-                    final_usage = TokenUsage(
-                        prompt_tokens=pt, completion_tokens=ct,
-                        total_tokens=pt + ct,
-                        payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
-                        prompt_tokens_reliable=False,
-                        prompt_tokens_source="claude_cli_reported")
-                    if evt.get("session_id"):
-                        final_session_id = evt["session_id"]
+    async def _dispatch_stream_event(self, evt: dict,
+                                     state: StreamState) -> AsyncIterator[StreamChunk]:
+        """Claude Code event 정규화 — text / thinking / tool_use / tool_result / event."""
+        etype = evt.get("type", "")
+        if etype == "system" and evt.get("session_id"):
+            state.final_session_id = evt["session_id"]
+            yield StreamChunk(type="event", data=evt,
+                              session_id=state.final_session_id)
+        elif etype == "assistant":
+            msg = evt.get("message") or {}
+            for block in msg.get("content") or []:
+                btype = block.get("type")
+                if btype == "text":
+                    text = block.get("text", "")
+                    if text:
+                        state.text_parts.append(text)
+                        yield StreamChunk(type="text", content=text, data=block)
+                elif btype == "thinking":
+                    yield StreamChunk(type="thinking",
+                                      content=block.get("thinking", ""),
+                                      data=block)
+                elif btype == "tool_use":
+                    yield StreamChunk(type="tool_use", data=block)
                 else:
-                    yield StreamChunk(type="event", data=evt)
-
-            if timed_out:
-                if proc and proc.returncode is None:
-                    await proc.wait()
-                return
-
-            rc = await proc.wait()
-            if rc != 0 and not total_content_parts:
-                err = b""
-                if proc.stderr:
-                    err = await proc.stderr.read()
-                yield StreamChunk(
-                    type="error",
-                    content=err.decode("utf-8", errors="replace")[:500],
-                    data={"returncode": rc})
-                return
-
-            yield StreamChunk(
-                type="done",
-                content="".join(total_content_parts),
-                session_id=final_session_id, usage=final_usage,
-                data={"provider": self.provider_id, "model": model,
-                      "latency_ms": int((time.time() - start) * 1000)})
-        except FileNotFoundError:
-            yield StreamChunk(type="error", content="Claude CLI not found")
-        except Exception as e:
-            logger.exception("Claude stream 예외")
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            yield StreamChunk(type="error", content=str(e))
+                    yield StreamChunk(type="event", data=block)
+        elif etype == "user":
+            msg = evt.get("message") or {}
+            for block in msg.get("content") or []:
+                if block.get("type") == "tool_result":
+                    yield StreamChunk(type="tool_result", data=block)
+                else:
+                    yield StreamChunk(type="event", data=block)
+        elif etype == "result":
+            usage = evt.get("usage") or {}
+            pt = int(usage.get("input_tokens") or 0)
+            ct = int(usage.get("output_tokens") or 0)
+            prev = state.final_usage
+            state.final_usage = TokenUsage(
+                prompt_tokens=pt, completion_tokens=ct,
+                total_tokens=pt + ct,
+                payload_prompt_tokens=(prev.payload_prompt_tokens if prev else 0),
+                prompt_tokens_reliable=False,
+                prompt_tokens_source="claude_cli_reported")
+            if evt.get("session_id"):
+                state.final_session_id = evt["session_id"]
+        else:
+            yield StreamChunk(type="event", data=evt)
 
 
 def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
