@@ -154,7 +154,10 @@ class LLMProvider(ABC):
         timed_out = False
         last_activity = start
         idle_limit = idle_timeout if idle_timeout is not None else timeout
-        wall_deadline = start + wall_timeout if wall_timeout else None
+        # issue #9: ``wall_timeout=0`` 도 의미 있는 입력 (즉시 만료) 이므로
+        # ``if wall_timeout`` (falsy check) 대신 ``is not None`` 명시적 검사.
+        wall_deadline = (start + wall_timeout
+                         if wall_timeout is not None else None)
 
         kwargs: dict = {
             "stdout": asyncio.subprocess.PIPE,
@@ -166,6 +169,10 @@ class LLMProvider(ABC):
         if cwd is not None:
             kwargs["cwd"] = cwd
 
+        # issue #10: ``except Exception`` 은 ``GeneratorExit`` 을 못 잡아
+        # caller 가 ``async for ... break`` / ``aclose()`` 로 일찍 종료할 때
+        # subprocess cleanup 이 실행되지 않아 좀비 프로세스가 남는다.
+        # ``try/finally`` 로 어떤 종료 경로에서도 ``proc.kill`` 보장.
         try:
             proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
             assert proc.stdout
@@ -246,12 +253,18 @@ class LLMProvider(ABC):
             yield StreamChunk(
                 type="error",
                 content=f"{self.provider_id} CLI not found")
-        except Exception as exc:  # noqa: BLE001 — 공통 cleanup
+        except Exception as exc:  # noqa: BLE001 — error chunk 만 yield, cleanup 은 finally
             logger.exception("%s stream 예외", self.provider_id)
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
             yield StreamChunk(type="error", content=str(exc))
+        finally:
+            # issue #10: GeneratorExit 포함 모든 종료 경로에서 proc 정리.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    # cleanup 실패는 silent — 더 이상 할 수 있는 게 없음
+                    pass
 
     async def _dispatch_stream_event(
             self, evt: dict, state: "StreamState"
