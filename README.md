@@ -95,7 +95,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.3"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.0"
 
 # For local development:
 pip install -e /path/to/agentcli
