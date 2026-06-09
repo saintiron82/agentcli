@@ -40,6 +40,27 @@ The provider CLI owns:
 - streaming chunk and error normalization
 - explicit provider/model/fallback policy
 
+## Design invariants
+
+These four constraints are non-negotiable. They are what the project pursues at
+the code level, not just stated preferences — every change is expected to hold
+them.
+
+- **Zero runtime dependencies.** `[project.dependencies]` stays empty; dev tools
+  live in `[project.optional-dependencies].dev` only. This is what keeps the
+  library safe to embed in any host app.
+- **The CLI session is the single source of truth for history.** The library
+  stores only `session_id` per provider and never re-injects prior turns into
+  prompts. `system_prompt` / `AgentProfile.instructions` are sent only when the
+  instruction hash changes. This keeps the layer lightweight and token usage
+  predictable.
+- **The three providers stay normalized.** `ClaudeProvider`, `CodexProvider`,
+  and `CopilotProvider` expose one unified contract for session flags, streaming
+  chunk types, and permission flags. A provider change that breaks parity is a
+  regression.
+- **Korean and English docs are paired.** Every `.md` has a matching `.ko.md`;
+  changes to one are mirrored in the other.
+
 ## Who should use it
 
 Use `agentcli` if you are building:
