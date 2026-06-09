@@ -64,6 +64,7 @@ class CopilotProvider(LLMProvider):
     provider_id = "copilot"
     supports_sessions = True
     supports_streaming = True
+    stores_history = False  # 히스토리는 Copilot CLI 세션이 소유
 
     def __init__(self,
                  allow_all_tools: bool = True,
@@ -391,6 +392,20 @@ class CopilotProvider(LLMProvider):
             sid = evt.get("sessionId")
             if sid:
                 state.final_session_id = sid
+            # 비스트리밍 파서와 동일 계약: result 에 error/exitCode!=0 이 담겨
+            # 오면 error 청크로 정규화한다 (event 로 위장되면 호스트가 실패를
+            # 감지하지 못한다).
+            err = evt.get("error")
+            exit_code = evt.get("exitCode")
+            if err or exit_code not in (None, 0):
+                msg = (err if isinstance(err, str)
+                       else str(err) if err
+                       else f"copilot exit={exit_code}")
+                yield StreamChunk(type="error", content=msg, data=evt)
+        elif etype in ("error", "assistant.error", "session.error"):
+            data = evt.get("data") or {}
+            msg = data.get("message") or evt.get("message") or str(data)
+            yield StreamChunk(type="error", content=msg, data=evt)
         elif etype and (etype.startswith("assistant.tool_")
                         or etype.startswith("tool.")):
             yield StreamChunk(type="tool_use", data=evt)
@@ -424,6 +439,10 @@ def _parse_copilot_jsonl(stdout: str) -> dict:
         try:
             evt = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(evt, dict):
+            # 유효한 JSON이지만 객체가 아닌 라인 (CLI 메타 출력 등)은 무시 —
+            # AttributeError 로 호스트에 예외가 전파되면 안 된다.
             continue
         etype = evt.get("type", "")
         if etype == "assistant.message_delta":

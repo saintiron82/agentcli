@@ -174,16 +174,15 @@ def test_invoke_includes_system_prompt_but_not_history(mock_find, mock_env, mock
     p = CopilotProvider()
     p.invoke([
         Message(role="system", content="Follow GUIDE v2"),
-        Message(role="user", content="old question"),
-        Message(role="assistant", content="old answer"),
+        Message(role="user", content="injected note"),
         Message(role="user", content="new question"),
     ])
     cmd = mock_run.call_args[0][0]
     prompt = cmd[cmd.index("-p") + 1]
     assert "Follow GUIDE v2" in prompt
     assert "new question" in prompt
-    assert "old question" not in prompt
-    assert "old answer" not in prompt
+    assert "Context (injected by host application):" in prompt
+    assert "[user] injected note" in prompt
 
 
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",

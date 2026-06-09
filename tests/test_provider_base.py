@@ -56,26 +56,56 @@ def test_resolve_model_aliases():
         p.resolve_model("custom-model", strict=True)
 
 
-def test_build_session_prompt_keeps_system_and_latest_user_only():
+def test_build_session_prompt_session_mode_is_system_plus_latest_user():
+    """CLI 네이티브 세션 모드: client 는 [system?, user] 만 전달한다."""
     prompt = build_session_prompt([
         Message(role="system", content="Follow GUIDE v2"),
-        Message(role="user", content="old question"),
-        Message(role="assistant", content="old answer"),
         Message(role="user", content="new question"),
     ])
     assert "Follow GUIDE v2" in prompt
     assert "new question" in prompt
-    assert "old question" not in prompt
-    assert "old answer" not in prompt
+    assert "Context" not in prompt
 
 
-def test_build_session_prompt_without_system_is_latest_user():
+def test_build_session_prompt_single_user_is_passthrough():
+    """미사용 모드: 최신 user 만 있으면 가공 없이 그대로."""
     prompt = build_session_prompt([
-        Message(role="user", content="old question"),
-        Message(role="assistant", content="old answer"),
         Message(role="user", content="new question"),
     ])
     assert prompt == "new question"
+
+
+def test_build_session_prompt_serializes_injected_context():
+    """호스트 주입 모드: 중간 메시지는 Context 블록으로 직렬화된다.
+
+    무엇을 담을지는 client 의 모드 결정 (세션 경로는 [system?, user] 만
+    전달) — provider 는 받은 것을 충실히 직렬화한다.
+    """
+    prompt = build_session_prompt([
+        Message(role="system", content="Follow GUIDE v2"),
+        Message(role="user", content="bull says market is up", agent="bull"),
+        Message(role="assistant", content="noted", agent="bull"),
+        Message(role="user", content="new question"),
+    ])
+    assert "Follow GUIDE v2" in prompt
+    assert "Context (injected by host application):" in prompt
+    assert "[user:bull] bull says market is up" in prompt
+    assert "[assistant:bull] noted" in prompt
+    assert "User request:\nnew question" in prompt
+    # 순서: system → context → 최신 user 요청
+    assert prompt.index("System instructions:") \
+        < prompt.index("Context (injected") \
+        < prompt.index("User request:")
+
+
+def test_build_session_prompt_context_without_system():
+    prompt = build_session_prompt([
+        Message(role="user", content="prior note"),
+        Message(role="user", content="ask now"),
+    ])
+    assert "Context (injected by host application):" in prompt
+    assert "[user] prior note" in prompt
+    assert "User request:\nask now" in prompt
 
 
 def test_default_health_check_reports_binary_missing():

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
                      LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
+from ..utils import serialize_messages
 
 
 @dataclass
@@ -31,9 +32,15 @@ class StreamState:
 def build_session_prompt(messages: list[Message]) -> str:
     """Build the prompt for CLI session providers.
 
-    Session providers own prior turns, so only durable system instructions and
-    the latest user request are injected. Earlier user/assistant messages are
-    intentionally excluded.
+    히스토리 3-모드 계약:
+      - CLI 네이티브 세션 모드: client 가 ``[system?, user]`` 만 전달 →
+        system + 최신 user 요청만 프롬프트가 된다 (CLI 세션이 히스토리 소유).
+      - 호스트 주입 모드 (``inject_context``): client 가 중간 메시지를
+        명시적으로 담아 보내면 "Context" 블록으로 직렬화되어 전달된다.
+      - 미사용 모드: client 가 최신 user 만 전달.
+
+    즉 이 함수는 받은 메시지를 충실히 직렬화할 뿐, 무엇을 담을지는 client
+    의 모드 결정이 담당한다.
     """
     if not messages:
         return ""
@@ -43,18 +50,30 @@ def build_session_prompt(messages: list[Message]) -> str:
         for m in messages
         if m.role == "system" and m.content.strip()
     ]
-    latest_user = ""
+    latest_user_msg = None
     for msg in reversed(messages):
         if msg.role == "user":
-            latest_user = msg.content
+            latest_user_msg = msg
             break
-    if not latest_user:
-        latest_user = messages[-1].content
+    if latest_user_msg is None:
+        latest_user_msg = messages[-1]
+    latest_user = latest_user_msg.content
 
-    if not system_parts:
+    context_msgs = [
+        m for m in messages
+        if m.role != "system" and m is not latest_user_msg
+    ]
+
+    parts: list[str] = []
+    if system_parts:
+        parts.append("System instructions:\n" + "\n\n".join(system_parts))
+    if context_msgs:
+        parts.append("Context (injected by host application):\n"
+                     + serialize_messages(context_msgs))
+    if not parts:
         return latest_user
-    system_text = "\n\n".join(system_parts)
-    return f"System instructions:\n{system_text}\n\nUser request:\n{latest_user}"
+    parts.append(f"User request:\n{latest_user}")
+    return "\n\n".join(parts)
 
 
 def estimate_payload_prompt_tokens(prompt: str) -> int:
@@ -69,6 +88,11 @@ class LLMProvider(ABC):
     provider_id: str = ""
     supports_sessions: bool = False
     supports_streaming: bool = False
+    # False 면 supports_sessions=False 여도 client 가 대화 내용을 messages
+    # 테이블에 저장하거나 이전 턴을 프롬프트에 재주입하지 않는다. CLI 가 자체
+    # 히스토리를 소유하는 3-provider 는 False. 라이브러리가 컨텍스트를 직접
+    # 관리해야 하는 custom 비세션 provider 만 True (기본값).
+    stores_history: bool = True
 
     @abstractmethod
     def invoke(self, messages: list[Message], *,
@@ -220,6 +244,11 @@ class LLMProvider(ABC):
                 try:
                     evt = json.loads(line)
                 except json.JSONDecodeError:
+                    yield StreamChunk(type="event", data={"raw": line})
+                    continue
+                if not isinstance(evt, dict):
+                    # 객체가 아닌 JSON 라인 — dispatcher 의 evt.get 이
+                    # AttributeError 로 스트림을 죽이지 않도록 raw event 처리.
                     yield StreamChunk(type="event", data={"raw": line})
                     continue
 
@@ -378,9 +407,16 @@ async def run_subprocess_async(
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
         return b"", f"timeout after {timeout}s".encode(), 124, True
+    finally:
+        # 호출 task 취소(CancelledError) 포함 모든 종료 경로에서 proc 정리.
+        # streaming 쪽 issue #10 과 동일한 좀비 프로세스 방지 — invoke 경로.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
     return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
 
 

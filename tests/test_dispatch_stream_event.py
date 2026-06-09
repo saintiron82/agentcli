@@ -300,3 +300,97 @@ class TestCopilotDispatch:
         chunks = _collect_chunks(self.provider, evt, self.state)
         assert len(chunks) == 1
         assert chunks[0].type == "event"
+
+
+# ============================================================
+# Copilot 스트림 에러 정규화 (실사용: 호스트가 type=="error"로 실패 감지)
+# ============================================================
+
+
+class TestCopilotErrorDispatch:
+    def setup_method(self):
+        self.provider = CopilotProvider()
+        self.state = StreamState(final_session_id="sid-1")
+
+    def test_error_event_becomes_error_chunk(self):
+        evt = {"type": "error", "data": {"message": "quota exceeded"}}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        assert len(chunks) == 1
+        assert chunks[0].type == "error"
+        assert "quota exceeded" in chunks[0].content
+
+    def test_assistant_error_event_becomes_error_chunk(self):
+        evt = {"type": "assistant.error",
+               "data": {"message": "model unavailable"}}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        assert [c.type for c in chunks] == ["error"]
+        assert "model unavailable" in chunks[0].content
+
+    def test_session_error_event_becomes_error_chunk(self):
+        evt = {"type": "session.error", "message": "session crashed"}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        assert [c.type for c in chunks] == ["error"]
+        assert "session crashed" in chunks[0].content
+
+    def test_result_with_nonzero_exit_becomes_error_chunk(self):
+        evt = {"type": "result", "sessionId": "sid-2", "exitCode": 1}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        # session_id 갱신과 동시에 실패가 error 청크로 표면화
+        assert self.state.final_session_id == "sid-2"
+        assert [c.type for c in chunks] == ["error"]
+        assert "exit=1" in chunks[0].content
+
+    def test_result_with_error_field_becomes_error_chunk(self):
+        evt = {"type": "result", "sessionId": "sid-2",
+               "exitCode": 0, "error": "billing issue"}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        assert [c.type for c in chunks] == ["error"]
+        assert "billing issue" in chunks[0].content
+
+    def test_result_success_yields_no_error(self):
+        evt = {"type": "result", "sessionId": "sid-2", "exitCode": 0}
+        chunks = _collect_chunks(self.provider, evt, self.state)
+        assert chunks == []
+        assert self.state.final_session_id == "sid-2"
+
+
+# ============================================================
+# 배치 파서: 비-dict JSON 라인 방어 (호스트로 예외 전파 금지)
+# ============================================================
+
+
+class TestNonDictJsonLines:
+    def test_codex_parser_skips_non_dict_json(self):
+        from agentcli.providers.codex import _parse_jsonl_events
+        stdout = '\n'.join([
+            '"Reading input from stdin..."',
+            '123',
+            '["array", "line"]',
+            '{"type":"thread.started","thread_id":"t-1"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
+        ])
+        parsed = _parse_jsonl_events(stdout)
+        assert parsed["text"] == "ok"
+        assert parsed["thread_id"] == "t-1"
+
+    def test_copilot_parser_skips_non_dict_json(self):
+        from agentcli.providers.copilot import _parse_copilot_jsonl
+        stdout = '\n'.join([
+            '"meta line"',
+            '42',
+            '{"type":"assistant.message","data":{"content":"hi","outputTokens":3}}',
+            '{"type":"result","sessionId":"s-9","exitCode":0}',
+        ])
+        parsed = _parse_copilot_jsonl(stdout)
+        assert parsed["text"] == "hi"
+        assert parsed["session_id"] == "s-9"
+        assert parsed["error"] == ""
+
+    def test_claude_parser_treats_non_dict_json_as_raw_text(self):
+        from agentcli.providers.claude import _parse_claude_json
+        content, tokens, err = _parse_claude_json('["not","an","object"]')
+        assert content == '["not","an","object"]'
+        assert err == ""
+        content2, _, err2 = _parse_claude_json('12345')
+        assert content2 == '12345'
+        assert err2 == ""

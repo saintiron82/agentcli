@@ -228,7 +228,10 @@ def test_invoke_not_found(mock_env, mock_run):
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_uses_system_and_last_message_only(mock_env, mock_run):
-    """세션 provider: system 지시는 주입하되 이전 턴은 재직렬화하지 않는다."""
+    """provider 는 client 가 담은 메시지를 충실히 직렬화한다.
+
+    세션 모드에서 이전 턴 미주입은 client 가 [system?, user] 만 담는 것으로
+    보장 (test_session_routing). 명시 주입분은 Context 블록으로 전달된다."""
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
@@ -236,8 +239,7 @@ def test_invoke_uses_system_and_last_message_only(mock_env, mock_run):
     p = CodexProvider()
     p.invoke([
         Message(role="system", content="Follow GUIDE v2"),
-        Message(role="user", content="이전 질문"),
-        Message(role="assistant", content="이전 답변"),
+        Message(role="user", content="주입된 노트"),
         Message(role="user", content="새 질문"),
     ])
     cmd = mock_run.call_args[0][0]
@@ -245,9 +247,8 @@ def test_invoke_uses_system_and_last_message_only(mock_env, mock_run):
     prompt = cmd[-1]
     assert "Follow GUIDE v2" in prompt
     assert "새 질문" in prompt
-    # 이전 히스토리는 들어가면 안 됨
-    assert "이전 질문" not in prompt
-    assert "이전 답변" not in prompt
+    assert "Context (injected by host application):" in prompt
+    assert "[user] 주입된 노트" in prompt
 
 
 @patch("agentcli.providers.codex.subprocess.run")
@@ -271,3 +272,32 @@ def test_invoke_timeout(mock_env, mock_run):
     assert resp.content == ""
     assert resp.error_type == "timeout"
     assert resp.exit_code == 124
+
+
+# ===== 인자 주입 방어: `--` 구분자 =====
+
+def test_build_cmd_new_session_has_dashdash_before_prompt():
+    """prompt 가 `-`로 시작해도 플래그로 해석되지 않도록 `--` 필수."""
+    from unittest.mock import patch
+    p = CodexProvider()
+    with patch.object(CodexProvider, "_find_binary",
+                      return_value="/usr/bin/codex"):
+        cmd = p._build_cmd("--dangerously-bypass-approvals-and-sandbox",
+                           "", None, "")
+    assert cmd is not None
+    dd = cmd.index("--")
+    assert cmd[dd + 1] == "--dangerously-bypass-approvals-and-sandbox", (
+        "악성 prompt 는 -- 뒤 위치 인자로만 전달되어야 한다")
+    assert cmd[-1] == "--dangerously-bypass-approvals-and-sandbox"
+
+
+def test_build_cmd_resume_has_dashdash_before_sid_and_prompt():
+    from unittest.mock import patch
+    p = CodexProvider()
+    with patch.object(CodexProvider, "_find_binary",
+                      return_value="/usr/bin/codex"):
+        cmd = p._build_cmd("-p", "", None, "-malicious-sid")
+    assert cmd is not None
+    dd = cmd.index("--")
+    assert cmd[dd + 1] == "-malicious-sid"
+    assert cmd[dd + 2] == "-p"

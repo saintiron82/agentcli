@@ -292,3 +292,176 @@ def test_json_decode_error_yields_event_chunk_and_continues(monkeypatch):
     assert text_chunks and text_chunks[0].content == "after-bad-line", (
         f"stream should continue after JSON decode error, got types={types}")
     assert types[-1] == "done"
+
+
+# ============================================================
+# 비-dict JSON 라인 방어: dispatcher 의 evt.get 이 스트림을 죽이지 않는다
+# ============================================================
+
+
+def test_non_dict_json_line_becomes_raw_event(monkeypatch):
+    """유효한 JSON이지만 객체가 아닌 라인은 raw event 로 흘려보내고 계속 진행."""
+    lines = [
+        b'"Reading input from stdin..."\n',
+        b'123\n',
+        b'{"type": "assistant", "message": {"content": '
+        b'[{"type": "text", "text": "ok"}]}}\n',
+    ]
+    proc = make_fake_proc(stdout_lines=lines, returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+
+    provider = ClaudeProvider()
+    state = StreamState()
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["fake"], state, model="m")]
+
+    chunks = asyncio.run(run())
+    types = [c.type for c in chunks]
+    raw_events = [c for c in chunks
+                  if c.type == "event" and "raw" in (c.data or {})]
+    assert len(raw_events) == 2, f"non-dict lines must surface as raw events: {types}"
+    assert "text" in types
+    assert types[-1] == "done"
+
+
+# ============================================================
+# claude stream stale-session 자동 복구
+# ============================================================
+
+
+def test_claude_stream_stale_session_retries_with_new_session(monkeypatch):
+    """첫 청크가 stale-session 에러면 새 세션으로 1회 재시도."""
+    from agentcli.types import Message
+
+    stale_proc = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"No conversation found with session ID: old-sid")
+    ok_events = [
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "recovered"}]}},
+        {"type": "result", "usage": {"input_tokens": 1, "output_tokens": 1},
+         "session_id": "new-sid"},
+    ]
+    ok_proc = make_fake_proc(stdout_lines=jsonl_bytes(ok_events), returncode=0)
+
+    procs = iter([stale_proc, ok_proc])
+    spawned_cmds: list[list[str]] = []
+
+    async def fake_create(*args, **kwargs):
+        spawned_cmds.append(list(args))
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(
+        ClaudeProvider, "_find_binary", lambda self: "/usr/bin/claude")
+
+    provider = ClaudeProvider()
+    provider.supports_sessions = True
+
+    async def run():
+        return [c async for c in provider.stream_async(
+            [Message(role="user", content="hi")], session_id="old-sid")]
+
+    chunks = asyncio.run(run())
+    types = [c.type for c in chunks]
+    assert "error" not in types, f"stale 에러는 재시도로 흡수되어야 함: {types}"
+    assert "text" in types
+    assert chunks[-1].type == "done"
+    assert chunks[-1].content == "recovered"
+    assert chunks[-1].session_id == "new-sid"
+    assert len(spawned_cmds) == 2
+    assert "--resume" in spawned_cmds[0]
+    assert "--resume" not in spawned_cmds[1]
+    assert "--session-id" in spawned_cmds[1]
+
+
+def test_claude_stream_non_stale_error_not_retried(monkeypatch):
+    """stale 외의 스트림 실패는 재시도 없이 error 청크 그대로 전달."""
+    from agentcli.types import Message
+
+    fail_proc = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"usage limit reached")
+    spawn_count = 0
+
+    async def fake_create(*args, **kwargs):
+        nonlocal spawn_count
+        spawn_count += 1
+        return fail_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(
+        ClaudeProvider, "_find_binary", lambda self: "/usr/bin/claude")
+
+    provider = ClaudeProvider()
+    provider.supports_sessions = True
+
+    async def run():
+        return [c async for c in provider.stream_async(
+            [Message(role="user", content="hi")], session_id="old-sid")]
+
+    chunks = asyncio.run(run())
+    assert [c.type for c in chunks] == ["error"]
+    assert "usage limit" in chunks[0].content
+    assert spawn_count == 1
+
+
+# ============================================================
+# run_subprocess_async: 호출 task 취소 시 proc 정리 (invoke 경로 좀비 방지)
+# ============================================================
+
+
+def test_run_subprocess_async_cancellation_kills_proc(monkeypatch):
+    """CancelledError 전파 경로에서도 subprocess 가 kill 되어야 한다."""
+    from unittest.mock import AsyncMock, MagicMock
+    from agentcli.providers.base import run_subprocess_async
+
+    proc = make_fake_proc()
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    proc.communicate = hang
+    proc.returncode = None
+    proc.kill = MagicMock(
+        side_effect=lambda: setattr(proc, "returncode", -9))
+    proc.wait = AsyncMock(return_value=-9)
+    patch_subprocess_exec(monkeypatch, proc)
+
+    async def run():
+        task = asyncio.create_task(run_subprocess_async(["x"], timeout=60))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    proc.kill.assert_called_once()
+
+
+def test_run_subprocess_async_timeout_still_kills_proc(monkeypatch):
+    """기존 timeout 경로 회귀: finally 로 이동한 kill 이 그대로 동작."""
+    from unittest.mock import AsyncMock, MagicMock
+    from agentcli.providers.base import run_subprocess_async
+
+    proc = make_fake_proc()
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    proc.communicate = hang
+    proc.returncode = None
+    proc.kill = MagicMock(
+        side_effect=lambda: setattr(proc, "returncode", -9))
+    proc.wait = AsyncMock(return_value=-9)
+    patch_subprocess_exec(monkeypatch, proc)
+
+    async def run():
+        return await run_subprocess_async(["x"], timeout=0)
+
+    stdout_b, stderr_b, rc, timed_out = asyncio.run(run())
+    assert timed_out is True
+    assert rc == 124
+    proc.kill.assert_called_once()
