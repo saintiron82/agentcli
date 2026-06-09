@@ -20,6 +20,20 @@ checks, usage accounting, fallback rules, and instruction freshness.
 `agentcli` packages that application-level client layer without taking ownership
 of the provider's native session history.
 
+Stated plainly, the role is narrow. When an application needs an agent
+backend, the usual route is to build an agent loop on a hosted API.
+`agentcli` takes the other route: reuse the agentic CLI the user already
+has installed and authenticated — typically on a flat-rate subscription —
+as that backend. The CLI keeps its own harness (tool loop, skills, project
+instructions, session history); this library is only the embedding client
+around it.
+
+Two limits follow from that choice. It fits personal and internal
+automation, not serving third parties on someone else's subscription. And
+CLI interfaces change faster than versioned APIs — absorbing that churn
+behind a stable Python contract is the maintenance this library exists to
+do.
+
 ## Core boundary
 
 The provider CLI owns:
