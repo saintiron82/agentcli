@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.0"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.1"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -424,6 +424,7 @@ pytest
 
 ## Status
 
+- **0.5.1** — Claude native session resume on macOS/Linux (stateless only on Windows, #4), explicit history modes (`new_session`, working `inject_context`), Copilot stream error normalization, same-conversation call serialization, Codex `--` argument hardening.
 - **0.4.3** — Claude provider declared stateless: `-p` mode no longer pairs with `--resume`, fixing a 5-minute Windows hang (#4).
 - **0.4.2** — Codex bootstrap greeting filtering and one-time resume retry for greeting-only first turns.
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
@@ -436,7 +437,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.4.3 release note: [docs/releases/v0.4.3.md](docs/releases/v0.4.3.md) / [docs/releases/v0.4.3.ko.md](docs/releases/v0.4.3.ko.md)
+- v0.5.1 release note: [docs/releases/v0.5.1.md](docs/releases/v0.5.1.md) / [docs/releases/v0.5.1.ko.md](docs/releases/v0.5.1.ko.md)
 
 ## License
 
