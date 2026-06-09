@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **Zero runtime dependencies.** Do not add anything to `[project.dependencies]` in `pyproject.toml`. Dev tools go in `[project.optional-dependencies].dev` only.
 - **The CLI session is the single source of truth for history.** The library stores only `session_id` per provider — never re-inject prior user/assistant turns into prompts. `system_prompt` / `AgentProfile.instructions` are injected only when the instruction hash changes.
-- **Three providers must stay normalized.** When adding or changing provider behavior, preserve the unified contract across `ClaudeProvider`, `CodexProvider`, `CopilotProvider` (session flags, streaming chunk types, permission flags). See the comparison table in `README.md`.
+- **Three providers must stay normalized.** When adding or changing provider behavior, preserve the unified contract across `ClaudeProvider`, `CodexProvider`, `CopilotProvider` (session flags, streaming chunk types, permission flags). See the comparison table in `README.md`. One documented exception: `ClaudeProvider.supports_sessions` is platform-conditional (`False` on Windows only) because `-p` + `--resume` hangs there (issue #4); macOS/Linux resume natively.
 - **Korean and English docs are paired.** Every doc with a `.md` also has a `.ko.md` (README, `docs/positioning`, `docs/release`, `docs/releases/v*`). Changes to one must be mirrored in the other.
 
 ## Commands

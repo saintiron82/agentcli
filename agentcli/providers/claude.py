@@ -19,6 +19,10 @@ from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
 
 logger = logging.getLogger(__name__)
 
+# 저장된 session_id 의 네이티브 세션 파일이 삭제/만료되면 CLI 가 이 메시지와
+# 함께 즉시 실패한다 — 이때만 새 세션으로 1회 자동 복구한다.
+STALE_SESSION_MARKER = "No conversation found with session ID"
+
 CLAUDE_MODELS = [
     {"id": "", "name": "기본", "aliases": ["default"]},
     {"id": "best", "name": "Best available"},
@@ -47,13 +51,16 @@ CLAUDE_MODELS = [
 
 class ClaudeProvider(LLMProvider):
     provider_id = "claude"
-    # `claude -p`는 single-shot/stateless이며 `--resume`은 인터랙티브 모드 전용이다.
-    # 두 모드를 같이 호출하면 Windows에서 5분+ hang (issue #4). 라이브러리는
-    # claude를 stateless로 선언하여 상위 client가 session_id를 저장·재생하지
-    # 않도록 한다. `--session-id <new-uuid>`는 새 세션 식별자 부여 용도로 계속
-    # 사용된다 (resume과 무관).
-    supports_sessions = False
+    # macOS/Linux: `claude -p --resume <sid>` 가 네이티브 세션을 재개하며
+    # resume 후에도 동일 session_id 가 유지된다 (Claude Code 2.1.x 검증).
+    # Windows: `-p` + `--resume` 조합이 인터랙티브 입력 대기로 폴백되어
+    # 5분+ hang (issue #4) — Windows 에서만 stateless 로 동작하고
+    # `--session-id <new-uuid>` 는 usage audit 식별자로만 쓴다.
+    supports_sessions = platform.system() != "Windows"
     supports_streaming = True
+    # 어느 모드든 히스토리는 Claude CLI 가 소유 — 라이브러리는 대화 내용을
+    # 저장하지 않는다 (Windows stateless 모드 포함).
+    stores_history = False
 
     def __init__(self,
                  permission_mode: str = "bypassPermissions",
@@ -146,11 +153,15 @@ class ClaudeProvider(LLMProvider):
         if self._disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._disallowed_tools)]
 
-        # issue #4: `-p` mode는 stateless라 `--resume`을 붙이면 인터랙티브
-        # 입력 대기로 폴백되어 Windows에서 데드락. session_id가 들어와도
-        # resume 시도 없이 새 식별자만 부여한다.
-        used_session_id = str(uuid.uuid4())
-        cmd += ["--session-id", used_session_id]
+        # macOS/Linux: 저장된 session_id 가 있으면 `--resume` 으로 재개.
+        # Windows (supports_sessions=False): issue #4 데드락 회피를 위해
+        # resume 하지 않고 항상 새 식별자만 부여한다.
+        if session_id and self.supports_sessions:
+            cmd += ["--resume", session_id]
+            used_session_id = session_id
+        else:
+            used_session_id = str(uuid.uuid4())
+            cmd += ["--session-id", used_session_id]
         return cmd, used_session_id
 
     def invoke(self, messages: list[Message], *,
@@ -174,6 +185,14 @@ class ClaudeProvider(LLMProvider):
             latency = int((time.time() - start) * 1000)
 
             if result.returncode != 0:
+                if (used_sid == session_id and session_id
+                        and STALE_SESSION_MARKER in (result.stderr or "")):
+                    logger.warning(
+                        "Claude 세션 %s 만료 — 새 세션으로 재시도",
+                        session_id[:8])
+                    return self.invoke(messages, model=model,
+                                       timeout=timeout, session_id="",
+                                       cwd=cwd)
                 err_msg = (result.stderr or "").strip()[:300]
                 msg = err_msg or f"exit={result.returncode}"
                 logger.error("Claude 실패 (code=%d): %s",
@@ -247,6 +266,13 @@ class ClaudeProvider(LLMProvider):
 
         if rc != 0:
             stderr_txt = stderr_b.decode("utf-8", errors="replace")
+            if (used_sid == session_id and session_id
+                    and STALE_SESSION_MARKER in stderr_txt):
+                logger.warning(
+                    "Claude 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
+                return await self.invoke_async(
+                    messages, model=model, timeout=timeout,
+                    session_id="", cwd=cwd)
             logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             return LLMResponse(
@@ -287,20 +313,40 @@ class ClaudeProvider(LLMProvider):
           {"type":"result","subtype":"success","result":"...","usage":{...},"session_id":"..."}
         """
         prompt = build_session_prompt(messages)
-        cmd, used_sid = self._build_cmd(prompt, model, session_id, "stream-json")
-        if cmd is None:
-            yield StreamChunk(type="error", content="Claude CLI not found")
-            return
-        state = StreamState(
-            final_session_id=used_sid,
-            final_usage=TokenUsage(
-                payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
-                prompt_tokens_reliable=False,
-                prompt_tokens_source="claude_cli_reported"))
-        async for chunk in self._run_stream_template(
-                cmd, state, model=model, cwd=cwd, timeout=timeout,
-                idle_timeout=idle_timeout, wall_timeout=wall_timeout):
-            yield chunk
+        # 만료된 session_id 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
+        # stale-session 에러일 때만 새 세션으로 1회 재시도한다. 어떤 출력이든
+        # caller 에 전달된 뒤에는 재시도하지 않는다.
+        attempt_sid = session_id
+        for _attempt in range(2):
+            cmd, used_sid = self._build_cmd(
+                prompt, model, attempt_sid, "stream-json")
+            if cmd is None:
+                yield StreamChunk(type="error", content="Claude CLI not found")
+                return
+            state = StreamState(
+                final_session_id=used_sid,
+                final_usage=TokenUsage(
+                    payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                    prompt_tokens_reliable=False,
+                    prompt_tokens_source="claude_cli_reported"))
+            retry_stale = False
+            emitted = False
+            async for chunk in self._run_stream_template(
+                    cmd, state, model=model, cwd=cwd, timeout=timeout,
+                    idle_timeout=idle_timeout, wall_timeout=wall_timeout):
+                if (attempt_sid and not emitted
+                        and chunk.type == "error"
+                        and STALE_SESSION_MARKER in (chunk.content or "")):
+                    retry_stale = True
+                    break
+                emitted = True
+                yield chunk
+            if not retry_stale:
+                return
+            logger.warning(
+                "Claude 세션 %s 만료 — 새 세션으로 스트림 재시도",
+                attempt_sid[:8])
+            attempt_sid = ""
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:
@@ -364,6 +410,9 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
+        return stdout, TokenUsage(), ""
+    if not isinstance(data, dict):
+        # 유효한 JSON이지만 객체가 아니면 (배열/스칼라) raw 텍스트와 동일 취급.
         return stdout, TokenUsage(), ""
 
     content = (data.get("result")

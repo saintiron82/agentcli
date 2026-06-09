@@ -51,10 +51,13 @@ def test_list_models():
 
 
 def test_provider_id():
+    import platform
     p = ClaudeProvider()
     assert p.provider_id == "claude"
-    # issue #4: claude -p 모드는 stateless이므로 supports_sessions=False
-    assert p.supports_sessions is False
+    # macOS/Linux: 네이티브 resume 지원. Windows: issue #4 hang 회피로 stateless.
+    assert p.supports_sessions is (platform.system() != "Windows")
+    # 어느 모드든 히스토리는 CLI 소유 — 라이브러리는 내용을 저장하지 않는다.
+    assert p.stores_history is False
 
 
 @patch("agentcli.providers.claude.subprocess.run")
@@ -98,17 +101,72 @@ def test_invoke_marks_claude_prompt_usage_as_provider_reported(mock_find, mock_r
 
 @patch("agentcli.providers.claude.subprocess.run")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
-def test_invoke_session_id_ignored_in_print_mode(mock_find, mock_run):
-    """issue #4: `-p` 모드는 stateless라 외부 session_id를 받아도 `--resume`
-    하지 않고 새 식별자를 발급한다 (Windows hang 우회)."""
+def test_invoke_session_id_ignored_in_stateless_mode(mock_find, mock_run):
+    """issue #4: Windows(stateless) 모드는 외부 session_id를 받아도 `--resume`
+    하지 않고 새 식별자를 발급한다 (hang 우회)."""
     mock_run.return_value = MagicMock(
         returncode=0, stdout='{"result":"ok"}', stderr="")
     p = ClaudeProvider()
+    p.supports_sessions = False  # Windows 모드 시뮬레이션
     resp = p.invoke([Message(role="user", content="hi")], session_id="abc-123")
     cmd = mock_run.call_args[0][0]
-    assert "--resume" not in cmd, "issue #4: -p + --resume은 데드락 유발"
+    assert "--resume" not in cmd, "issue #4: stateless 모드에서 --resume 금지"
     assert "--session-id" in cmd
     assert resp.session_id and resp.session_id != "abc-123"
+
+
+@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_resumes_session(mock_find, mock_run):
+    """세션 모드: 저장된 session_id로 `--resume`, 동일 sid를 반환."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout='{"result":"ok"}', stderr="")
+    p = ClaudeProvider()
+    p.supports_sessions = True
+    resp = p.invoke([Message(role="user", content="hi")],
+                    session_id="abc-123")
+    cmd = mock_run.call_args[0][0]
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--resume") + 1] == "abc-123"
+    assert "--session-id" not in cmd
+    assert resp.session_id == "abc-123"
+
+
+@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_stale_session_auto_recovers(mock_find, mock_run):
+    """만료된 sid resume 실패 시 새 세션으로 1회 자동 재시도."""
+    stale = MagicMock(
+        returncode=1, stdout="",
+        stderr="No conversation found with session ID: abc-123")
+    fresh = MagicMock(
+        returncode=0, stdout='{"result":"recovered"}', stderr="")
+    mock_run.side_effect = [stale, fresh]
+    p = ClaudeProvider()
+    p.supports_sessions = True
+    resp = p.invoke([Message(role="user", content="hi")],
+                    session_id="abc-123")
+    assert resp.content == "recovered"
+    assert resp.session_id != "abc-123", "새 세션 sid가 반환되어야 함"
+    assert mock_run.call_count == 2
+    retry_cmd = mock_run.call_args_list[1][0][0]
+    assert "--resume" not in retry_cmd
+    assert "--session-id" in retry_cmd
+
+
+@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_other_failure_not_retried(mock_find, mock_run):
+    """stale-session 외의 실패는 재시도 없이 그대로 에러 반환."""
+    mock_run.return_value = MagicMock(
+        returncode=1, stdout="", stderr="usage limit reached")
+    p = ClaudeProvider()
+    p.supports_sessions = True
+    resp = p.invoke([Message(role="user", content="hi")],
+                    session_id="abc-123")
+    assert resp.content == ""
+    assert resp.error
+    assert mock_run.call_count == 1
 
 
 @patch("agentcli.providers.claude.subprocess.run")
@@ -179,21 +237,24 @@ def test_invoke_with_model(mock_find, mock_run):
 
 @patch("agentcli.providers.claude.subprocess.run")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
-def test_invoke_includes_system_prompt_but_not_history(mock_find, mock_run):
+def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
+    """provider 는 받은 메시지를 충실히 직렬화한다 — 세션 모드에서 이전 턴이
+    프롬프트에 안 들어가는 것은 client 가 [system?, user] 만 담는 것으로
+    보장된다 (test_session_routing). 명시 주입(inject_context)분은 Context
+    블록으로 전달되어야 한다."""
     mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
     p = ClaudeProvider()
     p.invoke([
         Message(role="system", content="Follow GUIDE v2"),
-        Message(role="user", content="old question"),
-        Message(role="assistant", content="old answer"),
+        Message(role="user", content="injected note", agent="bull"),
         Message(role="user", content="new question"),
     ])
     cmd = mock_run.call_args[0][0]
     prompt = cmd[cmd.index("-p") + 1]
     assert "Follow GUIDE v2" in prompt
     assert "new question" in prompt
-    assert "old question" not in prompt
-    assert "old answer" not in prompt
+    assert "Context (injected by host application):" in prompt
+    assert "[user:bull] injected note" in prompt
 
 
 @patch("agentcli.providers.claude.subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 120))

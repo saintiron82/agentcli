@@ -34,6 +34,24 @@ provider CLI가 소유하는 것:
 - streaming chunk/error 정규화
 - 명시적 provider/model/fallback 정책
 
+## 설계 불변식
+
+이 네 가지 제약은 타협 대상이 아닙니다. 단순한 선호가 아니라 코드 레벨에서
+프로젝트가 추구하는 바이며, 모든 변경은 이 불변식을 지키는 것을 전제로 합니다.
+
+- **런타임 의존성 0.** `[project.dependencies]`는 비워 두고, 개발 도구는
+  `[project.optional-dependencies].dev`에만 둡니다. 그래야 어떤 호스트 앱에도
+  안전하게 임베드할 수 있습니다.
+- **CLI 세션이 히스토리의 단일 진실 소스.** 라이브러리는 provider별
+  `session_id`만 저장하고 이전 턴을 프롬프트에 다시 주입하지 않습니다.
+  `system_prompt` / `AgentProfile.instructions`는 instruction hash가 바뀔 때만
+  전송됩니다. 이 덕분에 레이어가 가볍고 토큰 사용량이 예측 가능합니다.
+- **세 provider는 정규화 상태를 유지.** `ClaudeProvider`, `CodexProvider`,
+  `CopilotProvider`는 세션 flag, streaming chunk 타입, 권한 flag에 대해 하나의
+  통일된 계약을 노출합니다. 이 동등성(parity)을 깨는 provider 변경은 회귀입니다.
+- **한/영 문서는 짝을 이룸.** 모든 `.md`에는 대응하는 `.ko.md`가 있으며, 한쪽
+  변경은 다른 쪽에도 반영합니다.
+
 ## 누가 쓰면 좋은가
 
 다음과 같은 것을 만들 때 적합합니다.

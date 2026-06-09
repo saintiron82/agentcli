@@ -76,6 +76,7 @@ class CodexProvider(LLMProvider):
     provider_id = "codex"
     supports_sessions = True
     supports_streaming = True
+    stores_history = False  # 히스토리는 Codex CLI 세션이 소유
 
     def __init__(self,
                  sandbox_mode: str = "danger-full-access",
@@ -168,7 +169,9 @@ class CodexProvider(LLMProvider):
                 cmd.append("--skip-git-repo-check")
             if model:
                 cmd += ["-m", model]
-            cmd += [session_id, prompt]
+            # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
+            # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
+            cmd += ["--", session_id, prompt]
             return cmd
         # 신규 세션
         cmd.append("--json")
@@ -184,7 +187,9 @@ class CodexProvider(LLMProvider):
             cmd += ["-C", cwd]
         if model:
             cmd += ["-m", model]
-        cmd.append(prompt)
+        # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
+        # 해석되지 않는다 (untrusted 입력 주입 방지).
+        cmd += ["--", prompt]
         return cmd
 
     # ---------- 동기 ----------
@@ -451,6 +456,9 @@ def _parse_jsonl_events(stdout: str) -> dict:
         try:
             evt = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(evt, dict):
+            # 유효한 JSON이지만 객체가 아닌 라인은 무시 — 호스트로 예외 전파 금지.
             continue
         etype = evt.get("type", "")
         if etype == "thread.started":

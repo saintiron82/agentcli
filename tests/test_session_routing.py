@@ -377,3 +377,115 @@ def test_fallback_receives_system_prompt_even_when_primary_suppresses_it():
     assert "GUIDE v1" in fallback_contents
     assert "second" in fallback_contents
     assert "first" not in fallback_contents
+
+
+# ===== stores_history=False 비세션 provider 경로 (Windows의 claude 등) =====
+
+class FakeCliStatelessProvider(FakeNonSessionProvider):
+    """CLI가 히스토리를 소유하지만 세션 resume은 불가능한 모드.
+
+    Windows의 ClaudeProvider(supports_sessions=False, stores_history=False)와
+    동일한 계약. 라이브러리는 내용 저장도, 이전 턴 재주입도 하지 않아야 한다.
+    """
+    provider_id = "cli-stateless"
+    stores_history = False
+
+
+def test_cli_stateless_provider_stores_no_content():
+    p = FakeCliStatelessProvider()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order([p.provider_id])
+    store = MemoryStore()
+    client = LLMClient(store=store, registry=reg)
+
+    resp = client.chat("hello", provider="cli-stateless", owner="bot1")
+    assert resp.content == "plain-reply"
+    # 내용 미저장: messages 테이블이 비어 있어야 한다.
+    assert store.get_messages(resp.conversation_id) == []
+
+
+def test_cli_stateless_provider_does_not_reinject_prev_turns():
+    p = FakeCliStatelessProvider()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order([p.provider_id])
+    store = MemoryStore()
+    client = LLMClient(store=store, registry=reg)
+
+    resp1 = client.chat("first", provider="cli-stateless", owner="bot1")
+    client.chat("second", provider="cli-stateless", owner="bot1",
+                conversation_id=resp1.conversation_id)
+    # 이전 턴이 프롬프트에 재주입되지 않는다 (CLI가 컨텍스트 소유).
+    assert [m.content for m in p.last_messages] == ["second"]
+
+
+def test_custom_non_session_provider_still_stores_content():
+    """stores_history 기본값(True)인 custom provider는 기존 동작 유지."""
+    p = FakeNonSessionProvider()
+    reg = ProviderRegistry()
+    reg.register(p)
+    reg.set_fallback_order([p.provider_id])
+    store = MemoryStore()
+    client = LLMClient(store=store, registry=reg)
+
+    resp = client.chat("hello", provider="plain", owner="bot1")
+    msgs = store.get_messages(resp.conversation_id)
+    assert [m.role for m in msgs] == ["user", "assistant"]
+
+
+# ===== 히스토리 3-모드: 주입 / CLI 네이티브 / 미사용 =====
+
+def test_new_session_param_starts_fresh_and_replaces_tracked_session():
+    """미사용 모드: new_session=True 는 이 호출만 새 세션에서 시작하고,
+    이후 호출은 그 새 세션을 이어간다."""
+    p = FakeSessionProvider()
+    client = _make_client(p)
+
+    r1 = client.chat("first", provider="sessprov", owner="o", alias="a")
+    sid1 = r1.session_id
+
+    r2 = client.chat("fresh start", provider="sessprov", owner="o", alias="a",
+                     new_session=True)
+    # provider 는 빈 session_id 를 받아 새 세션을 만들어야 한다.
+    assert p.last_session_id == ""
+    assert r2.session_id != sid1
+
+    r3 = client.chat("continue", provider="sessprov", owner="o", alias="a")
+    # 추적 세션은 new_session 호출이 만든 세션으로 교체된다.
+    assert p.last_session_id == r2.session_id
+    assert r3.session_id == r2.session_id
+
+
+def test_inject_context_reaches_session_provider():
+    """주입 모드: inject_context 는 세션 provider 호출에도 명시적으로
+    포함되어야 한다 (host-curated 컨텍스트 공유)."""
+    from datetime import datetime
+    p = FakeSessionProvider()
+    client = _make_client(p)
+    store = client._store
+
+    # 호스트가 직접 큐레이션한 컨텍스트 대화
+    ctx_conv = store.create("o", "sessprov")
+    store.add_message(ctx_conv.id, Message(
+        role="user", content="bull: market is strong",
+        timestamp=datetime.now(), agent="bull"))
+
+    client.chat("decide", provider="sessprov", owner="o", alias="trader",
+                inject_context=[{"conversation_id": ctx_conv.id, "limit": 10}])
+
+    contents = [m.content for m in p.last_messages]
+    assert "bull: market is strong" in contents
+    assert "decide" in contents
+
+
+def test_session_mode_without_injection_stays_minimal():
+    """CLI 네이티브 모드(기본): 주입이 없으면 최신 user 만 전달 — 3-모드 중
+    어떤 것도 섞이지 않는다."""
+    p = FakeSessionProvider()
+    client = _make_client(p)
+
+    r1 = client.chat("first", provider="sessprov", owner="o", alias="m")
+    client.chat("second", provider="sessprov", owner="o", alias="m")
+    assert [m.content for m in p.last_messages] == ["second"]
+    assert p.last_session_id == r1.session_id

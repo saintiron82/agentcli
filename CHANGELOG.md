@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.5.1 — 2026-06-10
+
+실사용("호스트 프로그램의 에이전트 백엔드") 기준으로 핵심 격차 5건을 수정.
+
+### Added
+- **Claude 세션 resume 복구 (macOS/Linux).** `ClaudeProvider.supports_sessions`
+  가 POSIX 에서 `True`. 첫 호출은 `--session-id` 발급, 이후 같은 conversation
+  은 `-p --resume <sid>` 로 재개 (Claude Code 2.1.x 실검증 — resume 후에도
+  동일 sid 유지). Windows 는 issue #4 hang 회피를 위해 기존 stateless 유지.
+- 만료된 Claude session_id 로 resume 실패 시 ("No conversation found")
+  새 세션으로 1회 자동 복구 — invoke/invoke_async/stream_async 모두.
+- `LLMProvider.stores_history` 계약: CLI 가 히스토리를 소유하는 3-provider 는
+  비세션 모드(Windows claude)에서도 대화 내용을 messages 테이블에 저장하지
+  않고 이전 턴을 재주입하지 않는다. custom 비세션 provider 는 기본값 True.
+- 같은 conversation 동시 호출 직렬화 (in-process): sync 는 per-conversation
+  `threading.Lock`, async 는 루프별 `asyncio.Lock`. 잠금 획득 후 session_id
+  재조회로 동시 호출이 CLI 세션을 분기·덮어쓰는 문제 차단.
+- **히스토리 3-모드 명시화.** ① CLI 네이티브 세션(기본, alias resume),
+  ② 호스트 주입(`inject_context` 가 세션 provider 에도 적용 — 이전에는
+  3-provider 에서 무동작), ③ 미사용(신규 `new_session=True` 호출 단위
+  스위치). `build_session_prompt` 가 명시 주입분을 "Context" 블록으로
+  직렬화 — 무엇을 담을지는 client 의 모드 결정이 담당.
+- E2E 검증 (Claude Code 2.1.x, agentcli 경유): 세션 연속성, `new_session`
+  격리, `inject_context` 전달, 그리고 `cwd` 의 CLAUDE.md 지시 반영 /
+  Agent Skills(`.claude/skills/`) 호출 / 커스텀 서브에이전트
+  (`.claude/agents/`) 활성화 모두 동작 확인.
+
+### Fixed
+- **Copilot 스트리밍이 error 이벤트를 `event` 청크로 위장하던 문제.**
+  `error`/`assistant.error`/`session.error` 및 `result.exitCode!=0` 이 이제
+  정규화된 `error` 청크로 방출 — 호스트가 `chunk.type == "error"` 로 실패를
+  감지할 수 있다 (비스트리밍 파서와 동일 계약).
+- 배치 JSONL 파서 (claude/codex/copilot) 와 스트림 템플릿이 "유효한 JSON
+  이지만 객체가 아닌" 라인에서 `AttributeError` 를 호스트로 전파하던 문제.
+  배치는 skip, 스트림은 raw `event` 청크로 처리.
+- `run_subprocess_async` 가 호출 task 취소(`CancelledError`) 시 subprocess
+  를 정리하지 않던 누수 — streaming 쪽 issue #10 과 동일 클래스의 invoke
+  경로 문제. `try/finally` 로 모든 종료 경로에서 kill 보장.
+- Codex 위치 인자(prompt, resume session_id) 앞에 `--` 구분자 삽입 —
+  `-` 로 시작하는 untrusted 입력이 CLI 플래그로 해석되는 주입 차단.
+
 ## 0.5.0 — 2026-05-31
 
 Internal refactor — `providers/` 3-provider 중복 골격을 base 의 template

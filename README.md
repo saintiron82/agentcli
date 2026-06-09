@@ -70,10 +70,27 @@ For a fuller product boundary, see [docs/positioning.md](docs/positioning.md).
 
 **The CLI session is the single source of truth for history.** The library stores only `session_id` per provider — it does not re-inject prior turns into prompts. This is what keeps the library lightweight and tokens predictable.
 
-- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag).
+- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag). The one exception is Claude on Windows, which stays stateless — see [Provider capabilities](#provider-capabilities).
 - `Conversation.metadata["session_id:<provider>"]` is persisted; content is not.
 - `system_prompt` / `AgentProfile.instructions` are injected only when a session has not seen that instruction hash yet, or when the instruction changes; prior user/assistant turns are not.
 - Sessionless providers (e.g., plain HTTP models if added later) still work — the library serializes prior messages for them.
+
+This principle is one of four project invariants. See [Design invariants](docs/positioning.md#design-invariants) for the full set (zero runtime deps, session as source of truth, three-provider parity, paired docs).
+
+### Choosing how history is used
+
+Every call picks one of three history modes explicitly:
+
+| Mode | How |
+|---|---|
+| CLI-native session (default) | Same `owner` + `alias` resumes the provider's own session — the CLI remembers prior turns. |
+| Host-injected context | `inject_context=[{"conversation_id": ..., "limit": 10, "agent": ""}]` serializes host-curated messages into the prompt as a labeled context block. Works with session providers too. |
+| No history | `new_session=True` runs this call in a fresh CLI session (the alias then tracks the new session). Or simply use a new alias. |
+
+Because the provider CLI owns its execution environment, project-level
+`CLAUDE.md`/`AGENTS.md`, Agent Skills (`.claude/skills/`), and custom
+subagents (`.claude/agents/`) in `cwd` are picked up natively by the CLI —
+verified end-to-end against Claude Code 2.1.x.
 
 ## Storage model
 
@@ -95,7 +112,7 @@ transcripts.
 pip install agentcli
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.0"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.1"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -355,14 +372,18 @@ use: durable session handles and usage logs, not conversation history.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
-| `ClaudeProvider` | ❌ (stateless `-p`) | ✅ | Per-call UUID via `--session-id` (audit only) |
+| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
 | `CodexProvider` | ✅ | ✅ | Parsed from `thread.started.thread_id` |
 | `CopilotProvider` | ✅ | ✅ | Parsed from `result.sessionId` |
 
-`ClaudeProvider` runs `claude -p` (single-shot/stateless). `--resume` is
-incompatible with `-p`, so the library does not store or replay session
-metadata for claude (see issue #4). A fresh `--session-id` is still passed
-per call so usage rows have a stable per-call identifier.
+`ClaudeProvider` runs `claude -p` with native session resume on macOS/Linux:
+the first call mints a fresh `--session-id`, the library stores it, and later
+calls on the same conversation pass `--resume <sid>`. The resumed session keeps
+the same ID (verified against Claude Code 2.1.x). On Windows, `-p` combined
+with `--resume` can fall back to interactive input and hang (issue #4), so the
+provider stays stateless there: each call gets a fresh per-call `--session-id`
+used for usage audit only, and no conversation content is persisted by the
+library.
 
 ## Security notes
 
@@ -399,10 +420,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-230 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, and Codex/Copilot JSONL parsing.
+344 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, and Codex/Copilot JSONL parsing.
 
 ## Status
 
+- **0.5.1** — Claude native session resume on macOS/Linux (stateless only on Windows, #4), explicit history modes (`new_session`, working `inject_context`), Copilot stream error normalization, same-conversation call serialization, Codex `--` argument hardening.
 - **0.4.3** — Claude provider declared stateless: `-p` mode no longer pairs with `--resume`, fixing a 5-minute Windows hang (#4).
 - **0.4.2** — Codex bootstrap greeting filtering and one-time resume retry for greeting-only first turns.
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
@@ -415,7 +437,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.4.3 release note: [docs/releases/v0.4.3.md](docs/releases/v0.4.3.md) / [docs/releases/v0.4.3.ko.md](docs/releases/v0.4.3.ko.md)
+- v0.5.1 release note: [docs/releases/v0.5.1.md](docs/releases/v0.5.1.md) / [docs/releases/v0.5.1.ko.md](docs/releases/v0.5.1.ko.md)
 
 ## License
 
