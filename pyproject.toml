@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentcli"
+name = "agentcli-py"
 version = "0.5.1"
 description = "Lightweight session-aware Python API for Claude Code, Codex, and GitHub Copilot CLI."
 readme = "README.md"

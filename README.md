@@ -109,7 +109,7 @@ transcripts.
 
 ```bash
 # After the first PyPI release:
-pip install agentcli
+pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
 pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.1"

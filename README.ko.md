@@ -93,7 +93,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 
 ```bash
 # 첫 PyPI 릴리즈 이후:
-pip install agentcli
+pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
 pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.1"
