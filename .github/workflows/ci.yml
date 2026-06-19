@@ -1,0 +1,72 @@
+name: CI
+
+# Promotes the local `release-check` gate (pytest → build → twine check) to CI.
+# Proves the multi-version / multi-OS support claimed in README.md and
+# pyproject.toml classifiers (Python 3.11–3.14 on macOS + Linux).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev environment
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: python -m pytest
+
+  build:
+    name: build + twine check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev environment
+        run: python -m pip install -e ".[dev]"
+
+      - name: Build distributions
+        run: |
+          rm -rf dist/
+          python -m build
+
+      - name: Validate distributions
+        run: python -m twine check dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
