@@ -10,7 +10,8 @@ import logging
 import shutil
 
 from .base import LLMProvider, run_health_command
-from ..types import ERROR_BINARY_MISSING, ProviderHealth, Message, LLMResponse
+from ..types import (ERROR_BINARY_MISSING, ProviderHealth, Message, LLMResponse,
+                     StreamChunk, TokenUsage)
 from ..utils import build_env
 
 logger = logging.getLogger(__name__)
@@ -75,3 +76,29 @@ class KiroProvider(LLMProvider):
             provider=self.provider_id, ok=True, status="ok", available=True,
             binary=bin_path, version=version, auth_ok=None,
             message="kiro-cli available")
+
+
+def _map_session_update(update: dict, usage: TokenUsage) -> list[StreamChunk]:
+    """ACP session/update.update 1개를 정규화 청크로 변환 + usage 누적.
+
+    필드명은 ACP 표준 기준 (Task 0 spike 로 확정). 모르는 변형은 event 로.
+    """
+    kind = update.get("sessionUpdate", "")
+    if kind == "agent_message_chunk":
+        text = (update.get("content") or {}).get("text", "")
+        return [StreamChunk(type="text", content=text, data=update)] if text else []
+    if kind == "agent_thought_chunk":
+        text = (update.get("content") or {}).get("text", "")
+        return [StreamChunk(type="thinking", content=text, data=update)] if text else []
+    if kind == "tool_call":
+        return [StreamChunk(type="tool_use", data=update)]
+    if kind == "tool_call_update":
+        return [StreamChunk(type="tool_result", data=update)]
+    if kind == "usage_update":
+        used = int(update.get("used") or 0)
+        usage.prompt_tokens = used
+        usage.total_tokens = used + usage.completion_tokens
+        usage.prompt_tokens_reliable = False
+        usage.prompt_tokens_source = "kiro_cli_reported"
+        return []
+    return [StreamChunk(type="event", data=update)]
