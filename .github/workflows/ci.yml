@@ -7,9 +7,10 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
+  # Tag pushes (v*) are handled by release.yml, which runs its own build gate —
+  # no need to duplicate the full matrix here.
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
