@@ -73,7 +73,9 @@ jobs:
 
   github-release:
     name: GitHub Release
-    needs: build
+    # Gate on a successful PyPI publish so the GitHub Release and PyPI never
+    # diverge (no GH Release for a version that failed to upload).
+    needs: [build, pypi-publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write

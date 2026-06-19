@@ -220,6 +220,20 @@ def test_invoke_cwd_and_sandbox(mock_env, mock_run, mock_find):
     assert kwargs.get("cwd") == "/repo"
 
 
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value=None)
+def test_invoke_binary_missing(mock_find, mock_run):
+    """바이너리 미해석 시 exec 전에 binary_missing 으로 단락한다."""
+    p = CodexProvider()
+    resp = p.invoke([Message(role="user", content="hi")])
+    assert resp.content == ""
+    assert resp.error == "codex CLI not found"
+    assert resp.error_type == "binary_missing"
+    assert resp.exit_code == 127
+    # exec 자체가 호출되지 않아야 한다 (단락 검증).
+    mock_run.assert_not_called()
+
+
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run",
        side_effect=FileNotFoundError)

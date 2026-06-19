@@ -54,6 +54,32 @@ name should become the stable public install path.
    pip install agentcli
    ```
 
+## Automated release (GitHub Actions)
+
+`.github/workflows/release.yml` runs both stages on a `v*` tag push, so the
+manual commands above are the fallback path:
+
+```bash
+git tag v0.5.1
+git push origin main --tags
+```
+
+The workflow then:
+
+1. **build + verify** — installs `".[dev]"`, runs `pytest` as a gate (a failing
+   tag never ships), `python -m build`, and `twine check dist/*`.
+2. **pypi-publish** — uploads via **PyPI Trusted Publishing (OIDC)** using
+   `pypa/gh-action-pypi-publish`, *not* `twine upload`. No API token is stored;
+   `twine` is used only for the `check` in step 1.
+3. **github-release** — gated on a successful PyPI upload, creates the GitHub
+   Release from `docs/releases/<tag>.md` with the built distributions attached.
+
+One-time setup before the first tag (on PyPI → *Publishing* → add a pending
+publisher): project `agentcli-py`, owner `saintiron82`, repo `agentcli`,
+workflow `release.yml`, environment `pypi`. To use an API token instead, drop
+`permissions.id-token` + `environment` from the `pypi-publish` job and pass
+`password: ${{ secrets.PYPI_API_TOKEN }}` to the publish step.
+
 ## Current Recommendation
 
 Prefer Stage 1 first. It keeps the package installable with `pip` while avoiding
