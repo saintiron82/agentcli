@@ -52,3 +52,31 @@ async def test_handle_line_ignores_non_json_and_non_object():
     await conn.handle_line("not json at all")
     await conn.handle_line("[1, 2, 3]")   # valid JSON, not an object
     assert sent == []   # nothing emitted, no exception raised
+
+
+@pytest.mark.asyncio
+async def test_notification_routed_to_callback():
+    t = FakeTransport()
+    seen = []
+    async def on_notif(method, params):
+        seen.append((method, params))
+    conn = AcpConnection(t.write_line, on_notification=on_notif)
+    t.bind(conn)
+    await t.feed({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": "s1", "update": {"sessionUpdate": "x"}}})
+    assert seen == [("session/update",
+                     {"sessionId": "s1", "update": {"sessionUpdate": "x"}})]
+
+
+@pytest.mark.asyncio
+async def test_incoming_request_answered_with_result():
+    t = FakeTransport()
+    async def on_req(method, params):
+        assert method == "fs/read_text_file"
+        return {"content": "hello"}
+    conn = AcpConnection(t.write_line, on_request=on_req)
+    t.bind(conn)
+    await t.feed({"jsonrpc": "2.0", "id": 42, "method": "fs/read_text_file",
+                  "params": {"path": "/x"}})
+    reply = t.last_sent()
+    assert reply == {"jsonrpc": "2.0", "id": 42, "result": {"content": "hello"}}
