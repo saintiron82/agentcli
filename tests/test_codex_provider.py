@@ -90,9 +90,10 @@ def test_parse_jsonl_events_ignores_codex_initial_greeting():
 
 # ===== invoke (신규 세션) =====
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_new_session(mock_env, mock_run):
+def test_invoke_new_session(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout=(
@@ -123,9 +124,10 @@ def test_build_cmd_uses_resolved_binary_path(mock_which):
     assert cmd[0] == r"C:\Users\u\AppData\Roaming\npm\codex.CMD"
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run):
+def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout=(
@@ -146,9 +148,10 @@ def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run
     assert resp.tokens.prompt_tokens_source == "codex_cli_reported"
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, mock_run):
+def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, mock_run, mock_find):
     mock_run.side_effect = [
         MagicMock(
             returncode=0,
@@ -178,9 +181,10 @@ def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, 
     assert "tid-greeting" in second_cmd
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_resume_session(mock_env, mock_run):
+def test_invoke_resume_session(mock_env, mock_run, mock_find):
     """session_id 전달 시 `codex exec resume <sid>` 사용."""
     mock_run.return_value = MagicMock(
         returncode=0,
@@ -198,9 +202,10 @@ def test_invoke_resume_session(mock_env, mock_run):
     assert resp.session_id == "tid-existing"
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_cwd_and_sandbox(mock_env, mock_run):
+def test_invoke_cwd_and_sandbox(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
         returncode=0, stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
         stderr="")
@@ -215,19 +220,21 @@ def test_invoke_cwd_and_sandbox(mock_env, mock_run):
     assert kwargs.get("cwd") == "/repo"
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run",
        side_effect=FileNotFoundError)
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_not_found(mock_env, mock_run):
+def test_invoke_not_found(mock_env, mock_run, mock_find):
     p = CodexProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
     assert resp.error
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_uses_system_and_last_message_only(mock_env, mock_run):
+def test_invoke_uses_system_and_last_message_only(mock_env, mock_run, mock_find):
     """provider 는 client 가 담은 메시지를 충실히 직렬화한다.
 
     세션 모드에서 이전 턴 미주입은 client 가 [system?, user] 만 담는 것으로
@@ -251,9 +258,10 @@ def test_invoke_uses_system_and_last_message_only(mock_env, mock_run):
     assert "[user] 주입된 노트" in prompt
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_nonzero_returns_error(mock_env, mock_run):
+def test_invoke_nonzero_returns_error(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
         returncode=1, stdout="", stderr="HTTP 401 unauthorized")
     p = CodexProvider()
@@ -263,10 +271,11 @@ def test_invoke_nonzero_returns_error(mock_env, mock_run):
     assert resp.error_type == "auth"
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run",
        side_effect=subprocess.TimeoutExpired("cmd", 120))
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
-def test_invoke_timeout(mock_env, mock_run):
+def test_invoke_timeout(mock_env, mock_run, mock_find):
     p = CodexProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""

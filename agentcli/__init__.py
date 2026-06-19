@@ -28,9 +28,13 @@ from .store.sqlite import SQLiteStore, SQLiteSessionStore
 from .profile import AgentProfile, AgentRegistry, set_default_client
 
 try:
-    __version__ = _pkg_version("agentcli")
+    __version__ = _pkg_version("agentcli-py")
 except PackageNotFoundError:
-    __version__ = "0.4.2"
+    try:
+        # Pre-rename dist name (installed before the agentcli-py rename).
+        __version__ = _pkg_version("agentcli")
+    except PackageNotFoundError:
+        __version__ = "0.5.1"
 
 __all__ = [
     "__version__",
