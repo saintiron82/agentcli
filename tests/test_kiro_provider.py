@@ -100,3 +100,49 @@ async def test_acp_turn_new_session_streams_text_and_usage():
     done = chunks[-1]
     assert done.session_id == "kiro-sess-1"
     assert done.usage.prompt_tokens == 1200
+
+
+@pytest.mark.asyncio
+async def test_resume_calls_session_load_with_stored_id():
+    p = KiroProvider()
+    holder = {}
+
+    async def write_line(line):
+        await holder["agent"].write_line(line)
+
+    def factory(on_req, on_notif):
+        conn = AcpConnection(write_line, on_request=on_req, on_notification=on_notif)
+        holder["agent"] = ScriptedAgent(conn, updates=[
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "ok"}}], load_ok=True)
+        holder["conn"] = conn
+        return conn
+
+    chunks = [c async for c in p._acp_turn(
+        prompt="again", model="", session_id="prev-sid", cwd=None,
+        timeout=10, idle_timeout=None, wall_timeout=None, conn_factory=factory)]
+    assert chunks[-1].type == "done"
+    assert chunks[-1].session_id == "prev-sid"  # load success keeps the stored id
+
+
+@pytest.mark.asyncio
+async def test_stale_session_falls_back_to_new_once():
+    p = KiroProvider()
+    holder = {}
+
+    async def write_line(line):
+        await holder["agent"].write_line(line)
+
+    def factory(on_req, on_notif):
+        conn = AcpConnection(write_line, on_request=on_req, on_notification=on_notif)
+        holder["agent"] = ScriptedAgent(conn, updates=[
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "fresh"}}],
+            load_ok=False, new_session_id="kiro-new")
+        return conn
+
+    chunks = [c async for c in p._acp_turn(
+        prompt="again", model="", session_id="expired", cwd=None,
+        timeout=10, idle_timeout=None, wall_timeout=None, conn_factory=factory)]
+    assert chunks[-1].type == "done"
+    assert chunks[-1].session_id == "kiro-new"  # recovered via session/new
