@@ -3,7 +3,7 @@ import os
 import pytest
 from unittest.mock import patch
 from agentcli.providers.kiro import KiroProvider
-from agentcli.types import TokenUsage
+from agentcli.types import TokenUsage, StreamChunk as SC, Message
 from agentcli.providers.kiro import _map_session_update
 from agentcli.providers._acp import AcpConnection
 from tests._acp_helpers import ScriptedAgent
@@ -208,3 +208,76 @@ async def test_stale_session_falls_back_to_new_once():
         timeout=10, idle_timeout=None, wall_timeout=None, conn_factory=factory)]
     assert chunks[-1].type == "done"
     assert chunks[-1].session_id == "kiro-new"  # recovered via session/new
+
+
+# ---------------------------------------------------------------------------
+# Task 8: stream_async / invoke_async / invoke (public surface)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stream_async_yields_text_then_done():
+    p = KiroProvider()
+    async def fake_turn(self_or_ignored=None, **kwargs):
+        yield SC(type="text", content="Hi")
+        yield SC(type="done", content="", session_id="s9",
+                 usage=TokenUsage(prompt_tokens=5), data={"latency_ms": 1})
+    with patch.object(KiroProvider, "_acp_turn", new=fake_turn), \
+         patch.object(KiroProvider, "_find_binary", return_value="/usr/bin/kiro-cli"):
+        out = [c async for c in p.stream_async([Message(role="user", content="hi")])]
+    assert [c.type for c in out] == ["text", "done"]
+    assert out[-1].session_id == "s9"
+
+
+@pytest.mark.asyncio
+async def test_stream_async_binary_missing():
+    p = KiroProvider()
+    with patch.object(KiroProvider, "_find_binary", return_value=None):
+        out = [c async for c in p.stream_async([Message(role="user", content="hi")])]
+    assert out[0].type == "error"
+    assert out[0].data.get("error_type") == "binary_missing"
+
+
+@pytest.mark.asyncio
+async def test_invoke_async_folds_chunks_into_response():
+    p = KiroProvider()
+    async def fake_turn(self_or_ignored=None, **kwargs):
+        yield SC(type="text", content="A")
+        yield SC(type="text", content="B")
+        yield SC(type="done", content="", session_id="s1",
+                 usage=TokenUsage(prompt_tokens=7), data={"latency_ms": 2})
+    with patch.object(KiroProvider, "_acp_turn", new=fake_turn), \
+         patch.object(KiroProvider, "_find_binary", return_value="/usr/bin/kiro-cli"):
+        resp = await p.invoke_async([Message(role="user", content="hi")])
+    assert resp.content == "AB"
+    assert resp.session_id == "s1"
+    assert resp.tokens.prompt_tokens == 7
+    assert resp.provider == "kiro"
+
+
+# ---------------------------------------------------------------------------
+# Task 8 carry-forward B: wall_timeout in _acp_turn
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_acp_turn_wall_timeout_yields_error():
+    """A wall_timeout of nearly-zero expires before a scripted agent responds."""
+    p = KiroProvider()
+    barrier: asyncio.Event = asyncio.Event()
+
+    async def write_line(line: str) -> None:
+        # Never reply — simulates an unresponsive agent.
+        pass
+
+    def factory(on_req, on_notif):
+        from agentcli.providers._acp import AcpConnection
+        conn = AcpConnection(write_line, on_request=on_req, on_notification=on_notif)
+        return conn
+
+    chunks = [c async for c in p._acp_turn(
+        prompt="ping", model="", session_id="", cwd=None,
+        timeout=30, idle_timeout=None, wall_timeout=0.05,
+        conn_factory=factory)]
+    assert any(
+        c.type == "error" and c.data.get("timeout_kind") == "wall"
+        for c in chunks
+    ), f"Expected wall timeout error chunk, got: {chunks}"

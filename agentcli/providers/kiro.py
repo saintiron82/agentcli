@@ -7,13 +7,14 @@
 verified against kiro-cli: (Task 0 spike 에서 고정)
 """
 import asyncio
+import contextlib
 import logging
 import shutil
 import time
 from pathlib import Path
 from typing import AsyncIterator
 
-from .base import LLMProvider, run_health_command, estimate_payload_prompt_tokens as _estimate
+from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
 from ._acp import AcpConnection, AcpError
 from ..types import (ERROR_BINARY_MISSING, ProviderHealth, Message, LLMResponse,
                      StreamChunk, TokenUsage)
@@ -54,11 +55,139 @@ class KiroProvider(LLMProvider):
         self._model = model
         self._agent = agent
 
+    # ------------------------------------------------------------------
+    # Public surface: invoke / invoke_async / stream_async
+    # ------------------------------------------------------------------
+
     def invoke(self, messages: list[Message], *,
                model: str = "", timeout: int = 120,
                session_id: str = "", cwd: str | None = None) -> LLMResponse:
-        """Invoke Kiro CLI. (Task 8 implementation)"""
-        raise NotImplementedError("invoke is implemented in Task 8")
+        """Synchronous invoke — must NOT be called from inside a running event loop.
+        Use invoke_async / stream_async directly in async contexts.
+        """
+        return asyncio.run(self.invoke_async(
+            messages, model=model, timeout=timeout,
+            session_id=session_id, cwd=cwd))
+
+    async def invoke_async(self, messages: list[Message], *,
+                           model: str = "", timeout: int = 120,
+                           session_id: str = "",
+                           cwd: str | None = None) -> LLMResponse:
+        """Async invoke — consumes stream_async and folds chunks."""
+        parts: list[str] = []
+        usage = TokenUsage()
+        sid = session_id
+        err = ""
+        err_type = ""
+        latency = 0
+        async for ch in self.stream_async(
+                messages, model=model, timeout=timeout,
+                session_id=session_id, cwd=cwd):
+            if ch.session_id:
+                sid = ch.session_id
+            if ch.type == "text":
+                parts.append(ch.content)
+            elif ch.type == "error":
+                err = ch.content or "kiro stream error"
+                err_type = (ch.data or {}).get("error_type", "") or "unknown"
+            elif ch.type == "done":
+                if ch.usage is not None:
+                    usage = ch.usage
+                latency = int((ch.data or {}).get("latency_ms") or 0)
+        content = "".join(parts)
+        if not content and err:
+            return LLMResponse(
+                content="", provider=self.provider_id,
+                model=model or self._model, session_id=sid,
+                error=err, error_type=err_type,
+                exit_code=127 if "not found" in err else None)
+        return LLMResponse(
+            content=content, provider=self.provider_id,
+            model=model or self._model, tokens=usage,
+            latency_ms=latency, session_id=sid)
+
+    async def stream_async(self, messages: list[Message], *,
+                           model: str = "", timeout: int = 120,
+                           session_id: str = "", cwd: str | None = None,
+                           idle_timeout: int | None = None,
+                           wall_timeout: float | None = None) -> AsyncIterator[StreamChunk]:
+        """Public streaming interface. Yields normalized StreamChunk objects."""
+        if not self._find_binary():
+            yield StreamChunk(type="error", content="kiro-cli not found",
+                              data={"error_type": ERROR_BINARY_MISSING,
+                                    "exit_code": 127})
+            return
+        prompt = build_session_prompt(messages)
+        factory, state = self._subprocess_conn_factory(model or self._model, cwd)
+        try:
+            async for chunk in self._acp_turn(
+                    prompt=prompt, model=model or self._model,
+                    session_id=session_id, cwd=cwd, timeout=timeout,
+                    idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                    conn_factory=factory):
+                yield chunk
+        finally:
+            box = state.get("proc_box") or {}
+            rdr = box.get("reader")
+            proc = box.get("proc")
+            if rdr and not rdr.done():
+                rdr.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await rdr
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await proc.wait()
+
+    def _subprocess_conn_factory(self, model: str, cwd: str | None):
+        """Return (factory, state) for spawning a real kiro-cli acp subprocess.
+
+        factory(on_request, on_notification) -> AcpConnection
+        state["proc_box"] holds {"proc": ..., "reader": ...} after first write.
+        """
+        state: dict = {}
+
+        def factory(on_request, on_notification):
+            bin_path = self._find_binary()
+            cmd = [bin_path, "acp"]
+            if self._agent:
+                cmd += ["--agent", self._agent]
+            proc_box: dict = {}
+
+            async def ensure_proc():
+                if "proc" in proc_box:
+                    return proc_box["proc"]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd, env=build_env())
+                proc_box["proc"] = proc
+
+                async def reader():
+                    assert proc.stdout
+                    while True:
+                        line = await proc.stdout.readline()
+                        if not line:
+                            break
+                        await conn.handle_line(line.decode("utf-8", errors="replace"))
+
+                proc_box["reader"] = asyncio.create_task(reader())
+                return proc
+
+            async def write_line(line: str) -> None:
+                proc = await ensure_proc()
+                assert proc.stdin
+                proc.stdin.write((line + "\n").encode("utf-8"))
+                await proc.stdin.drain()
+
+            conn = AcpConnection(write_line, on_request=on_request,
+                                 on_notification=on_notification)
+            state["proc_box"] = proc_box
+            return conn
+
+        return factory, state
 
     def is_available(self) -> bool:
         return shutil.which("kiro-cli") is not None
@@ -140,16 +269,37 @@ class KiroProvider(LLMProvider):
                 await queue.put((_DONE, exc))
 
         start = time.time()
+        wall_deadline = start + wall_timeout if wall_timeout is not None else None
         driver = asyncio.create_task(drive())
         idle = idle_timeout if idle_timeout is not None else timeout
         try:
             while True:
+                # Compute effective timeout: min(idle, remaining wall time).
+                if wall_deadline is not None:
+                    remaining = wall_deadline - time.time()
+                    if remaining <= 0:
+                        yield StreamChunk(type="error",
+                                          content="wall timeout expired",
+                                          data={"error_type": "timeout",
+                                                "timeout_kind": "wall"})
+                        return
+                    effective = min(idle, remaining)
+                else:
+                    effective = idle
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=idle)
+                    item = await asyncio.wait_for(queue.get(), timeout=effective)
                 except asyncio.TimeoutError:
-                    yield StreamChunk(type="error",
-                                      content=f"idle timeout: {idle}s",
-                                      data={"error_type": "timeout"})
+                    # Determine whether wall or idle expired.
+                    if wall_deadline is not None and time.time() >= wall_deadline:
+                        yield StreamChunk(type="error",
+                                          content="wall timeout expired",
+                                          data={"error_type": "timeout",
+                                                "timeout_kind": "wall"})
+                    else:
+                        yield StreamChunk(type="error",
+                                          content=f"idle timeout: {idle}s",
+                                          data={"error_type": "timeout",
+                                                "timeout_kind": "idle"})
                     return
                 if isinstance(item, StreamChunk):
                     yield item
@@ -172,8 +322,11 @@ class KiroProvider(LLMProvider):
                           "stop_reason": payload})
                 return
         finally:
+            # Fix A: await driver cancellation to prevent "never retrieved" warnings.
             if not driver.done():
                 driver.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await driver
 
     async def _handle_agent_request(self, method: str, params: dict,
                                     cwd: str | None) -> dict:
