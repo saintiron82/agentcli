@@ -8,7 +8,6 @@ verified against kiro-cli: (Task 0 spike 에서 고정)
 """
 import asyncio
 import logging
-import os
 import shutil
 import time
 from pathlib import Path

@@ -167,6 +167,27 @@ async def test_fs_read_outside_cwd_denied(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fs_read_dotdot_traversal_denied(tmp_path):
+    p = KiroProvider()
+    escape = str(tmp_path) + "/../../../etc/hosts"
+    res = await p._handle_agent_request(
+        "fs/read_text_file", {"path": escape}, cwd=str(tmp_path))
+    assert res.get("content", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_fs_read_symlink_escape_denied(tmp_path):
+    target_outside = tmp_path.parent / "outside.txt"
+    target_outside.write_text("secret", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    os.symlink(target_outside, link)
+    p = KiroProvider()
+    res = await p._handle_agent_request(
+        "fs/read_text_file", {"path": str(link)}, cwd=str(tmp_path))
+    assert res.get("content", "") == ""
+
+
+@pytest.mark.asyncio
 async def test_stale_session_falls_back_to_new_once():
     p = KiroProvider()
     holder = {}
