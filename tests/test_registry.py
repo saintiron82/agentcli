@@ -59,4 +59,12 @@ def test_default_registry():
     assert "codex" in ids
     assert "copilot" in ids
     # 세션 provider 우선, Codex는 --full-auto 부담으로 후순위.
-    assert reg.get_fallback_chain() == ["claude", "copilot", "codex"]
+    assert reg.get_fallback_chain() == ["claude", "copilot", "codex", "kiro"]
+
+
+def test_default_registry_includes_kiro():
+    from agentcli.providers.registry import create_default_registry
+    reg = create_default_registry()
+    ids = [row["id"] for row in reg.list_providers()]
+    assert "kiro" in ids
+    assert reg.get("kiro") is not None

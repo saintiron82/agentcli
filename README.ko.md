@@ -172,6 +172,7 @@ resp = await client.chat_async(
 from agentcli.providers.claude import ClaudeProvider
 from agentcli.providers.codex import CodexProvider
 from agentcli.providers.copilot import CopilotProvider
+from agentcli.providers.kiro import KiroProvider
 from agentcli import ProviderRegistry
 
 registry = ProviderRegistry()
@@ -190,7 +191,26 @@ registry.register(CopilotProvider(
     disallowed_tools=["Bash"],
     add_dirs=["/tmp"],
 ))
+# KiroProvider 기본값은 trust_all=True (모든 도구 호출 자동 승인).
+# 멀티테넌트/신뢰할 수 없는 환경에서는 trust_all=False 와 trust_tools 로 좁혀야 한다.
+registry.register(KiroProvider(
+    trust_all=False,
+    trust_tools=["Read", "Grep"],
+))
 ```
+
+## Provider 기능 비교
+
+| Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
+|---|---|---|---|
+| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
+| `CodexProvider` | ✅ | ✅ | `thread.started.thread_id` 파싱 |
+| `CopilotProvider` | ✅ | ✅ | `result.sessionId` 파싱 |
+| `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` 결과의 `sessionId`; 전송 계층 = ACP JSON-RPC over stdio (`kiro-cli acp`) |
+
+`KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
+
+`ClaudeProvider`는 macOS/Linux에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). Windows에서는 `-p`와 `--resume` 조합이 인터랙티브 입력 대기로 빠질 수 있어(issue #4) 무상태로 동작합니다.
 
 ## 테스트
 

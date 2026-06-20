@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **KiroProvider** — 네 번째 provider. `kiro-cli acp`(ACP, JSON-RPC 2.0 over
+  stdio)를 호출당 one-shot turn 으로 감싸 세션 연속성·타입드 스트리밍·토큰
+  통계를 제공. 외부 LLMProvider 계약·청크 타입은 기존 3종과 동일. 제로 의존성.
+
 ## 0.5.1 — 2026-06-10
 
 실사용("호스트 프로그램의 에이전트 백엔드") 기준으로 핵심 격차 5건을 수정.

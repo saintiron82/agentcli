@@ -375,6 +375,9 @@ use: durable session handles and usage logs, not conversation history.
 | `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
 | `CodexProvider` | ✅ | ✅ | Parsed from `thread.started.thread_id` |
 | `CopilotProvider` | ✅ | ✅ | Parsed from `result.sessionId` |
+| `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` result `sessionId`; transport = ACP JSON-RPC over stdio (`kiro-cli acp`) |
+
+`KiroProvider` drives `kiro-cli acp` (line-delimited JSON-RPC 2.0) as one-shot turns per call: `initialize` → first turn `session/new` / resume `session/load(stored sessionId)` → `session/prompt` → `session/update` stream. Token usage comes from `usage_update` notifications; permissions are auto-answered via `session/request_permission` (`trust_all`/`trust_tools`). Authentication uses `KIRO_API_KEY` (or `kiro-cli login`).
 
 `ClaudeProvider` runs `claude -p` with native session resume on macOS/Linux:
 the first call mints a fresh `--session-id`, the library stores it, and later
@@ -393,6 +396,7 @@ Each provider exposes its permission flags. **Defaults are permissive for dev co
 from agentcli.providers.claude import ClaudeProvider
 from agentcli.providers.codex import CodexProvider
 from agentcli.providers.copilot import CopilotProvider
+from agentcli.providers.kiro import KiroProvider
 from agentcli import ProviderRegistry
 
 registry = ProviderRegistry()
@@ -410,6 +414,12 @@ registry.register(CopilotProvider(
     allowed_tools=["Read", "Grep"],
     disallowed_tools=["Bash"],
     add_dirs=["/tmp"],
+))
+# KiroProvider defaults to trust_all=True (auto-approves every tool call).
+# In multi-tenant or untrusted contexts, set trust_all=False with explicit trust_tools.
+registry.register(KiroProvider(
+    trust_all=False,
+    trust_tools=["Read", "Grep"],
 ))
 ```
 
