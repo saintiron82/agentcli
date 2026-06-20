@@ -8,8 +8,10 @@ verified against kiro-cli: (Task 0 spike 에서 고정)
 """
 import asyncio
 import logging
+import os
 import shutil
 import time
+from pathlib import Path
 from typing import AsyncIterator
 
 from .base import LLMProvider, run_health_command, estimate_payload_prompt_tokens as _estimate
@@ -176,10 +178,59 @@ class KiroProvider(LLMProvider):
 
     async def _handle_agent_request(self, method: str, params: dict,
                                     cwd: str | None) -> dict:
-        """agent→client 역요청 핸들러 스텁. 실제 구현은 Task 7.
+        """agent→client 역콜백 핸들러."""
+        if method == "session/request_permission":
+            return self._decide_permission(params)
+        if method == "fs/read_text_file":
+            return self._fs_read(params, cwd)
+        if method == "fs/write_text_file":
+            return self._fs_write(params, cwd)
+        # terminal/* 등 미지원 역요청은 빈 result (Task 0 spike 로 필요성 확인).
+        return {}
 
-        현재는 모든 역요청에 빈 result 를 반환해 프로토콜을 통과시킨다.
-        """
+    def _decide_permission(self, params: dict) -> dict:
+        options = params.get("options") or []
+        tool_title = (params.get("toolCall") or {}).get("title", "")
+        allowed = self._trust_all or (tool_title in self._trust_tools)
+        if allowed:
+            for opt in options:
+                if str(opt.get("kind", "")).startswith("allow") or \
+                   opt.get("optionId") == "allow":
+                    return {"outcome": {"outcome": "selected",
+                                        "optionId": opt.get("optionId")}}
+        return {"outcome": {"outcome": "cancelled"}}
+
+    def _within_cwd(self, path: str, cwd: str | None) -> Path | None:
+        if not cwd:
+            return None
+        try:
+            root = Path(cwd).resolve()
+            target = Path(path).resolve()
+            target.relative_to(root)  # cwd 밖이면 ValueError
+            return target
+        except (ValueError, OSError):
+            return None
+
+    def _fs_read(self, params: dict, cwd: str | None) -> dict:
+        target = self._within_cwd(params.get("path", ""), cwd)
+        if target is None or not target.is_file():
+            logger.warning("kiro fs/read 거부: %s", params.get("path"))
+            return {"content": ""}
+        try:
+            return {"content": target.read_text(encoding="utf-8", errors="replace")}
+        except OSError:
+            return {"content": ""}
+
+    def _fs_write(self, params: dict, cwd: str | None) -> dict:
+        target = self._within_cwd(params.get("path", ""), cwd)
+        if target is None:
+            logger.warning("kiro fs/write 거부: %s", params.get("path"))
+            return {}
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(params.get("content", ""), encoding="utf-8")
+        except OSError:
+            pass
         return {}
 
 

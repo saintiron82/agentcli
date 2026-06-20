@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pytest
 from unittest.mock import patch
 from agentcli.providers.kiro import KiroProvider
@@ -123,6 +124,46 @@ async def test_resume_calls_session_load_with_stored_id():
         timeout=10, idle_timeout=None, wall_timeout=None, conn_factory=factory)]
     assert chunks[-1].type == "done"
     assert chunks[-1].session_id == "prev-sid"  # load success keeps the stored id
+
+
+@pytest.mark.asyncio
+async def test_permission_trust_all_selects_allow_option():
+    p = KiroProvider(trust_all=True)
+    res = await p._handle_agent_request("session/request_permission", {
+        "options": [
+            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "reject", "name": "Reject", "kind": "reject_once"}],
+        "toolCall": {"title": "read"}}, cwd=None)
+    assert res["outcome"]["outcome"] == "selected"
+    assert res["outcome"]["optionId"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_permission_denied_when_not_trusted():
+    p = KiroProvider(trust_all=False, trust_tools=["grep"])
+    res = await p._handle_agent_request("session/request_permission", {
+        "options": [{"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"}],
+        "toolCall": {"title": "bash"}}, cwd=None)
+    assert res["outcome"]["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_fs_read_within_cwd(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("data", encoding="utf-8")
+    p = KiroProvider()
+    res = await p._handle_agent_request(
+        "fs/read_text_file", {"path": str(f)}, cwd=str(tmp_path))
+    assert res["content"] == "data"
+
+
+@pytest.mark.asyncio
+async def test_fs_read_outside_cwd_denied(tmp_path):
+    p = KiroProvider()
+    res = await p._handle_agent_request(
+        "fs/read_text_file", {"path": "/etc/hosts"}, cwd=str(tmp_path))
+    assert res.get("content", "") == ""
 
 
 @pytest.mark.asyncio
