@@ -42,7 +42,10 @@ class AcpConnection:
         except BaseException:
             self._pending.pop(rid, None)
             raise
-        return await fut
+        try:
+            return await fut
+        finally:
+            self._pending.pop(rid, None)
 
     async def handle_line(self, line: str) -> None:
         line = line.strip()

@@ -17,7 +17,7 @@ from typing import AsyncIterator
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
 from ._acp import AcpConnection, AcpError
 from ..types import (ERROR_BINARY_MISSING, ProviderHealth, Message, LLMResponse,
-                     StreamChunk, TokenUsage)
+                     StreamChunk, TokenUsage, classify_error)
 from ..utils import build_env
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class KiroProvider(LLMProvider):
                 parts.append(ch.content)
             elif ch.type == "error":
                 err = ch.content or "kiro stream error"
-                err_type = (ch.data or {}).get("error_type", "") or "unknown"
+                err_type = (ch.data or {}).get("error_type", "")
             elif ch.type == "done":
                 if ch.usage is not None:
                     usage = ch.usage
@@ -217,7 +217,7 @@ class KiroProvider(LLMProvider):
 
     async def _acp_turn(self, *, prompt: str, model: str, session_id: str,
                         cwd: str | None, timeout: int,
-                        idle_timeout: int | None, wall_timeout: int | None,
+                        idle_timeout: float | None, wall_timeout: float | None,
                         conn_factory) -> AsyncIterator[StreamChunk]:
         """한 turn 을 구동하며 정규화 청크를 yield.
 
@@ -308,11 +308,11 @@ class KiroProvider(LLMProvider):
                 _, payload = item
                 if isinstance(payload, AcpError):
                     yield StreamChunk(type="error", content=payload.message,
-                                      data={"error_type": "unknown"})
+                                      data={"error_type": classify_error(payload.message)})
                     return
                 if isinstance(payload, Exception):
                     yield StreamChunk(type="error", content=str(payload),
-                                      data={"error_type": "unknown"})
+                                      data={"error_type": classify_error(str(payload))})
                     return
                 yield StreamChunk(
                     type="done", content="",
