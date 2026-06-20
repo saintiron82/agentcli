@@ -4,7 +4,7 @@
   initialize → session/new|load → session/prompt → session/update 소비 → stopReason.
 세션이 히스토리를 소유하므로 라이브러리는 session_id 만 관리한다.
 
-verified against kiro-cli: (Task 0 spike 에서 고정)
+ACP 필드명은 ACP 표준 스펙(https://agentclientprotocol.com) 기준 — 실 kiro-cli 대상 미검증.
 """
 import asyncio
 import contextlib
@@ -27,7 +27,7 @@ _PROTOCOL_VERSION = 1
 _DONE = object()  # 큐 종료 센티넬
 
 # 모델 selector 는 resolve_model(비-strict) 로 그대로 통과시킨다.
-# 알려진 id 는 Task 0 spike / `kiro-cli chat --list-models` 로 확장 가능.
+# 알려진 id 는 kiro-cli 가 노출하면 확장 가능.
 KIRO_MODELS = [
     {"id": "", "name": "기본", "aliases": ["default"]},
 ]
@@ -45,7 +45,9 @@ class KiroProvider(LLMProvider):
         """
         Args:
             trust_all: session/request_permission 을 전부 자동 승인 (dev 기본).
-                multi-tenant/untrusted 임베딩 시 False + trust_tools 로 좁힐 것.
+                **WARNING**: 기본값 True 는 모든 도구 호출을 자동 승인한다.
+                multi-tenant/untrusted 임베딩 시 False + trust_tools 로 명시 허용 도구만
+                좁혀야 한다.
             trust_tools: trust_all=False 일 때 자동 승인할 도구 이름 목록.
             model: 기본 모델 selector (호출 인자가 우선).
             agent: kiro agent 이름 (선택).
@@ -222,7 +224,7 @@ class KiroProvider(LLMProvider):
         """한 turn 을 구동하며 정규화 청크를 yield.
 
         conn_factory(on_request, on_notification) -> AcpConnection 으로 transport 주입.
-        실제 subprocess 연결은 Task 8에서 구현; 테스트에서는 ScriptedAgent-기반 팩토리를 주입.
+        프로덕션 경로는 _subprocess_conn_factory 가 transport 를 주입하고, 테스트는 가짜 팩토리를 주입한다.
         """
         queue: asyncio.Queue = asyncio.Queue()
         usage = TokenUsage(payload_prompt_tokens=_estimate(prompt),
@@ -253,7 +255,7 @@ class KiroProvider(LLMProvider):
                         await conn.request("session/load",
                                            {"sessionId": session_id, "cwd": cwd or "."})
                     except AcpError:
-                        # 잔여(stale) 세션 → 새 세션으로 1회 복구 (Task 6 에서 테스트).
+                        # 잔여(stale) 세션 → 새 세션으로 1회 복구.
                         state["session_id"] = (await conn.request(
                             "session/new", {"cwd": cwd or "."}))["sessionId"]
                 else:
@@ -272,6 +274,7 @@ class KiroProvider(LLMProvider):
         wall_deadline = start + wall_timeout if wall_timeout is not None else None
         driver = asyncio.create_task(drive())
         idle = idle_timeout if idle_timeout is not None else timeout
+        text_parts: list[str] = []
         try:
             while True:
                 # Compute effective timeout: min(idle, remaining wall time).
@@ -302,6 +305,8 @@ class KiroProvider(LLMProvider):
                                                 "timeout_kind": "idle"})
                     return
                 if isinstance(item, StreamChunk):
+                    if item.type == "text":
+                        text_parts.append(item.content)
                     yield item
                     continue
                 # (_DONE, payload) 센티넬
@@ -315,7 +320,7 @@ class KiroProvider(LLMProvider):
                                       data={"error_type": classify_error(str(payload))})
                     return
                 yield StreamChunk(
-                    type="done", content="",
+                    type="done", content="".join(text_parts),
                     session_id=state["session_id"], usage=usage,
                     data={"provider": self.provider_id, "model": model,
                           "latency_ms": int((time.time() - start) * 1000),
@@ -337,7 +342,7 @@ class KiroProvider(LLMProvider):
             return self._fs_read(params, cwd)
         if method == "fs/write_text_file":
             return self._fs_write(params, cwd)
-        # terminal/* 등 미지원 역요청은 빈 result (Task 0 spike 로 필요성 확인).
+        # terminal/* 등 미지원 역요청은 빈 result.
         return {}
 
     def _decide_permission(self, params: dict) -> dict:
@@ -345,9 +350,16 @@ class KiroProvider(LLMProvider):
         tool_title = (params.get("toolCall") or {}).get("title", "")
         allowed = self._trust_all or (tool_title in self._trust_tools)
         if allowed:
+            # Prefer an explicitly "allow"-named option first.
             for opt in options:
                 if str(opt.get("kind", "")).startswith("allow") or \
                    opt.get("optionId") == "allow":
+                    return {"outcome": {"outcome": "selected",
+                                        "optionId": opt.get("optionId")}}
+            # Fall back to the first non-reject option if no allow-named one exists.
+            for opt in options:
+                if not str(opt.get("kind", "")).startswith("reject") and \
+                   opt.get("optionId") != "reject":
                     return {"outcome": {"outcome": "selected",
                                         "optionId": opt.get("optionId")}}
         return {"outcome": {"outcome": "cancelled"}}
@@ -389,7 +401,7 @@ class KiroProvider(LLMProvider):
 def _map_session_update(update: dict, usage: TokenUsage) -> list[StreamChunk]:
     """ACP session/update.update 1개를 정규화 청크로 변환 + usage 누적.
 
-    필드명은 ACP 표준 기준 (Task 0 spike 로 확정). 모르는 변형은 event 로.
+    필드명은 ACP 표준 기준 (실 kiro-cli 미검증). 모르는 변형은 event 로.
     """
     kind = update.get("sessionUpdate", "")
     if kind == "agent_message_chunk":

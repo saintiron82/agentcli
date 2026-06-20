@@ -369,3 +369,120 @@ async def test_invoke_async_error_type_classified_as_usage_limit():
     assert resp.error_type == ERROR_USAGE_LIMIT, (
         f"Expected error_type={ERROR_USAGE_LIMIT!r}, got {resp.error_type!r}")
     assert resp.recoverable is True, "usage_limit errors must be recoverable"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: done chunk carries accumulated text
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_acp_turn_done_chunk_carries_accumulated_text():
+    """done chunk content must equal the joined text from all text chunks."""
+    p = KiroProvider()
+    updates = [
+        {"sessionUpdate": "agent_message_chunk",
+         "content": {"type": "text", "text": "Hel"}},
+        {"sessionUpdate": "agent_message_chunk",
+         "content": {"type": "text", "text": "lo"}},
+    ]
+
+    async def _placeholder_write(line: str) -> None:  # pragma: no cover
+        pass
+
+    def conn_factory(on_req, on_notif):
+        conn = AcpConnection(_placeholder_write, on_request=on_req,
+                             on_notification=on_notif)
+        agent = ScriptedAgent(conn, updates=updates)
+        conn._write_line = agent.write_line
+        return conn
+
+    chunks = []
+    async for ch in p._acp_turn(
+            prompt="hi", model="", session_id="", cwd=None,
+            timeout=10, idle_timeout=None, wall_timeout=None,
+            conn_factory=conn_factory):
+        chunks.append(ch)
+
+    done = chunks[-1]
+    assert done.type == "done"
+    assert done.content == "Hello", (
+        f"done.content should be 'Hello', got {done.content!r}")
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: _decide_permission must honor trust_all even without "allow"-named option
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_permission_trust_all_selects_non_allow_named_option():
+    """trust_all=True must select the first non-reject option even if no option
+    has kind starting with 'allow' or optionId == 'allow'."""
+    p = KiroProvider(trust_all=True)
+    res = await p._handle_agent_request("session/request_permission", {
+        "options": [
+            {"optionId": "proceed", "kind": "approve"},
+            {"optionId": "no", "kind": "reject_once"}],
+        "toolCall": {"title": "bash"}}, cwd=None)
+    assert res["outcome"]["outcome"] == "selected", (
+        f"Expected 'selected', got {res['outcome']['outcome']!r}")
+    assert res["outcome"]["optionId"] == "proceed", (
+        f"Expected optionId 'proceed', got {res['outcome']['optionId']!r}")
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: fs/write tests and idle timeout test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fs_write_within_cwd(tmp_path):
+    """fs/write_text_file within cwd creates the file with correct content."""
+    p = KiroProvider()
+    out_path = str(tmp_path / "out.txt")
+    res = await p._handle_agent_request(
+        "fs/write_text_file", {"path": out_path, "content": "hi"},
+        cwd=str(tmp_path))
+    assert res == {}
+    written = tmp_path / "out.txt"
+    assert written.exists(), "File should have been created"
+    assert written.read_text(encoding="utf-8") == "hi"
+
+
+@pytest.mark.asyncio
+async def test_fs_write_outside_cwd_denied(tmp_path):
+    """fs/write_text_file outside cwd must be denied — no file created."""
+    p = KiroProvider()
+    evil_path = str(tmp_path.parent / "evil.txt")
+    await p._handle_agent_request(
+        "fs/write_text_file", {"path": evil_path, "content": "bad"},
+        cwd=str(tmp_path))
+    import pathlib
+    assert not pathlib.Path(evil_path).exists(), (
+        "File outside cwd must NOT be created")
+
+
+@pytest.mark.asyncio
+async def test_acp_turn_idle_timeout_yields_error():
+    """idle_timeout that expires before any reply must yield an error chunk
+    with error_type='timeout' and timeout_kind='idle'."""
+    p = KiroProvider()
+
+    async def write_line(line: str) -> None:
+        # Never replies — simulates a permanently silent agent.
+        pass
+
+    def factory(on_req, on_notif):
+        conn = AcpConnection(write_line, on_request=on_req, on_notification=on_notif)
+        return conn
+
+    chunks = [c async for c in p._acp_turn(
+        prompt="ping", model="", session_id="", cwd=None,
+        timeout=0.05, idle_timeout=0.05, wall_timeout=None,
+        conn_factory=factory)]
+
+    error_chunks = [c for c in chunks if c.type == "error"]
+    assert error_chunks, f"Expected at least one error chunk, got: {chunks}"
+    err = error_chunks[0]
+    assert err.data.get("error_type") == "timeout", (
+        f"error_type should be 'timeout', got {err.data.get('error_type')!r}")
+    assert err.data.get("timeout_kind") == "idle", (
+        f"timeout_kind should be 'idle', got {err.data.get('timeout_kind')!r}")

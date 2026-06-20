@@ -172,6 +172,7 @@ resp = await client.chat_async(
 from agentcli.providers.claude import ClaudeProvider
 from agentcli.providers.codex import CodexProvider
 from agentcli.providers.copilot import CopilotProvider
+from agentcli.providers.kiro import KiroProvider
 from agentcli import ProviderRegistry
 
 registry = ProviderRegistry()
@@ -189,6 +190,12 @@ registry.register(CopilotProvider(
     allowed_tools=["Read", "Grep"],
     disallowed_tools=["Bash"],
     add_dirs=["/tmp"],
+))
+# KiroProvider 기본값은 trust_all=True (모든 도구 호출 자동 승인).
+# 멀티테넌트/신뢰할 수 없는 환경에서는 trust_all=False 와 trust_tools 로 좁혀야 한다.
+registry.register(KiroProvider(
+    trust_all=False,
+    trust_tools=["Read", "Grep"],
 ))
 ```
 
