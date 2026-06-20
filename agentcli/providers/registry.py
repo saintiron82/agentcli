@@ -49,12 +49,13 @@ def create_default_registry() -> ProviderRegistry:
     from .claude import ClaudeProvider
     from .codex import CodexProvider
     from .copilot import CopilotProvider
+    from .kiro import KiroProvider
 
     reg = ProviderRegistry()
     reg.register(ClaudeProvider())
     reg.register(CodexProvider())
     reg.register(CopilotProvider())
-    # 세션 지원 provider를 우선 — 히스토리를 재주입 없이 CLI가 관리.
-    # Codex --full-auto는 쓰기 권한 + 긴 응답으로 가장 비싸므로 후순위.
-    reg.set_fallback_order(["claude", "copilot", "codex"])
+    reg.register(KiroProvider())
+    # 세션 지원 provider 우선. Codex --full-auto 는 가장 비싸 후순위.
+    reg.set_fallback_order(["claude", "copilot", "codex", "kiro"])
     return reg
