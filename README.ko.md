@@ -199,6 +199,47 @@ registry.register(KiroProvider(
 ))
 ```
 
+### 호출 시점 provider 옵션 (MCP & 권한)
+
+위 생성자 플래그는 provider 인스턴스 단위로 고정된다. 도구/권한/MCP 서버를
+**호출마다** 바꾸려면 — 예: *같은* 대화를 읽기 전용에서 행위로 전환 —
+`chat`/`chat_async`/`chat_stream` 에 `provider_options` 를 넘긴다. 각 키는 그
+키를 받는 provider 에게만 전달되므로, 다른 provider 로 fallback 돼도 무관한
+옵션은 안전하게 무시된다.
+
+```python
+# 읽기 턴: plan 권한, 외부 도구 없음.
+client.chat("열린 이슈를 요약해줘.", provider="claude",
+            owner="team", alias="triager",
+            provider_options={"permission_mode": "plan"})
+
+# 같은 세션에서 행위 턴: 외부 MCP 서버를 붙이고 쓰기 도구를 허용. 대화는
+# 이어지고 권한/도구만 바뀐다.
+client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="claude",
+            owner="team", alias="triager",
+            provider_options={
+                "permission_mode": "acceptEdits",
+                "mcp_config": {"pair": {                # ClaudeProvider 가
+                    "type": "http",                     # {"mcpServers": ...} 로 감쌈
+                    "url": "https://pair.example/mcp",
+                    "headers": {"Authorization": "Bearer <token>"}}},
+                "strict_mcp_config": True,              # 주변 MCP 설정 무시
+                "allowed_tools": ["mcp__pair__add_comment"]})
+```
+
+지원하는 `provider_options` 키:
+
+- **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
+  문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
+  `disallowed_tools`.
+- **codex** — `sandbox_mode`, `approval_policy`. codex 는 MCP 미지원 — 쓰기
+  권한이 필요한 행위 턴은 `provider_options={"sandbox_mode": "workspace-write"}`
+  를 `new_session=True` 와 함께 쓴다(resume 는 원 세션 sandbox 를 유지하고
+  `-s` 를 무시).
+
+`cwd` 안의 파일만 편집한다면 `mcp_config` 는 필요 없다 — 생성자
+`permission_mode`/`allowed_tools`(또는 이 호출 시점 오버라이드)로 충분하다.
+
 ## Provider 기능 비교
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
