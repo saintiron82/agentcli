@@ -6,15 +6,23 @@
 
 verified against kiro-cli: (Task 0 spike 에서 고정)
 """
+import asyncio
 import logging
 import shutil
+import time
+from typing import AsyncIterator
 
-from .base import LLMProvider, run_health_command
+from .base import LLMProvider, run_health_command, estimate_payload_prompt_tokens as _estimate
+from ._acp import AcpConnection, AcpError
 from ..types import (ERROR_BINARY_MISSING, ProviderHealth, Message, LLMResponse,
                      StreamChunk, TokenUsage)
 from ..utils import build_env
 
 logger = logging.getLogger(__name__)
+
+# ACP protocol constants
+_PROTOCOL_VERSION = 1
+_DONE = object()  # 큐 종료 센티넬
 
 # 모델 selector 는 resolve_model(비-strict) 로 그대로 통과시킨다.
 # 알려진 id 는 Task 0 spike / `kiro-cli chat --list-models` 로 확장 가능.
@@ -76,6 +84,103 @@ class KiroProvider(LLMProvider):
             provider=self.provider_id, ok=True, status="ok", available=True,
             binary=bin_path, version=version, auth_ok=None,
             message="kiro-cli available")
+
+    async def _acp_turn(self, *, prompt: str, model: str, session_id: str,
+                        cwd: str | None, timeout: int,
+                        idle_timeout: int | None, wall_timeout: int | None,
+                        conn_factory) -> AsyncIterator[StreamChunk]:
+        """한 turn 을 구동하며 정규화 청크를 yield.
+
+        conn_factory(on_request, on_notification) -> AcpConnection 으로 transport 주입.
+        실제 subprocess 연결은 Task 8에서 구현; 테스트에서는 ScriptedAgent-기반 팩토리를 주입.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        usage = TokenUsage(payload_prompt_tokens=_estimate(prompt),
+                           prompt_tokens_reliable=False,
+                           prompt_tokens_source="kiro_cli_reported")
+        state = {"session_id": session_id}
+
+        async def on_notification(method: str, params: dict) -> None:
+            if method == "session/update":
+                for ch in _map_session_update(params.get("update") or {}, usage):
+                    await queue.put(ch)
+
+        async def on_request(method: str, params: dict) -> dict:
+            return await self._handle_agent_request(method, params, cwd)
+
+        conn = conn_factory(on_request, on_notification)
+
+        async def drive() -> None:
+            try:
+                await conn.request("initialize", {
+                    "protocolVersion": _PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": True, "writeTextFile": True},
+                        "terminal": False},
+                    "clientInfo": {"name": "agentcli", "version": "0"}})
+                if session_id:
+                    try:
+                        await conn.request("session/load",
+                                           {"sessionId": session_id, "cwd": cwd or "."})
+                    except AcpError:
+                        # 잔여(stale) 세션 → 새 세션으로 1회 복구 (Task 6 에서 테스트).
+                        state["session_id"] = (await conn.request(
+                            "session/new", {"cwd": cwd or "."}))["sessionId"]
+                else:
+                    state["session_id"] = (await conn.request(
+                        "session/new", {"cwd": cwd or "."}))["sessionId"]
+                res = await conn.request("session/prompt", {
+                    "sessionId": state["session_id"],
+                    "prompt": [{"type": "text", "text": prompt}]})
+                await queue.put((_DONE, res.get("stopReason", "")))
+            except AcpError as exc:
+                await queue.put((_DONE, exc))
+            except Exception as exc:  # noqa: BLE001
+                await queue.put((_DONE, exc))
+
+        start = time.time()
+        driver = asyncio.create_task(drive())
+        idle = idle_timeout if idle_timeout is not None else timeout
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=idle)
+                except asyncio.TimeoutError:
+                    yield StreamChunk(type="error",
+                                      content=f"idle timeout: {idle}s",
+                                      data={"error_type": "timeout"})
+                    return
+                if isinstance(item, StreamChunk):
+                    yield item
+                    continue
+                # (_DONE, payload) 센티넬
+                _, payload = item
+                if isinstance(payload, AcpError):
+                    yield StreamChunk(type="error", content=payload.message,
+                                      data={"error_type": "unknown"})
+                    return
+                if isinstance(payload, Exception):
+                    yield StreamChunk(type="error", content=str(payload),
+                                      data={"error_type": "unknown"})
+                    return
+                yield StreamChunk(
+                    type="done", content="",
+                    session_id=state["session_id"], usage=usage,
+                    data={"provider": self.provider_id, "model": model,
+                          "latency_ms": int((time.time() - start) * 1000),
+                          "stop_reason": payload})
+                return
+        finally:
+            if not driver.done():
+                driver.cancel()
+
+    async def _handle_agent_request(self, method: str, params: dict,
+                                    cwd: str | None) -> dict:
+        """agent→client 역요청 핸들러 스텁. 실제 구현은 Task 7.
+
+        현재는 모든 역요청에 빈 result 를 반환해 프로토콜을 통과시킨다.
+        """
+        return {}
 
 
 def _map_session_update(update: dict, usage: TokenUsage) -> list[StreamChunk]:

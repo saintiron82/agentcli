@@ -1,7 +1,11 @@
+import asyncio
+import pytest
 from unittest.mock import patch
 from agentcli.providers.kiro import KiroProvider
 from agentcli.types import TokenUsage
 from agentcli.providers.kiro import _map_session_update
+from agentcli.providers._acp import AcpConnection
+from tests._acp_helpers import ScriptedAgent
 
 
 def test_provider_id_and_capabilities():
@@ -57,3 +61,42 @@ def test_map_usage_update_accumulates_and_emits_nothing():
     assert u.prompt_tokens == 1500
     assert u.prompt_tokens_source == "kiro_cli_reported"
     assert u.prompt_tokens_reliable is False
+
+
+@pytest.mark.asyncio
+async def test_acp_turn_new_session_streams_text_and_usage():
+    p = KiroProvider()
+    updates = [
+        {"sessionUpdate": "agent_message_chunk",
+         "content": {"type": "text", "text": "Hel"}},
+        {"sessionUpdate": "agent_message_chunk",
+         "content": {"type": "text", "text": "lo"}},
+        {"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
+    ]
+
+    def conn_factory(on_req, on_notif):
+        conn = AcpConnection(_placeholder_write, on_request=on_req,
+                             on_notification=on_notif)
+        agent = ScriptedAgent(conn, updates=updates)
+        # Replace the connection's write_line with the agent's write_line
+        conn._write_line = agent.write_line
+        return conn
+
+    # Placeholder; replaced above before any I/O occurs
+    async def _placeholder_write(line: str) -> None:  # pragma: no cover
+        pass
+
+    chunks = []
+    async for ch in p._acp_turn(
+            prompt="hi", model="", session_id="", cwd=None,
+            timeout=10, idle_timeout=None, wall_timeout=None,
+            conn_factory=conn_factory):
+        chunks.append(ch)
+
+    types = [c.type for c in chunks]
+    assert "text" in types and types[-1] == "done"
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text == "Hello"
+    done = chunks[-1]
+    assert done.session_id == "kiro-sess-1"
+    assert done.usage.prompt_tokens == 1200
