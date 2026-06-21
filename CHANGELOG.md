@@ -6,6 +6,15 @@
 - **KiroProvider** — 네 번째 provider. `kiro-cli acp`(ACP, JSON-RPC 2.0 over
   stdio)를 호출당 one-shot turn 으로 감싸 세션 연속성·타입드 스트리밍·토큰
   통계를 제공. 외부 LLMProvider 계약·청크 타입은 기존 3종과 동일. 제로 의존성.
+- **호출 시점 `provider_options` — MCP & 권한 오버라이드 (#154).**
+  `LLMClient.chat`/`chat_async`/`chat_stream` 에 `provider_options` 인자 추가:
+  도구/권한/MCP 설정을 호출마다 오버라이드한다(키는 그 키를 받는 provider 에만
+  전달 → fallback 안전). `ClaudeProvider` 가 `--mcp-config`
+  (+`--strict-mcp-config`)를 방출해 임베드된 claude 가 외부 MCP 서버(예: Pair)에
+  닿을 수 있고, `permission_mode`/`allowed_tools` 를 호출 시점에 바꿔 같은
+  세션에서 읽기↔행위를 오간다. `CodexProvider` 는 `sandbox_mode`/`approval_policy`
+  오버라이드(행위 턴은 `new_session=True` 와 병행 — resume 는 `-s` 무시). 실제
+  claude CLI 로 `--mcp-config` 포맷 수용 확인.
 
 ## 0.5.1 — 2026-06-10
 

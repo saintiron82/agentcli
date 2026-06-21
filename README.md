@@ -423,6 +423,48 @@ registry.register(KiroProvider(
 ))
 ```
 
+### Call-time provider options (MCP & permissions)
+
+The constructor flags above are fixed per provider instance. To switch tools /
+permissions / MCP servers **per call** — e.g. flip the *same* conversation from
+read-only to acting — pass `provider_options` to `chat` / `chat_async` /
+`chat_stream`. Each key is forwarded only to providers whose call accepts it, so
+one provider's options are harmlessly ignored on fallback to another.
+
+```python
+# Read turn: planning permission, no external tools.
+client.chat("Summarize the open issues.", provider="claude",
+            owner="team", alias="triager",
+            provider_options={"permission_mode": "plan"})
+
+# Act turn on the SAME session: attach an external MCP server and allow its
+# write tools. The conversation continues; only permissions/tools change.
+client.chat("Comment 'investigating' on issue #154.", provider="claude",
+            owner="team", alias="triager",
+            provider_options={
+                "permission_mode": "acceptEdits",
+                "mcp_config": {"pair": {                # ClaudeProvider wraps this
+                    "type": "http",                     # under {"mcpServers": ...}
+                    "url": "https://pair.example/mcp",
+                    "headers": {"Authorization": "Bearer <token>"}}},
+                "strict_mcp_config": True,              # ignore ambient MCP config
+                "allowed_tools": ["mcp__pair__add_comment"]})
+```
+
+Supported `provider_options` keys:
+
+- **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
+  path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
+  `disallowed_tools`.
+- **codex** — `sandbox_mode`, `approval_policy`. Codex has no MCP; for an act
+  turn that needs write access, pair `provider_options={"sandbox_mode":
+  "workspace-write"}` with `new_session=True` (resume reuses the original
+  session's sandbox and ignores `-s`).
+
+If you only edit files in `cwd`, you don't need `mcp_config` at all — the
+`permission_mode` / `allowed_tools` constructor flags (or these per-call
+overrides) are enough.
+
 ## Testing
 
 ```bash

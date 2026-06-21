@@ -111,37 +111,51 @@ def _supported_kwargs(provider_obj, method_name: str, kwargs: dict) -> dict:
     }
 
 
+def _merge_options(base: dict, provider_options: dict | None) -> dict:
+    """provider_options(호출 시점 옵션)를 base kwargs 에 병합 — provider_options 우선.
+
+    실제로 provider 의 메서드가 받는 키만 호출 직전 ``_supported_kwargs`` 가
+    걸러내므로, 한 provider 전용 옵션(예: claude mcp_config)을 다른 provider
+    로 fallback 해도 안전하게 무시된다 (#154)."""
+    if provider_options:
+        base.update(provider_options)
+    return base
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
-                       session_id, cwd, alias, resume_by_alias=True):
-    kwargs = _supported_kwargs(provider_obj, "invoke", {
+                       session_id, cwd, alias, resume_by_alias=True,
+                       provider_options=None):
+    kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
         "alias": alias,
         "resume_by_alias": resume_by_alias,
-    })
+    }, provider_options))
     return provider_obj.invoke(messages, **kwargs)
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     session_id, cwd, alias,
-                                    resume_by_alias=True):
-    kwargs = _supported_kwargs(provider_obj, "invoke_async", {
+                                    resume_by_alias=True,
+                                    provider_options=None):
+    kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
         "alias": alias,
         "resume_by_alias": resume_by_alias,
-    })
+    }, provider_options))
     return await provider_obj.invoke_async(messages, **kwargs)
 
 
 def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         session_id, cwd, alias, idle_timeout=None,
-                        wall_timeout=None, resume_by_alias=True):
-    kwargs = _supported_kwargs(provider_obj, "stream_async", {
+                        wall_timeout=None, resume_by_alias=True,
+                        provider_options=None):
+    kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
@@ -150,7 +164,7 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
         "idle_timeout": idle_timeout,
         "wall_timeout": wall_timeout,
         "resume_by_alias": resume_by_alias,
-    })
+    }, provider_options))
     return provider_obj.stream_async(messages, **kwargs)
 
 
@@ -463,6 +477,7 @@ class LLMClient:
              fallback: bool = False,
              wall_timeout: int | None = None,
              new_session: bool = False,
+             provider_options: dict | None = None,
              ) -> LLMResponse:
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
@@ -484,7 +499,7 @@ class LLMClient:
                 provider, messages, fallback_messages, model,
                 wall_timeout or timeout, session_id, cwd,
                 alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback)
+                allow_fallback=fallback, provider_options=provider_options)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -506,7 +521,8 @@ class LLMClient:
                               cwd: str | None,
                               *, alias: str = "",
                               resume_by_alias: bool = True,
-                              allow_fallback: bool = False) -> LLMResponse:
+                              allow_fallback: bool = False,
+                              provider_options: dict | None = None) -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         # 1) primary 시도
@@ -515,7 +531,8 @@ class LLMClient:
             resp = _invoke_with_alias(
                 p, messages, model=model, timeout=timeout,
                 session_id=session_id, cwd=cwd, alias=alias,
-                resume_by_alias=resume_by_alias)
+                resume_by_alias=resume_by_alias,
+                provider_options=provider_options)
             if resp.content:
                 return resp
             last_resp = resp
@@ -549,7 +566,8 @@ class LLMClient:
             resp = _invoke_with_alias(
                 np, fallback_messages, model="", timeout=timeout,
                 session_id="", cwd=cwd, alias=alias,
-                resume_by_alias=resume_by_alias)
+                resume_by_alias=resume_by_alias,
+                provider_options=provider_options)
             if resp.content:
                 return resp
             last_resp = resp
@@ -586,6 +604,7 @@ class LLMClient:
                          fallback: bool = False,
                          wall_timeout: int | None = None,
                          new_session: bool = False,
+                         provider_options: dict | None = None,
                          ) -> LLMResponse:
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
@@ -607,7 +626,7 @@ class LLMClient:
                 provider, messages, fallback_messages, model,
                 wall_timeout or timeout, session_id, cwd,
                 alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback)
+                allow_fallback=fallback, provider_options=provider_options)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -630,7 +649,8 @@ class LLMClient:
                                           cwd: str | None,
                                           *, alias: str = "",
                                           resume_by_alias: bool = True,
-                                          allow_fallback: bool = False) -> LLMResponse:
+                                          allow_fallback: bool = False,
+                              provider_options: dict | None = None) -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         p = self._registry.get(provider_id)
@@ -638,7 +658,8 @@ class LLMClient:
             resp = await _invoke_async_with_alias(
                 p, messages, model=model, timeout=timeout,
                 session_id=session_id, cwd=cwd, alias=alias,
-                resume_by_alias=resume_by_alias)
+                resume_by_alias=resume_by_alias,
+                provider_options=provider_options)
             if resp.content:
                 return resp
             last_resp = resp
@@ -670,7 +691,8 @@ class LLMClient:
             resp = await _invoke_async_with_alias(
                 np, fallback_messages, model="", timeout=timeout,
                 session_id="", cwd=cwd, alias=alias,
-                resume_by_alias=resume_by_alias)
+                resume_by_alias=resume_by_alias,
+                provider_options=provider_options)
             if resp.content:
                 return resp
             last_resp = resp
@@ -700,6 +722,7 @@ class LLMClient:
                           idle_timeout: int | None = None,
                           wall_timeout: int | None = None,
                           new_session: bool = False,
+                          provider_options: dict | None = None,
                           ) -> AsyncIterator[StreamChunk]:
         """스트리밍 호출. 청크를 yield하면서 응답을 누적하고 완료 시 저장.
 
@@ -769,7 +792,8 @@ class LLMClient:
                             alias=resolved_alias,
                             idle_timeout=idle_timeout,
                             wall_timeout=wall_timeout,
-                            resume_by_alias=resume_by_alias):
+                            resume_by_alias=resume_by_alias,
+                            provider_options=provider_options):
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
 

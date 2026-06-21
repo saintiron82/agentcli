@@ -151,15 +151,24 @@ class CodexProvider(LLMProvider):
             message=auth_msg or "Codex CLI authenticated")
 
     def _build_cmd(self, prompt: str, model: str, cwd: str | None,
-                   session_id: str) -> list[str] | None:
+                   session_id: str, *,
+                   sandbox_mode: str | None = None,
+                   approval_policy: str | None = None) -> list[str] | None:
         """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
 
         바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
         binary_missing 으로 실패 처리). claude/copilot 와 동일 패턴.
+
+        sandbox_mode/approval_policy 는 호출 시점 오버라이드 (None 이면 생성자
+        기본값). resume 시에는 원 세션 설정이 유지되어 무시된다 — acting run 은
+        ``new_session=True`` 로 신규 세션을 강제해야 적용된다 (#154).
         """
         bin_path = self._find_binary()
         if not bin_path:
             return None
+        sbox = sandbox_mode or self._sandbox_mode
+        apol = (approval_policy if approval_policy is not None
+                else self._approval_policy)
         cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
@@ -179,10 +188,10 @@ class CodexProvider(LLMProvider):
             cmd.append("--full-auto")
         if self._skip_git:
             cmd.append("--skip-git-repo-check")
-        if self._sandbox_mode:
-            cmd += ["-s", self._sandbox_mode]
-        if self._approval_policy:
-            cmd += ["-a", self._approval_policy]
+        if sbox:
+            cmd += ["-s", sbox]
+        if apol:
+            cmd += ["-a", apol]
         if cwd:
             cmd += ["-C", cwd]
         if model:
@@ -197,10 +206,14 @@ class CodexProvider(LLMProvider):
     def invoke(self, messages: list[Message], *,
                model: str = "", timeout: int = 120,
                session_id: str = "",
-               cwd: str | None = None) -> LLMResponse:
+               cwd: str | None = None,
+               sandbox_mode: str | None = None,
+               approval_policy: str | None = None) -> LLMResponse:
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
-        cmd = self._build_cmd(prompt, model, cwd, session_id)
+        cmd = self._build_cmd(prompt, model, cwd, session_id,
+                              sandbox_mode=sandbox_mode,
+                              approval_policy=approval_policy)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -235,7 +248,9 @@ class CodexProvider(LLMProvider):
             if _needs_initial_greeting_retry(parsed, session_id):
                 first_thread_id = parsed["thread_id"]
                 retry_result = subprocess.run(
-                    self._build_cmd(prompt, model, cwd, first_thread_id),
+                    self._build_cmd(prompt, model, cwd, first_thread_id,
+                                    sandbox_mode=sandbox_mode,
+                                    approval_policy=approval_policy),
                     capture_output=True, text=True, timeout=timeout,
                     stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
                 latency = int((time.time() - start) * 1000)
@@ -286,9 +301,13 @@ class CodexProvider(LLMProvider):
     async def invoke_async(self, messages: list[Message], *,
                            model: str = "", timeout: int = 120,
                            session_id: str = "",
-                           cwd: str | None = None) -> LLMResponse:
+                           cwd: str | None = None,
+                           sandbox_mode: str | None = None,
+                           approval_policy: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
-        cmd = self._build_cmd(prompt, model, cwd, session_id)
+        cmd = self._build_cmd(prompt, model, cwd, session_id,
+                              sandbox_mode=sandbox_mode,
+                              approval_policy=approval_policy)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -349,7 +368,9 @@ class CodexProvider(LLMProvider):
                            session_id: str = "",
                            cwd: str | None = None,
                            idle_timeout: int | None = None,
-                           wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
+                           wall_timeout: int | None = None,
+                           sandbox_mode: str | None = None,
+                           approval_policy: str | None = None) -> AsyncIterator[StreamChunk]:
         """Codex exec --json JSONL 이벤트 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -364,7 +385,9 @@ class CodexProvider(LLMProvider):
           error / turn.failed                         → error
         """
         prompt = build_session_prompt(messages)
-        cmd = self._build_cmd(prompt, model, cwd, session_id)
+        cmd = self._build_cmd(prompt, model, cwd, session_id,
+                              sandbox_mode=sandbox_mode,
+                              approval_policy=approval_policy)
         if cmd is None:
             yield StreamChunk(type="error", content="codex CLI not found")
             return

@@ -134,24 +134,49 @@ class ClaudeProvider(LLMProvider):
 
     def _build_cmd(self, prompt: str, model: str,
                    session_id: str,
-                   output_format: str = "json") -> tuple[list[str] | None, str]:
-        """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음."""
+                   output_format: str = "json", *,
+                   permission_mode: str | None = None,
+                   allowed_tools: list[str] | None = None,
+                   disallowed_tools: list[str] | None = None,
+                   mcp_config: dict | str | None = None,
+                   strict_mcp_config: bool = False) -> tuple[list[str] | None, str]:
+        """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
+
+        permission_mode/allowed_tools/disallowed_tools/mcp_config 는 호출 시점
+        오버라이드 (None 이면 생성자 기본값). mcp_config 는 외부 MCP 서버 정의 —
+        dict 면 ``{"mcpServers": ...}`` 로 감싸 JSON 직렬화, str 이면 그대로
+        (파일 경로 또는 사전 직렬화 JSON) 전달한다 (#154).
+        """
         bin_path = self._find_binary()
         if not bin_path:
             return None, ""
 
+        pmode = permission_mode or self._permission_mode
+        atools = allowed_tools if allowed_tools is not None else self._allowed_tools
+        dtools = (disallowed_tools if disallowed_tools is not None
+                  else self._disallowed_tools)
+
         cmd = [bin_path, "-p", prompt,
                "--output-format", output_format,
-               "--permission-mode", self._permission_mode]
+               "--permission-mode", pmode]
         if output_format == "stream-json":
             # stream-json은 반드시 --verbose 필요 (Claude Code 제약)
             cmd.append("--verbose")
         if model:
             cmd += ["--model", model]
-        if self._allowed_tools:
-            cmd += ["--allowedTools", ",".join(self._allowed_tools)]
-        if self._disallowed_tools:
-            cmd += ["--disallowedTools", ",".join(self._disallowed_tools)]
+        if atools:
+            cmd += ["--allowedTools", ",".join(atools)]
+        if dtools:
+            cmd += ["--disallowedTools", ",".join(dtools)]
+        if mcp_config:
+            if isinstance(mcp_config, str):
+                cmd += ["--mcp-config", mcp_config]
+            else:
+                payload = (mcp_config if "mcpServers" in mcp_config
+                           else {"mcpServers": mcp_config})
+                cmd += ["--mcp-config", json.dumps(payload)]
+            if strict_mcp_config:
+                cmd.append("--strict-mcp-config")
 
         # macOS/Linux: 저장된 session_id 가 있으면 `--resume` 으로 재개.
         # Windows (supports_sessions=False): issue #4 데드락 회피를 위해
@@ -167,9 +192,18 @@ class ClaudeProvider(LLMProvider):
     def invoke(self, messages: list[Message], *,
                model: str = "", timeout: int = 120,
                session_id: str = "",
-               cwd: str | None = None) -> LLMResponse:
+               cwd: str | None = None,
+               mcp_config: dict | str | None = None,
+               strict_mcp_config: bool = False,
+               permission_mode: str | None = None,
+               allowed_tools: list[str] | None = None,
+               disallowed_tools: list[str] | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
-        cmd, used_sid = self._build_cmd(prompt, model, session_id, "json")
+        cmd, used_sid = self._build_cmd(
+            prompt, model, session_id, "json",
+            permission_mode=permission_mode, allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+            strict_mcp_config=strict_mcp_config)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -190,9 +224,14 @@ class ClaudeProvider(LLMProvider):
                     logger.warning(
                         "Claude 세션 %s 만료 — 새 세션으로 재시도",
                         session_id[:8])
-                    return self.invoke(messages, model=model,
-                                       timeout=timeout, session_id="",
-                                       cwd=cwd)
+                    return self.invoke(
+                        messages, model=model, timeout=timeout,
+                        session_id="", cwd=cwd,
+                        permission_mode=permission_mode,
+                        allowed_tools=allowed_tools,
+                        disallowed_tools=disallowed_tools,
+                        mcp_config=mcp_config,
+                        strict_mcp_config=strict_mcp_config)
                 err_msg = (result.stderr or "").strip()[:300]
                 msg = err_msg or f"exit={result.returncode}"
                 logger.error("Claude 실패 (code=%d): %s",
@@ -235,9 +274,18 @@ class ClaudeProvider(LLMProvider):
     async def invoke_async(self, messages: list[Message], *,
                            model: str = "", timeout: int = 120,
                            session_id: str = "",
-                           cwd: str | None = None) -> LLMResponse:
+                           cwd: str | None = None,
+                           mcp_config: dict | str | None = None,
+                           strict_mcp_config: bool = False,
+                           permission_mode: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
-        cmd, used_sid = self._build_cmd(prompt, model, session_id, "json")
+        cmd, used_sid = self._build_cmd(
+            prompt, model, session_id, "json",
+            permission_mode=permission_mode, allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+            strict_mcp_config=strict_mcp_config)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -272,7 +320,12 @@ class ClaudeProvider(LLMProvider):
                     "Claude 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
                 return await self.invoke_async(
                     messages, model=model, timeout=timeout,
-                    session_id="", cwd=cwd)
+                    session_id="", cwd=cwd,
+                    permission_mode=permission_mode,
+                    allowed_tools=allowed_tools,
+                    disallowed_tools=disallowed_tools,
+                    mcp_config=mcp_config,
+                    strict_mcp_config=strict_mcp_config)
             logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             return LLMResponse(
@@ -299,7 +352,12 @@ class ClaudeProvider(LLMProvider):
                            session_id: str = "",
                            cwd: str | None = None,
                            idle_timeout: int | None = None,
-                           wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
+                           wall_timeout: int | None = None,
+                           mcp_config: dict | str | None = None,
+                           strict_mcp_config: bool = False,
+                           permission_mode: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -319,7 +377,10 @@ class ClaudeProvider(LLMProvider):
         attempt_sid = session_id
         for _attempt in range(2):
             cmd, used_sid = self._build_cmd(
-                prompt, model, attempt_sid, "stream-json")
+                prompt, model, attempt_sid, "stream-json",
+                permission_mode=permission_mode, allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+                strict_mcp_config=strict_mcp_config)
             if cmd is None:
                 yield StreamChunk(type="error", content="Claude CLI not found")
                 return
