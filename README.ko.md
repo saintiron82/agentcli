@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.0"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.1"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -271,8 +271,8 @@ pytest
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.0`
-- 릴리즈 노트: [docs/releases/v0.6.0.ko.md](docs/releases/v0.6.0.ko.md)
+- 현재 릴리즈: `0.6.1`
+- 릴리즈 노트: [docs/releases/v0.6.1.ko.md](docs/releases/v0.6.1.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 
 ## 라이선스
