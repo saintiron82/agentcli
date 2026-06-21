@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.5.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.0"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -489,7 +489,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.5.1 release note: [docs/releases/v0.5.1.md](docs/releases/v0.5.1.md) / [docs/releases/v0.5.1.ko.md](docs/releases/v0.5.1.ko.md)
+- v0.6.0 release note: [docs/releases/v0.6.0.md](docs/releases/v0.6.0.md) / [docs/releases/v0.6.0.ko.md](docs/releases/v0.6.0.ko.md)
 
 ## License
 

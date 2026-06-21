@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-06-21
 
 ### Added
 - **KiroProvider** — 네 번째 provider. `kiro-cli acp`(ACP, JSON-RPC 2.0 over
@@ -15,6 +15,13 @@
   세션에서 읽기↔행위를 오간다. `CodexProvider` 는 `sandbox_mode`/`approval_policy`
   오버라이드(행위 턴은 `new_session=True` 와 병행 — resume 는 `-s` 무시). 실제
   claude CLI 로 `--mcp-config` 포맷 수용 확인.
+
+### Fixed
+- **KiroProvider `session/new`·`session/load` 에 ACP 필수 `mcpServers` 필드 누락.**
+  실 `kiro-cli` 2.8.1 대상 라이브 검증에서 매 턴 stall(idle timeout) 발견 —
+  `{"cwd": ...}` 만 보내 kiro 가 응답하지 않던 문제. `"mcpServers": []` 추가로
+  수정. raw ACP spike 로 나머지 필드 매핑(`sessionUpdate`/`content.text`/
+  `stopReason`)은 실측 일치 확인. 계정 인증(`kiro-cli login`)으로 spike 실행.
 
 ## 0.5.1 — 2026-06-10
 
