@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **codex `mcp_config` pass-through (#154 follow-up).** `CodexProvider`
+  invoke/invoke_async/stream_async + `provider_options` accept `mcp_config`
+  (codex-native shape `{name: {url, bearer_token_env_var?}}` or `{name:
+  {command, args?, env?}}`); each server is injected per-call as
+  `-c mcp_servers.<name>=<TOML inline table>` (`~/.codex/config.toml` override).
+  An embedded codex can now reach external MCP servers — verified end-to-end:
+  codex performed a real MCP tool call against a throwaway server. Note: in
+  non-interactive `codex exec`, MCP tool calls must clear codex's approval gate
+  (a restrictive `sandbox_mode` + `approval_policy="never"` cancels them).
+
 ## 0.6.0 — 2026-06-21
 
 ### Added

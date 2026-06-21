@@ -456,12 +456,20 @@ Supported `provider_options` keys:
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
   `disallowed_tools`.
-- **codex** — `sandbox_mode`, `approval_policy`. Codex has no MCP; for an act
-  turn that needs write access, pair `provider_options={"sandbox_mode":
-  "workspace-write"}` with `new_session=True` (resume reuses the original
-  session's sandbox and ignores `-s`).
+- **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
+  servers from `~/.codex/config.toml`, so its `mcp_config` uses the
+  **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
+  token is an env-var *name*, not inline headers like claude) or
+  `{name: {command, args?, env?}}` (stdio) — and each server is injected
+  per-call as `-c mcp_servers.<name>=<toml>`. An act turn that needs write
+  access pairs `provider_options={"sandbox_mode": "workspace-write"}` with
+  `new_session=True` (resume ignores `-s`). **Caveat:** in non-interactive
+  `codex exec` an MCP tool call must pass codex's approval gate or it is
+  cancelled (`user cancelled MCP tool call`) — configure approval accordingly.
 
-If you only edit files in `cwd`, you don't need `mcp_config` at all — the
+`mcp_config` is **provider-shaped**: claude expects `{name: {type, url,
+headers}}` (wrapped under `mcpServers`), codex expects the `mcp_servers` schema
+above. If you only edit files in `cwd`, you don't need `mcp_config` at all — the
 `permission_mode` / `allowed_tools` constructor flags (or these per-call
 overrides) are enough.
 
