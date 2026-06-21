@@ -252,15 +252,19 @@ class KiroProvider(LLMProvider):
                     "clientInfo": {"name": "agentcli", "version": "0"}})
                 if session_id:
                     try:
-                        await conn.request("session/load",
-                                           {"sessionId": session_id, "cwd": cwd or "."})
+                        await conn.request(
+                            "session/load",
+                            {"sessionId": session_id, "cwd": cwd or ".",
+                             "mcpServers": []})
                     except AcpError:
                         # 잔여(stale) 세션 → 새 세션으로 1회 복구.
                         state["session_id"] = (await conn.request(
-                            "session/new", {"cwd": cwd or "."}))["sessionId"]
+                            "session/new",
+                            {"cwd": cwd or ".", "mcpServers": []}))["sessionId"]
                 else:
                     state["session_id"] = (await conn.request(
-                        "session/new", {"cwd": cwd or "."}))["sessionId"]
+                        "session/new",
+                        {"cwd": cwd or ".", "mcpServers": []}))["sessionId"]
                 res = await conn.request("session/prompt", {
                     "sessionId": state["session_id"],
                     "prompt": [{"type": "text", "text": prompt}]})
