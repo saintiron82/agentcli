@@ -232,13 +232,20 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
   `disallowed_tools`.
-- **codex** — `sandbox_mode`, `approval_policy`. codex 는 MCP 미지원 — 쓰기
-  권한이 필요한 행위 턴은 `provider_options={"sandbox_mode": "workspace-write"}`
-  를 `new_session=True` 와 함께 쓴다(resume 는 원 세션 sandbox 를 유지하고
-  `-s` 를 무시).
+- **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
+  `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
+  형태** — `{name: {url, bearer_token_env_var?}}`(HTTP; 토큰은 inline 헤더가 아니라
+  환경변수 *이름*) 또는 `{name: {command, args?, env?}}`(stdio) — 이고, 각 서버를
+  호출 시점에 `-c mcp_servers.<name>=<toml>` 로 주입한다. 쓰기 권한이 필요한 행위
+  턴은 `provider_options={"sandbox_mode": "workspace-write"}` 를 `new_session=True`
+  와 함께 쓴다(resume 는 `-s` 무시). **주의:** 비대화형 `codex exec` 에서 MCP 도구
+  호출은 codex 의 승인 게이트를 통과해야 하며, 그렇지 않으면 취소된다
+  (`user cancelled MCP tool call`) — 승인 설정을 그에 맞게 조정할 것.
 
-`cwd` 안의 파일만 편집한다면 `mcp_config` 는 필요 없다 — 생성자
-`permission_mode`/`allowed_tools`(또는 이 호출 시점 오버라이드)로 충분하다.
+`mcp_config` 는 **provider 별 형태**다: claude 는 `{name: {type, url, headers}}`
+(`mcpServers` 로 감쌈), codex 는 위 `mcp_servers` 스키마. `cwd` 안의 파일만
+편집한다면 `mcp_config` 는 필요 없다 — 생성자 `permission_mode`/`allowed_tools`
+(또는 이 호출 시점 오버라이드)로 충분하다.
 
 ## Provider 기능 비교
 

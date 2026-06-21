@@ -72,6 +72,26 @@ CODEX_MODELS = [
 ]
 
 
+def _toml_inline(value) -> str:
+    """Python 값을 TOML inline 값으로 직렬화 (codex `-c key=value` 용).
+
+    JSON 문자열 인용은 TOML basic string 과 호환되므로 str/숫자는 json.dumps,
+    list/dict 는 TOML inline array/table 로 재귀 직렬화한다.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_inline(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(
+            f"{k} = {_toml_inline(v)}" for k, v in value.items()) + "}"
+    return json.dumps(str(value))
+
+
 class CodexProvider(LLMProvider):
     provider_id = "codex"
     supports_sessions = True
@@ -153,7 +173,8 @@ class CodexProvider(LLMProvider):
     def _build_cmd(self, prompt: str, model: str, cwd: str | None,
                    session_id: str, *,
                    sandbox_mode: str | None = None,
-                   approval_policy: str | None = None) -> list[str] | None:
+                   approval_policy: str | None = None,
+                   mcp_config: dict | None = None) -> list[str] | None:
         """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
 
         바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
@@ -162,6 +183,13 @@ class CodexProvider(LLMProvider):
         sandbox_mode/approval_policy 는 호출 시점 오버라이드 (None 이면 생성자
         기본값). resume 시에는 원 세션 설정이 유지되어 무시된다 — acting run 은
         ``new_session=True`` 로 신규 세션을 강제해야 적용된다 (#154).
+
+        mcp_config 는 외부 MCP 서버 정의 dict ``{name: {codex mcp_servers 필드}}``.
+        codex 는 claude 와 달리 ``~/.codex/config.toml`` 의 ``[mcp_servers.<name>]``
+        를 쓰므로, 각 서버를 ``-c 'mcp_servers.<name>=<TOML inline table>'`` 로
+        per-call 주입한다. HTTP 는 ``{url, bearer_token_env_var?}``, stdio 는
+        ``{command, args?, env?}`` (#154 follow-up). 토큰은 inline 헤더가 아니라
+        ``bearer_token_env_var`` (환경변수명) 로 전달한다.
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -169,6 +197,9 @@ class CodexProvider(LLMProvider):
         sbox = sandbox_mode or self._sandbox_mode
         apol = (approval_policy if approval_policy is not None
                 else self._approval_policy)
+        mcp_args: list[str] = []
+        for name, cfg in (mcp_config or {}).items():
+            mcp_args += ["-c", f"mcp_servers.{name}={_toml_inline(cfg)}"]
         cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
@@ -178,6 +209,7 @@ class CodexProvider(LLMProvider):
                 cmd.append("--skip-git-repo-check")
             if model:
                 cmd += ["-m", model]
+            cmd += mcp_args
             # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
             # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
             cmd += ["--", session_id, prompt]
@@ -196,6 +228,7 @@ class CodexProvider(LLMProvider):
             cmd += ["-C", cwd]
         if model:
             cmd += ["-m", model]
+        cmd += mcp_args
         # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
         # 해석되지 않는다 (untrusted 입력 주입 방지).
         cmd += ["--", prompt]
@@ -208,12 +241,14 @@ class CodexProvider(LLMProvider):
                session_id: str = "",
                cwd: str | None = None,
                sandbox_mode: str | None = None,
-               approval_policy: str | None = None) -> LLMResponse:
+               approval_policy: str | None = None,
+               mcp_config: dict | None = None) -> LLMResponse:
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy)
+                              approval_policy=approval_policy,
+                              mcp_config=mcp_config)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -250,7 +285,8 @@ class CodexProvider(LLMProvider):
                 retry_result = subprocess.run(
                     self._build_cmd(prompt, model, cwd, first_thread_id,
                                     sandbox_mode=sandbox_mode,
-                                    approval_policy=approval_policy),
+                                    approval_policy=approval_policy,
+                                    mcp_config=mcp_config),
                     capture_output=True, text=True, timeout=timeout,
                     stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
                 latency = int((time.time() - start) * 1000)
@@ -303,11 +339,13 @@ class CodexProvider(LLMProvider):
                            session_id: str = "",
                            cwd: str | None = None,
                            sandbox_mode: str | None = None,
-                           approval_policy: str | None = None) -> LLMResponse:
+                           approval_policy: str | None = None,
+                           mcp_config: dict | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy)
+                              approval_policy=approval_policy,
+                              mcp_config=mcp_config)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -370,7 +408,8 @@ class CodexProvider(LLMProvider):
                            idle_timeout: int | None = None,
                            wall_timeout: int | None = None,
                            sandbox_mode: str | None = None,
-                           approval_policy: str | None = None) -> AsyncIterator[StreamChunk]:
+                           approval_policy: str | None = None,
+                           mcp_config: dict | None = None) -> AsyncIterator[StreamChunk]:
         """Codex exec --json JSONL 이벤트 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -387,7 +426,8 @@ class CodexProvider(LLMProvider):
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy)
+                              approval_policy=approval_policy,
+                              mcp_config=mcp_config)
         if cmd is None:
             yield StreamChunk(type="error", content="codex CLI not found")
             return

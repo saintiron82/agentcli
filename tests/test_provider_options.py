@@ -241,3 +241,53 @@ def test_codex_stream_async_forwards_sandbox(mock_bc):
     asyncio.run(_drain(p.stream_async([Message(role="user", content="hi")],
                                       sandbox_mode="workspace-write")))
     assert mock_bc.call_args.kwargs["sandbox_mode"] == "workspace-write"
+
+
+# ===== codex MCP pass-through via -c mcp_servers.<name> (#154 follow-up C) =====
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary",
+       return_value="/usr/bin/codex")
+def test_codex_build_cmd_emits_mcp_config_http(mock_find):
+    p = CodexProvider()
+    cmd = p._build_cmd("hi", "", None, "",
+                       mcp_config={"pair": {"url": "http://x/mcp"}})
+    assert "-c" in cmd
+    joined = " ".join(cmd)
+    assert "mcp_servers.pair=" in joined
+    assert '"http://x/mcp"' in joined   # url serialized as a TOML/JSON string
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary",
+       return_value="/usr/bin/codex")
+def test_codex_build_cmd_emits_mcp_config_stdio(mock_find):
+    p = CodexProvider()
+    cmd = p._build_cmd("hi", "", None, "",
+                       mcp_config={"demo": {"command": "python",
+                                            "args": ["/tmp/m.py"]}})
+    joined = " ".join(cmd)
+    assert "mcp_servers.demo=" in joined
+    assert '"python"' in joined and '"/tmp/m.py"' in joined
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary",
+       return_value="/usr/bin/codex")
+def test_codex_build_cmd_no_mcp_flag_when_absent(mock_find):
+    p = CodexProvider()
+    cmd = p._build_cmd("hi", "", None, "")
+    assert "mcp_servers." not in " ".join(cmd)
+
+
+@patch.object(CodexProvider, "_build_cmd", return_value=None)
+def test_codex_invoke_forwards_mcp_config(mock_bc):
+    p = CodexProvider()
+    p.invoke([Message(role="user", content="hi")],
+             mcp_config={"x": {"url": "u"}})
+    assert mock_bc.call_args.kwargs["mcp_config"] == {"x": {"url": "u"}}
+
+
+@patch.object(CodexProvider, "_build_cmd", return_value=None)
+def test_codex_stream_async_forwards_mcp_config(mock_bc):
+    p = CodexProvider()
+    asyncio.run(_drain(p.stream_async([Message(role="user", content="hi")],
+                                      mcp_config={"x": {"url": "u"}})))
+    assert mock_bc.call_args.kwargs["mcp_config"] == {"x": {"url": "u"}}
