@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-06-21
 
 ### Added
 - **codex `mcp_config` pass-through (#154 follow-up).** `CodexProvider`
