@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.2"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -231,7 +231,7 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`.
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
   `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
   형태** — `{name: {url, bearer_token_env_var?}}`(HTTP; 토큰은 inline 헤더가 아니라
@@ -246,6 +246,37 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 (`mcpServers` 로 감쌈), codex 는 위 `mcp_servers` 스키마. `cwd` 안의 파일만
 편집한다면 `mcp_config` 는 필요 없다 — 생성자 `permission_mode`/`allowed_tools`
 (또는 이 호출 시점 오버라이드)로 충분하다.
+
+### lean 모드 & debug (claude)
+
+툴이 필요 없는 단일 completion — 큰 컨텍스트에 대한 요약/생성/초안 — 에서는
+`lean=True` 가 에이전트 하네스를 걷어낸다: `--safe-mode`(CLAUDE.md/skills/
+plugins/hooks/MCP/custom agents 없음) + `--tools ""`(빌트인 툴 없음). 그러면
+completion 이 MCP 기동 비용을 내지 않고 자율 툴 루프로 빠지지도 않는다. 남는
+지배 비용은 출력 토큰 생성이므로, 지연이 중요하면 더 빠른 모델도 함께 고른다.
+
+```python
+# 약 5만 자 텍스트 → 회의록, 툴 불필요:
+client.chat(report_text, provider="claude",
+            model="claude-haiku-4-5",            # 출력 속도가 본질적 레버
+            provider_options={"lean": True})     # 하네스 제거 + 툴 루프 차단
+```
+
+호출이 이유 없이 느리면 `debug=True`(필요 시 `debug_log_path` 와 함께)가 Claude
+의 `--debug` 를 붙이고, 프롬프트가 redact 된 argv 를 로깅하며, 스트리밍에서는
+청크별 타임라인을 기록해 툴 루프나 init 지연을 보이게 한다. `debug_log_path` 를
+주면 JSON Lines trace(argv·청크 타임라인·stderr·총 소요)가 append 되어, 느린
+호출을 재현한 뒤 들여다볼 수 있다.
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                       provider_options={
+                                           "debug": True,
+                                           "debug_log_path": "/tmp/agentcli.jsonl"}):
+    ...
+```
+
+`lean`/`debug` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
 
 ## Provider 기능 비교
 
@@ -267,12 +298,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 344개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, Codex/Copilot JSONL parsing을 다룹니다.
+현재 413개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.1`
-- 릴리즈 노트: [docs/releases/v0.6.1.ko.md](docs/releases/v0.6.1.ko.md)
+- 현재 릴리즈: `0.6.2`
+- 릴리즈 노트: [docs/releases/v0.6.2.ko.md](docs/releases/v0.6.2.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 
 ## 라이선스

@@ -34,7 +34,7 @@ except PackageNotFoundError:
         # Pre-rename dist name (installed before the agentcli-py rename).
         __version__ = _pkg_version("agentcli")
     except PackageNotFoundError:
-        __version__ = "0.6.1"
+        __version__ = "0.6.2"
 
 __all__ = [
     "__version__",

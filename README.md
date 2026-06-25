@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.2"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -455,7 +455,7 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`.
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
   **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
@@ -473,6 +473,38 @@ above. If you only edit files in `cwd`, you don't need `mcp_config` at all — t
 `permission_mode` / `allowed_tools` constructor flags (or these per-call
 overrides) are enough.
 
+### Lean mode & debug (claude)
+
+For a single completion that needs no tools — summarize / generate / draft over
+a large context — `lean=True` strips the agent harness: it adds `--safe-mode`
+(no CLAUDE.md/skills/plugins/hooks/MCP/custom agents) and `--tools ""` (no
+built-in tools). The completion then can't pay for MCP startup or wander into an
+autonomous tool loop. The dominant remaining cost is output-token generation, so
+also pick a faster model when latency matters.
+
+```python
+# ~50k-char text → meeting minutes, no tools needed:
+client.chat(report_text, provider="claude",
+            model="claude-haiku-4-5",            # output speed is the main lever
+            provider_options={"lean": True})     # strip harness; block tool loops
+```
+
+When a call is mysteriously slow, `debug=True` (optionally with
+`debug_log_path`) appends Claude's `--debug`, logs the prompt-redacted argv, and
+for streaming records a per-chunk timeline so a tool loop or init stall is
+visible. A `debug_log_path` appends a JSON-Lines trace (argv, chunk timeline,
+stderr, elapsed) you can inspect after reproducing the slow call.
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                       provider_options={
+                                           "debug": True,
+                                           "debug_log_path": "/tmp/agentcli.jsonl"}):
+    ...
+```
+
+`lean` / `debug` are Claude-specific; other providers ignore them on fallback.
+
 ## Testing
 
 ```bash
@@ -480,7 +512,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-344 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, and Codex/Copilot JSONL parsing.
+413 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
@@ -497,7 +529,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.6.1 release note: [docs/releases/v0.6.1.md](docs/releases/v0.6.1.md) / [docs/releases/v0.6.1.ko.md](docs/releases/v0.6.1.ko.md)
+- v0.6.2 release note: [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md) / [docs/releases/v0.6.2.ko.md](docs/releases/v0.6.2.ko.md)
 
 ## License
 

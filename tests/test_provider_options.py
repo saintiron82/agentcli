@@ -112,15 +112,14 @@ from unittest.mock import MagicMock
 from agentcli.types import Message
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary",
        return_value="/usr/bin/claude")
 def test_claude_invoke_threads_mcp_config_to_cmd(mock_find, mock_run):
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout='{"type":"result","subtype":"success","result":"ok",'
-               '"session_id":"s","usage":{}}',
-        stderr="")
+    mock_run.return_value = (
+        b'{"type":"result","subtype":"success","result":"ok",'
+        b'"session_id":"s","usage":{}}',
+        b"", 0, False)
     p = ClaudeProvider()
     p.invoke([Message(role="user", content="hi")],
              mcp_config={"pair": {"url": "https://x/mcp"}},

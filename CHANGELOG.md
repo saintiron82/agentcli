@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.6.2 — 2026-06-25
+
+### Added
+- **`ClaudeProvider` lean mode (`lean=True`).** For single-shot completions
+  (summarize/generate — no tool use), appends `--safe-mode` (disables
+  CLAUDE.md/skills/plugins/hooks/MCP/custom agents) + `--tools` allowlist
+  (`""` to disable all built-in tools, or the explicit `allowed_tools`). This
+  strips the agent harness so a large-context completion does not pay for
+  MCP startup or risk an autonomous tool loop. Constructor arg + per-call
+  override + `provider_options={"lean": True}`. MCP/`disallowed_tools` are
+  ignored in lean mode. Default `False` — existing behavior unchanged.
+- **Optional debug instrumentation (`debug=True`, `debug_log_path=...`).**
+  Appends Claude's `--debug` flag, logs the (prompt-redacted) argv, and — for
+  streaming — records a per-chunk timeline (`+{elapsed}s type evt/name`) so a
+  tool loop or init stall is legible. `debug_log_path` appends a JSON-Lines
+  trace (argv, chunk timeline, drained stderr, elapsed). stderr is drained
+  concurrently during streaming to avoid a `--debug` pipe-buffer deadlock.
+  Threaded through `invoke`/`invoke_async`/`stream_async` and
+  `provider_options`. Default `False`.
+
+### Fixed
+- **Orphaned grandchild processes ("zombie" accumulation).** A CLI spawns its
+  own children (MCP servers, hooks, node helpers). Killing only the direct
+  child on timeout/cleanup left those grandchildren running — and a grandchild
+  holding the stdout pipe could even wedge `subprocess.run`'s post-timeout
+  cleanup. All spawn sites now start a new session (process group) and tear
+  down the **whole group** via `os.killpg(SIGKILL)` on timeout/cancel/early-exit
+  (POSIX; Windows falls back to direct kill). New `run_subprocess_sync` replaces
+  `subprocess.run` in `ClaudeProvider.invoke` for the same group teardown +
+  `stdin=DEVNULL`. Verified with deterministic repro tests (sync + async).
+
+### Notes
+- `lean`/`debug` are Claude-specific (they map to Claude Code flags). The
+  client's `provider_options` filtering means other providers safely ignore
+  them; Codex/Copilot equivalents are not implemented.
+- The process-group teardown lives in the shared `base` runners, so the
+  streaming and async paths benefit across all providers; the sync
+  `run_subprocess_sync` switch is wired for claude (codex/copilot can adopt).
+
 ## 0.6.1 — 2026-06-21
 
 ### Added

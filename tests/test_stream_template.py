@@ -14,12 +14,52 @@ import pytest
 from agentcli.providers.base import StreamState
 from agentcli.providers.claude import ClaudeProvider
 from tests._stream_helpers import (
-    HangingReadline, jsonl_bytes, make_fake_proc, patch_subprocess_exec)
+    FakeReadline, HangingReadline, jsonl_bytes, make_fake_proc,
+    patch_subprocess_exec)
 
 
 # ============================================================
 # 정상 시퀀스 (sanity check + #11 일부)
 # ============================================================
+
+
+def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
+    """debug=True: 청크 타임라인 + redact argv + stderr 를 trace 파일로 기록."""
+    import json
+    events = [
+        {"type": "system", "session_id": "sys-1"},
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "hi"}]}},
+        {"type": "result", "usage": {"input_tokens": 3, "output_tokens": 2},
+         "session_id": "sys-1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    # stderr 동시 드레인 검증을 위해 readline 가능한 fake 로 교체
+    proc.stderr = FakeReadline([b"debug: mcp connected\n",
+                                b"debug: tool_use Bash\n"])
+    patch_subprocess_exec(monkeypatch, proc)
+
+    provider = ClaudeProvider()
+    state = StreamState(final_session_id="seed")
+    trace = tmp_path / "trace.jsonl"
+    cmd = ["claude", "-p", "SECRET-PROMPT", "--debug",
+           "--output-format", "stream-json"]
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            cmd, state, model="m", debug=True, debug_log_path=str(trace))]
+
+    chunks = asyncio.run(run())
+    assert [c.type for c in chunks][-1] == "done"
+
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "stream"
+    assert rec["chunk_count"] >= 2
+    assert any(c["type"] == "text" for c in rec["chunks"])
+    # 프롬프트 본문 redact
+    assert "SECRET-PROMPT" not in json.dumps(rec["argv"])
+    # stderr 동시 드레인되어 trace 에 담김
+    assert "mcp connected" in rec["stderr"]
 
 
 def test_run_stream_template_normal_sequence(monkeypatch):

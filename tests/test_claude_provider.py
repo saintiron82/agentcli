@@ -4,6 +4,11 @@ from agentcli.providers.claude import ClaudeProvider
 from agentcli.types import Message
 
 
+def _sync(stdout="", stderr="", rc=0, timed_out=False):
+    """run_subprocess_sync 반환 계약 ``(stdout, stderr, rc, timed_out)`` 생성."""
+    return (stdout.encode("utf-8"), stderr.encode("utf-8"), rc, timed_out)
+
+
 def test_is_available_found():
     with patch("shutil.which", return_value="/usr/bin/claude"):
         p = ClaudeProvider()
@@ -60,13 +65,11 @@ def test_provider_id():
     assert p.stores_history is False
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_success(mock_find, mock_run):
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout='{"result":"응답입니다","usage":{"input_tokens":300,"output_tokens":200}}',
-        stderr="")
+    mock_run.return_value = _sync(
+        stdout='{"result":"응답입니다","usage":{"input_tokens":300,"output_tokens":200}}')
     p = ClaudeProvider()
     resp = p.invoke([Message(role="user", content="hello")])
     assert resp.content == "응답입니다"
@@ -82,13 +85,11 @@ def test_invoke_success(mock_find, mock_run):
     assert "--session-id" in cmd
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_marks_claude_prompt_usage_as_provider_reported(mock_find, mock_run):
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout='{"result":"응답입니다","usage":{"input_tokens":6,"output_tokens":2}}',
-        stderr="")
+    mock_run.return_value = _sync(
+        stdout='{"result":"응답입니다","usage":{"input_tokens":6,"output_tokens":2}}')
     p = ClaudeProvider()
 
     resp = p.invoke([Message(role="user", content="longer user prompt than six tokens")])
@@ -99,13 +100,12 @@ def test_invoke_marks_claude_prompt_usage_as_provider_reported(mock_find, mock_r
     assert resp.tokens.prompt_tokens_source == "claude_cli_reported"
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_session_id_ignored_in_stateless_mode(mock_find, mock_run):
     """issue #4: Windows(stateless) 모드는 외부 session_id를 받아도 `--resume`
     하지 않고 새 식별자를 발급한다 (hang 우회)."""
-    mock_run.return_value = MagicMock(
-        returncode=0, stdout='{"result":"ok"}', stderr="")
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
     p = ClaudeProvider()
     p.supports_sessions = False  # Windows 모드 시뮬레이션
     resp = p.invoke([Message(role="user", content="hi")], session_id="abc-123")
@@ -115,12 +115,11 @@ def test_invoke_session_id_ignored_in_stateless_mode(mock_find, mock_run):
     assert resp.session_id and resp.session_id != "abc-123"
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_resumes_session(mock_find, mock_run):
     """세션 모드: 저장된 session_id로 `--resume`, 동일 sid를 반환."""
-    mock_run.return_value = MagicMock(
-        returncode=0, stdout='{"result":"ok"}', stderr="")
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
     p = ClaudeProvider()
     p.supports_sessions = True
     resp = p.invoke([Message(role="user", content="hi")],
@@ -132,15 +131,12 @@ def test_invoke_resumes_session(mock_find, mock_run):
     assert resp.session_id == "abc-123"
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_stale_session_auto_recovers(mock_find, mock_run):
     """만료된 sid resume 실패 시 새 세션으로 1회 자동 재시도."""
-    stale = MagicMock(
-        returncode=1, stdout="",
-        stderr="No conversation found with session ID: abc-123")
-    fresh = MagicMock(
-        returncode=0, stdout='{"result":"recovered"}', stderr="")
+    stale = _sync(stderr="No conversation found with session ID: abc-123", rc=1)
+    fresh = _sync(stdout='{"result":"recovered"}')
     mock_run.side_effect = [stale, fresh]
     p = ClaudeProvider()
     p.supports_sessions = True
@@ -154,12 +150,11 @@ def test_invoke_stale_session_auto_recovers(mock_find, mock_run):
     assert "--session-id" in retry_cmd
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_other_failure_not_retried(mock_find, mock_run):
     """stale-session 외의 실패는 재시도 없이 그대로 에러 반환."""
-    mock_run.return_value = MagicMock(
-        returncode=1, stdout="", stderr="usage limit reached")
+    mock_run.return_value = _sync(stderr="usage limit reached", rc=1)
     p = ClaudeProvider()
     p.supports_sessions = True
     resp = p.invoke([Message(role="user", content="hi")],
@@ -169,23 +164,22 @@ def test_invoke_other_failure_not_retried(mock_find, mock_run):
     assert mock_run.call_count == 1
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_non_json_stdout_fallback(mock_find, mock_run):
     """JSON 파싱 실패 시 stdout 전체를 content로 취급 (하위 호환)."""
-    mock_run.return_value = MagicMock(
-        returncode=0, stdout="plain text response", stderr="")
+    mock_run.return_value = _sync(stdout="plain text response")
     p = ClaudeProvider()
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == "plain text response"
     assert resp.tokens.total_tokens == 0
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_cwd_and_tools(mock_find, mock_run):
     """cwd + allowed_tools/disallowed_tools 전달 검증."""
-    mock_run.return_value = MagicMock(returncode=0, stdout='{"result":"ok"}', stderr="")
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
     p = ClaudeProvider(
         permission_mode="default",
         allowed_tools=["Read", "Grep"],
@@ -205,15 +199,87 @@ def test_invoke_cwd_and_tools(mock_find, mock_run):
     assert kwargs.get("cwd") == "/repo"
 
 
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_lean_strips_harness(mock_find, mock_run):
+    """lean=True 는 단일 completion 용으로 커스터마이즈+빌트인 툴을 모두 끊는다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    p = ClaudeProvider(lean=True)
+    p.invoke([Message(role="user", content="요약해줘")])
+    cmd = mock_run.call_args[0][0]
+    # 모든 커스터마이즈(CLAUDE.md/skills/plugins/hooks/MCP/custom agents) 비활성화
+    assert "--safe-mode" in cmd
+    # 빌트인 툴 전부 비활성화: --tools "" (allowed_tools 미지정 시)
+    assert "--tools" in cmd
+    assert cmd[cmd.index("--tools") + 1] == ""
+    # MCP/툴 허용·거부 플래그는 lean 에서 붙지 않는다
+    assert "--mcp-config" not in cmd
+    assert "--allowedTools" not in cmd
+    assert "--disallowedTools" not in cmd
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_lean_keeps_explicit_tools(mock_find, mock_run):
+    """lean + allowed_tools 명시 → 그 빌트인 툴만 --tools 로 남긴다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    p = ClaudeProvider(lean=True, allowed_tools=["Read", "Grep"])
+    p.invoke([Message(role="user", content="hi")])
+    cmd = mock_run.call_args[0][0]
+    assert "--safe-mode" in cmd
+    assert "--tools" in cmd
+    assert cmd[cmd.index("--tools") + 1] == "Read,Grep"
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_lean_per_call_override(mock_find, mock_run):
+    """생성자 기본이 lean=False 여도 호출 시 lean=True 로 켤 수 있다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    p = ClaudeProvider()  # 기본 lean=False
+    p.invoke([Message(role="user", content="hi")])
+    assert "--safe-mode" not in mock_run.call_args[0][0]
+    p.invoke([Message(role="user", content="hi")], lean=True)
+    assert "--safe-mode" in mock_run.call_args[0][0]
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_debug_adds_flag_and_writes_trace(mock_find, mock_run, tmp_path):
+    """debug=True 는 --debug 를 붙이고, debug_log_path 에 redact 된 trace 를 남긴다."""
+    import json as _json
+    mock_run.return_value = _sync(stdout='{"result":"ok"}', stderr="mcp connect...\n")
+    trace = tmp_path / "trace.jsonl"
+    p = ClaudeProvider(debug=True, debug_log_path=str(trace))
+    p.invoke([Message(role="user", content="비밀프롬프트요약")])
+    cmd = mock_run.call_args[0][0]
+    assert "--debug" in cmd
+    assert trace.exists()
+    rec = _json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "invoke"
+    assert rec["returncode"] == 0
+    # argv 의 프롬프트 본문은 redact 되어 원문이 노출되지 않아야 한다
+    assert any("<prompt:" in str(a) for a in rec["argv"])
+    assert "비밀프롬프트요약" not in _json.dumps(rec["argv"], ensure_ascii=False)
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_debug_off_no_flag(mock_find, mock_run):
+    """기본(debug=False)은 --debug 를 붙이지 않는다 — 기존 동작 불변."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    ClaudeProvider().invoke([Message(role="user", content="hi")])
+    assert "--debug" not in mock_run.call_args[0][0]
+
+
 def test_invoke_async_via_base_fallback():
     """base 기본 구현: invoke_async는 to_thread로 동기 invoke를 실행."""
     import asyncio
     from unittest.mock import patch, MagicMock
-    with patch("agentcli.providers.claude.subprocess.run") as mock_run, \
+    with patch("agentcli.providers.claude.run_subprocess_sync") as mock_run, \
          patch("agentcli.providers.claude.ClaudeProvider._find_binary",
                return_value="/usr/bin/claude"):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout='{"result":"async-ok"}', stderr="")
+        mock_run.return_value = _sync(stdout='{"result":"async-ok"}')
         # 직접 async 함수를 테스트: Claude는 invoke_async 오버라이드했지만
         # asyncio.create_subprocess_exec 모킹이 까다로우니 여기서는
         # 기본 fallback이 아닌 진짜 async 경로는 integration 단에서 검증.
@@ -223,10 +289,10 @@ def test_invoke_async_via_base_fallback():
         assert resp.content == "async-ok"
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_with_model(mock_find, mock_run):
-    mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    mock_run.return_value = _sync(stdout="ok")
     p = ClaudeProvider()
     p.invoke([Message(role="user", content="hi")], model="sonnet")
     cmd = mock_run.call_args[0][0]
@@ -235,14 +301,14 @@ def test_invoke_with_model(mock_find, mock_run):
     assert cmd[idx + 1] == "sonnet"
 
 
-@patch("agentcli.providers.claude.subprocess.run")
+@patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
     """provider 는 받은 메시지를 충실히 직렬화한다 — 세션 모드에서 이전 턴이
     프롬프트에 안 들어가는 것은 client 가 [system?, user] 만 담는 것으로
     보장된다 (test_session_routing). 명시 주입(inject_context)분은 Context
     블록으로 전달되어야 한다."""
-    mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    mock_run.return_value = _sync(stdout="ok")
     p = ClaudeProvider()
     p.invoke([
         Message(role="system", content="Follow GUIDE v2"),
@@ -257,7 +323,8 @@ def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
     assert "[user:bull] injected note" in prompt
 
 
-@patch("agentcli.providers.claude.subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 120))
+@patch("agentcli.providers.claude.run_subprocess_sync",
+       return_value=(b"", b"timeout after 120s", 124, True))
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_timeout(mock_find, mock_run):
     p = ClaudeProvider()
