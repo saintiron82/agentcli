@@ -1,12 +1,12 @@
-"""프로세스 그룹 teardown 회귀 테스트 (좀비/고아 손자 방지).
+"""프로세스 그룹 teardown 회귀 테스트 (좀비 손자 방지).
 
 확인된 원인: CLI(claude 등)가 띄운 MCP 서버·hook **손자** 프로세스는 직속
-자식만 kill 하면 고아로 남아 누적된다. ``run_subprocess_sync`` /
-``run_subprocess_async`` 는 새 세션(프로세스 그룹)으로 띄운 뒤 타임아웃 시
-그룹 전체를 killpg 하여 손자까지 reap 해야 한다.
+자식만 kill 하면 좀비로 남아 누적된다. ``run_subprocess_sync`` /
+``run_subprocess_async`` / 스트리밍 ``_run_stream_template`` 은 새 세션(프로세스
+그룹)으로 띄운 뒤 타임아웃 시 그룹 전체를 killpg 하여 손자까지 reap 해야 한다.
 
-재현 모델: ``sh -c 'sleep <tag> & exit 0'`` — 직속 sh 는 즉시 종료하지만
-백그라운드 손자 ``sleep`` 이 stdout 파이프를 물고 살아남는다(=고아).
+재현 모델: ``sh -c 'sleep <tag> & ...'`` — 직속 sh 의 백그라운드 손자
+``sleep`` 이 stdout 파이프를 물고 살아남는다(=좀비 잔여 프로세스).
 """
 from __future__ import annotations
 
@@ -17,13 +17,15 @@ import time
 
 import pytest
 
-from agentcli.providers.base import run_subprocess_async, run_subprocess_sync
+from agentcli.providers.base import (StreamState, run_subprocess_async,
+                                     run_subprocess_sync)
+from agentcli.providers.claude import ClaudeProvider
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="process-group teardown is POSIX-only")
 
 
-def _orphan_alive(tag: str) -> bool:
+def _zombie_alive(tag: str) -> bool:
     r = subprocess.run(["pgrep", "-f", f"sleep {tag}"],
                        capture_output=True, text=True)
     return bool([p for p in r.stdout.split() if p])
@@ -41,7 +43,7 @@ def test_run_subprocess_sync_reaps_grandchild():
             ["sh", "-c", f"sleep {tag} & exit 0"], timeout=1)
         assert timed is True
         time.sleep(0.4)
-        assert not _orphan_alive(tag), "그룹 kill 후 고아 sleep 손자가 남으면 안 됨"
+        assert not _zombie_alive(tag), "그룹 kill 후 좀비 sleep 손자가 남으면 안 됨"
     finally:
         _cleanup(tag)
 
@@ -58,6 +60,34 @@ def test_run_subprocess_async_reaps_grandchild():
         _out, _err, _rc, timed = asyncio.run(run())
         assert timed is True
         time.sleep(0.4)
-        assert not _orphan_alive(tag)
+        assert not _zombie_alive(tag)
+    finally:
+        _cleanup(tag)
+
+
+def test_run_stream_template_reaps_grandchild():
+    """스트리밍 경로(_run_stream_template)도 idle 타임아웃 시 그룹 전체 killpg.
+
+    직속 sh 가 foreground ``sleep`` 으로 살아있고 stdout 출력이 없어 idle
+    timeout 이 걸린다 → ``_kill_process_group`` 이 그룹을 SIGKILL → 백그라운드
+    손자 ``sleep <tag>`` 까지 reap. (mock proc 테스트는 .pid 가 없어 killpg
+    분기를 타지 못하므로, 실제 손자로 스트리밍 분기를 검증한다.)
+    """
+    tag = "9182733"
+    prov = ClaudeProvider()
+
+    async def run():
+        chunks = []
+        async for c in prov._run_stream_template(
+                ["sh", "-c", f"sleep {tag} & sleep 10"],
+                StreamState(), timeout=1):
+            chunks.append(c)
+        return chunks
+
+    try:
+        chunks = asyncio.run(run())
+        assert any(c.type == "error" for c in chunks), "idle timeout error chunk 기대"
+        time.sleep(0.4)
+        assert not _zombie_alive(tag), "스트리밍 그룹 kill 후 좀비 손자가 남으면 안 됨"
     finally:
         _cleanup(tag)

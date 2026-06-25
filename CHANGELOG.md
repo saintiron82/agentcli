@@ -21,7 +21,7 @@
   `provider_options`. Default `False`.
 
 ### Fixed
-- **Orphaned grandchild processes ("zombie" accumulation).** A CLI spawns its
+- **Zombie grandchild-process accumulation.** A CLI spawns its
   own children (MCP servers, hooks, node helpers). Killing only the direct
   child on timeout/cleanup left those grandchildren running — and a grandchild
   holding the stdout pipe could even wedge `subprocess.run`'s post-timeout
@@ -29,7 +29,8 @@
   down the **whole group** via `os.killpg(SIGKILL)` on timeout/cancel/early-exit
   (POSIX; Windows falls back to direct kill). New `run_subprocess_sync` replaces
   `subprocess.run` in `ClaudeProvider.invoke` for the same group teardown +
-  `stdin=DEVNULL`. Verified with deterministic repro tests (sync + async).
+  `stdin=DEVNULL`. Verified with deterministic repro tests (sync + async +
+  streaming).
 
 ### Notes
 - `lean`/`debug` are Claude-specific (they map to Claude Code flags). The
@@ -312,7 +313,7 @@ First release under the `agentcli` name (previously internal `libs.llm`). Major 
 
 ### Changed
 - **No more history re-injection for session providers.** Prior `prev_messages` rolling-context injection (which duplicated what the CLI session already held) is removed. Non-session providers still serialize history if/when added.
-- **Atomic store writes**: failed calls leave no residue (no orphaned user messages in conversation history).
+- **Atomic store writes**: failed calls leave no residue (no unreferenced user messages in conversation history).
 - **Default fallback order**: `["claude", "copilot", "codex"]` (session-first, full-auto last).
 - **Claude uses `--output-format json`** and parses `usage.input_tokens` / `output_tokens` directly instead of stderr regex.
 - **Codex uses `--output-format json`** event stream parsing; `cached_input_tokens` flows into `TokenUsage.cached_tokens`.

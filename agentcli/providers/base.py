@@ -26,7 +26,7 @@ def _new_session_kwargs() -> dict:
 
 def _kill_process_group(proc) -> None:
     """spawn 된 프로세스의 **그룹 전체**를 SIGKILL — 직속 자식만 죽이면 CLI 가
-    띄운 MCP 서버·hook 손자가 고아로 남아 누적된다 (확인된 좀비 원인).
+    띄운 MCP 서버·hook 손자가 좀비로 남아 누적된다 (확인된 좀비 원인).
 
     ``start_new_session=True`` 로 띄웠으므로 자식 PID == PGID. ``getpgid`` 는
     자식이 먼저 종료하면 race 로 실패하므로 ``proc.pid`` 를 PGID 로 직접 쓴다.
@@ -568,7 +568,7 @@ async def run_subprocess_async(
             proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         # 타임아웃이면 직속 자식이 이미 종료했어도(손자가 파이프를 물고 행)
-        # 그룹 전체를 무조건 kill — returncode 가드로 건너뛰면 손자가 고아로
+        # 그룹 전체를 무조건 kill — returncode 가드로 건너뛰면 손자가 좀비로
         # 남는다 (test_process_group 회귀).
         _kill_process_group(proc)
         return b"", f"timeout after {timeout}s".encode(), 124, True
@@ -592,7 +592,7 @@ def run_subprocess_sync(
     """Synchronous subprocess with process-group teardown.
 
     ``subprocess.run`` 의 타임아웃 정리는 **직속 자식만** kill 하므로, CLI 가
-    띄운 MCP 서버·hook 손자가 고아로 남아 누적된다 (확인된 좀비 원인). 또한
+    띄운 MCP 서버·hook 손자가 좀비로 남아 누적된다 (확인된 좀비 원인). 또한
     손자가 stdout 파이프를 물고 있으면 정리 단계의 재-communicate 가 매달릴
     수 있다. 이를 막기 위해 ``Popen(start_new_session=True)`` 로 새 그룹에
     띄우고, 타임아웃/정리 시 ``killpg`` 로 **그룹 전체**를 죽인다. stdin 은
