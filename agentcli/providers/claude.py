@@ -545,37 +545,47 @@ class ClaudeProvider(LLMProvider):
                               session_id=state.final_session_id)
         elif etype == "stream_event":
             ev = evt.get("event") or {}
-            if ev.get("type") == "content_block_delta":
+            evtype = ev.get("type")
+            if evtype == "message_start":
+                # 새 메시지: delta-seen 플래그 리셋 → 뒤따르는 전체 assistant
+                # 블록 skip 여부를 이 메시지의 델타 수신 여부로만 판단한다.
+                state.extra["saw_text_delta"] = False
+                state.extra["saw_thinking_delta"] = False
+            elif evtype == "content_block_delta":
                 delta = ev.get("delta") or {}
                 dtype = delta.get("type")
                 if dtype == "text_delta":
                     text = delta.get("text", "")
                     if text:
+                        state.extra["saw_text_delta"] = True
                         state.text_parts.append(text)
                         yield StreamChunk(type="text", content=text, data=delta)
                 elif dtype == "thinking_delta":
                     thinking = delta.get("thinking", "")
                     if thinking:
+                        state.extra["saw_thinking_delta"] = True
                         yield StreamChunk(type="thinking",
                                           content=thinking, data=delta)
                 # input_json_delta(툴 인자 부분 JSON) 등은 무시 — 전체 tool_use
                 # 블록을 assistant 이벤트에서 받는다.
-            # message_start/stop, content_block_start/stop, message_delta 는
-            # 내부 프로토콜 프레이밍 — 스트림 청크로 흘리지 않는다.
+            # content_block_start/stop, message_delta/stop 는 내부 프로토콜
+            # 프레이밍 — 스트림 청크로 흘리지 않는다.
         elif etype == "assistant":
             msg = evt.get("message") or {}
             for block in msg.get("content") or []:
                 btype = block.get("type")
                 if btype == "text":
-                    # partial: 이미 text_delta 로 증분 스트리밍됨 → 중복 방지.
-                    if partial:
+                    # partial: 델타로 이미 스트리밍됐을 때만 skip(중복 방지).
+                    # 델타가 한 번도 안 왔으면 전체 블록을 fallback 으로 방출 —
+                    # 안 그러면 텍스트가 조용히 유실된다(merge-gate 회귀).
+                    if partial and state.extra.get("saw_text_delta"):
                         continue
                     text = block.get("text", "")
                     if text:
                         state.text_parts.append(text)
                         yield StreamChunk(type="text", content=text, data=block)
                 elif btype == "thinking":
-                    if partial:
+                    if partial and state.extra.get("saw_thinking_delta"):
                         continue
                     yield StreamChunk(type="thinking",
                                       content=block.get("thinking", ""),

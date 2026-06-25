@@ -57,6 +57,70 @@ def test_stream_partial_messages_incremental_text(monkeypatch):
     assert done.content == "Hello", "done content == 델타 합"
 
 
+def test_stream_partial_no_delta_falls_back_to_full_block(monkeypatch):
+    """partial=True 인데 델타 없이 전체 assistant 블록만 오면 텍스트를 유실하지
+    않고 fallback 으로 방출한다 (merge-gate Important 회귀)."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        # text_delta 가 한 번도 안 옴 — 전체 블록만 도착
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "WHOLE answer"}]}},
+        {"type": "result", "subtype": "success", "result": "WHOLE answer",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    texts = [c.content for c in chunks if c.type == "text"]
+    assert texts == ["WHOLE answer"], f"델타 없으면 전체 블록 fallback 필요, got {texts}"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "WHOLE answer", "텍스트 유실 금지"
+
+
+def test_stream_partial_thinking_and_message_start_reset(monkeypatch):
+    """partial: thinking_delta 는 thinking 청크로(텍스트 합엔 미포함), 그리고
+    message_start 가 delta-seen 플래그를 리셋한다."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "thinking_delta", "thinking": "hmm"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "ans"}}},
+        # 전체 블록 — thinking/text 모두 델타로 왔으니 중복 방출 금지
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "text", "text": "ans"}]}},
+        {"type": "result", "subtype": "success", "result": "ans",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    assert [c.content for c in chunks if c.type == "thinking"] == ["hmm"]
+    assert [c.content for c in chunks if c.type == "text"] == ["ans"]
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "ans", "thinking 은 최종 content 에 포함되지 않는다"
+
+
 def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
     """debug=True: 청크 타임라인 + redact argv + stderr 를 trace 파일로 기록."""
     import json

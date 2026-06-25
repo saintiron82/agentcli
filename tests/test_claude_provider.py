@@ -283,6 +283,10 @@ def test_build_cmd_partial_messages_flag(mock_find):
     # 비스트리밍 json 에는 절대 붙지 않는다
     cmd3, _ = p._build_cmd("hi", "", "", "json", partial_messages=True)
     assert "--include-partial-messages" not in cmd3
+    # 생성자 기본 상속: 호출 시 partial_messages 미지정(None) → self 값 사용
+    cmd4, _ = ClaudeProvider(partial_messages=True)._build_cmd(
+        "hi", "", "", "stream-json")
+    assert "--include-partial-messages" in cmd4
 
 
 def test_invoke_async_via_base_fallback():
