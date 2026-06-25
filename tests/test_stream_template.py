@@ -121,6 +121,45 @@ def test_stream_partial_thinking_and_message_start_reset(monkeypatch):
     assert done.content == "ans", "thinking 은 최종 content 에 포함되지 않는다"
 
 
+def test_stream_partial_with_tool_use_interleave(monkeypatch):
+    """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
+    는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "Use tool"}}},
+        # 전체 블록: text(델타로 이미 옴 → skip) + tool_use(전체 블록에서 방출)
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Use tool"},
+            {"type": "tool_use", "name": "Read", "id": "t1", "input": {}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+        {"type": "result", "subtype": "success", "result": "Use tool",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    assert [c.content for c in chunks if c.type == "text"] == ["Use tool"]
+    assert sum(1 for c in chunks if c.type == "tool_use") == 1
+    assert sum(1 for c in chunks if c.type == "tool_result") == 1
+    # 청크 순서: text → tool_use → tool_result
+    seq = [c.type for c in chunks if c.type in ("text", "tool_use", "tool_result")]
+    assert seq == ["text", "tool_use", "tool_result"]
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "Use tool"
+
+
 def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
     """debug=True: 청크 타임라인 + redact argv + stderr 를 trace 파일로 기록."""
     import json

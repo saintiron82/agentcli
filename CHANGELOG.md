@@ -28,6 +28,11 @@
   `assistant` block to avoid double-counting. Live A/B (12s generation): first
   token ~12s → ~6s, 1 chunk → 28. Default `False` — block-level unchanged.
 
+- **`scripts/agentcli_ps.py` diagnostic.** Lists in-flight `claude -p` /
+  `codex exec` / `copilot -p` runs grouped by process group (leader + its
+  MCP/node children), flags `[long]` / `[residual]` / `[defunct]` groups, and
+  can `--kill <PGID>` a stuck one. Zero deps (stdlib + `ps`, POSIX).
+
 ### Fixed
 - **Zombie grandchild-process accumulation.** A CLI spawns its
   own children (MCP servers, hooks, node helpers). Killing only the direct

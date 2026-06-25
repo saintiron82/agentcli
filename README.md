@@ -521,6 +521,20 @@ async for chunk in client.chat_stream(prompt, provider="claude",
 `lean` / `debug` / `partial_messages` are Claude-specific; other providers
 ignore them on fallback.
 
+### Tracking running CLIs (diagnostics)
+
+Because each spawn runs in its own process group (0.6.2+), the bundled
+`scripts/agentcli_ps.py` lists in-flight `claude -p` / `codex exec` /
+`copilot -p` runs grouped by PGID — leader plus its children (MCP servers, node
+helpers) — and flags `[long]` / `[residual]` / `[defunct]` groups. Zero deps
+(stdlib + `ps`, POSIX):
+
+```bash
+python3 scripts/agentcli_ps.py                 # running agent groups
+python3 scripts/agentcli_ps.py --older-than 300  # only suspiciously long ones
+python3 scripts/agentcli_ps.py --kill <PGID>     # SIGKILL a stuck group
+```
+
 ## Testing
 
 ```bash
@@ -528,7 +542,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-418 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+442 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

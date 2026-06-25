@@ -152,6 +152,26 @@ def test_invoke_stale_session_auto_recovers(mock_find, mock_run):
 
 @patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_stale_retry_preserves_lean_and_debug(mock_find, mock_run, tmp_path):
+    """stale-session 자동 재시도가 lean/debug 를 재시도 커맨드에도 유지한다."""
+    mock_run.side_effect = [
+        _sync(stderr="No conversation found with session ID: abc-123", rc=1),
+        _sync(stdout='{"result":"ok"}'),
+    ]
+    p = ClaudeProvider(lean=True, debug=True,
+                       debug_log_path=str(tmp_path / "t.jsonl"))
+    p.supports_sessions = True
+    resp = p.invoke([Message(role="user", content="hi")], session_id="abc-123")
+    assert resp.content == "ok"
+    assert mock_run.call_count == 2
+    for call in mock_run.call_args_list:
+        cmd = call[0][0]
+        assert "--safe-mode" in cmd, "재시도에도 lean 유지"
+        assert "--debug" in cmd, "재시도에도 debug 유지"
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_invoke_other_failure_not_retried(mock_find, mock_run):
     """stale-session 외의 실패는 재시도 없이 그대로 에러 반환."""
     mock_run.return_value = _sync(stderr="usage limit reached", rc=1)
@@ -229,6 +249,31 @@ def test_invoke_lean_keeps_explicit_tools(mock_find, mock_run):
     assert "--safe-mode" in cmd
     assert "--tools" in cmd
     assert cmd[cmd.index("--tools") + 1] == "Read,Grep"
+
+
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_lean_ignores_mcp_and_disallowed_when_present(mock_find):
+    """lean 은 mcp_config/disallowed_tools 가 명시되어 있어도 무시한다(문서 계약).
+    --safe-mode 가 MCP 를 끄고 --tools 가 allowlist 이므로."""
+    p = ClaudeProvider(lean=True, disallowed_tools=["Bash"])
+    cmd, _ = p._build_cmd("hi", "", "", "stream-json",
+                          mcp_config={"pair": {"url": "https://x/mcp"}},
+                          strict_mcp_config=True)
+    assert "--safe-mode" in cmd
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
+    assert "--mcp-config" not in cmd
+    assert "--disallowedTools" not in cmd
+    assert "--strict-mcp-config" not in cmd
+
+
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_lean_and_debug_combined(mock_find):
+    """lean + debug 동시 → --safe-mode 와 --debug 가 함께 붙는다."""
+    cmd, _ = ClaudeProvider(lean=True, debug=True)._build_cmd(
+        "hi", "", "", "stream-json")
+    assert "--safe-mode" in cmd
+    assert "--debug" in cmd
+    assert "--tools" in cmd
 
 
 @patch("agentcli.providers.claude.run_subprocess_sync")

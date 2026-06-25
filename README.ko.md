@@ -293,6 +293,19 @@ async for chunk in client.chat_stream(prompt, provider="claude",
 
 `lean`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
 
+### 실행 중인 CLI 추적 (진단)
+
+각 호출이 자기 프로세스 그룹으로 도므로(0.6.2+), 동봉된 `scripts/agentcli_ps.py`
+가 진행 중인 `claude -p` / `codex exec` / `copilot -p` 를 PGID 단위(리더 + 자식
+MCP 서버·node 헬퍼)로 묶어 보여주고 `[long]`/`[residual]`/`[defunct]` 그룹을
+표시한다. 의존성 0 (stdlib + `ps`, POSIX):
+
+```bash
+python3 scripts/agentcli_ps.py                  # 실행 중인 agent 그룹
+python3 scripts/agentcli_ps.py --older-than 300 # 의심스럽게 오래된 것만
+python3 scripts/agentcli_ps.py --kill <PGID>    # 멈춘 그룹 SIGKILL
+```
+
 ## Provider 기능 비교
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
@@ -313,7 +326,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 418개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 442개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 

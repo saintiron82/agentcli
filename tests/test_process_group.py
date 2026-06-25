@@ -25,6 +25,36 @@ pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="process-group teardown is POSIX-only")
 
 
+def test_run_subprocess_sync_happy_path_returns_streams_and_rc():
+    out, err, rc, timed = run_subprocess_sync(
+        ["sh", "-c", "printf out; printf err >&2; exit 3"], timeout=5)
+    assert out == b"out"
+    assert err == b"err"
+    assert rc == 3
+    assert timed is False
+
+
+def test_run_subprocess_sync_closes_stdin():
+    # stdin 이 DEVNULL 이면 cat 은 즉시 EOF → 행 없이 종료.
+    out, _err, _rc, timed = run_subprocess_sync(
+        ["sh", "-c", "cat; printf done"], timeout=5)
+    assert out == b"done"
+    assert timed is False
+
+
+def test_run_subprocess_sync_missing_binary_raises():
+    with pytest.raises(FileNotFoundError):
+        run_subprocess_sync(["/no/such/binary_xyz123"], timeout=2)
+
+
+def test_run_subprocess_async_happy_path():
+    async def run():
+        return await run_subprocess_async(
+            ["sh", "-c", "printf hi; exit 0"], timeout=5)
+    out, _err, rc, timed = asyncio.run(run())
+    assert out == b"hi" and rc == 0 and timed is False
+
+
 def _zombie_alive(tag: str) -> bool:
     r = subprocess.run(["pgrep", "-f", f"sleep {tag}"],
                        capture_output=True, text=True)
