@@ -84,7 +84,8 @@ class ClaudeProvider(LLMProvider):
                  disallowed_tools: list[str] | None = None,
                  lean: bool = False,
                  debug: bool = False,
-                 debug_log_path: str | None = None):
+                 debug_log_path: str | None = None,
+                 partial_messages: bool = False):
         """
         Args:
             permission_mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` 중 하나.
@@ -109,6 +110,12 @@ class ClaudeProvider(LLMProvider):
             debug_log_path: 지정 시 debug 모드의 구조화 trace(JSON Lines:
                 redact 된 argv·청크 타임라인·stderr·총 소요)를 이 파일에 append.
                 20분 행을 재현한 뒤 이 파일 하나로 원인을 파악한다.
+            partial_messages: 스트리밍 전용. True 면 stream-json 에
+                ``--include-partial-messages`` 를 붙여 Claude 가 토큰 단위 델타
+                (``content_block_delta``/``text_delta``·``thinking_delta``)를
+                내보내게 한다. ``stream_async`` 가 이를 증분 ``text``/``thinking``
+                청크로 흘려, 단일 긴 생성도 토큰이 실시간으로 나온다(기본은 메시지
+                블록 단위). invoke(비스트리밍)에는 영향 없음. 기본 False.
         """
         self._permission_mode = permission_mode
         self._allowed_tools = allowed_tools
@@ -116,6 +123,7 @@ class ClaudeProvider(LLMProvider):
         self._lean = lean
         self._debug = debug
         self._debug_log_path = debug_log_path
+        self._partial_messages = partial_messages
 
     def _find_binary(self) -> str | None:
         executable = "claude.cmd" if platform.system() == "Windows" else "claude"
@@ -179,7 +187,8 @@ class ClaudeProvider(LLMProvider):
                    mcp_config: dict | str | None = None,
                    strict_mcp_config: bool = False,
                    lean: bool | None = None,
-                   debug: bool | None = None) -> tuple[list[str] | None, str]:
+                   debug: bool | None = None,
+                   partial_messages: bool | None = None) -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
         permission_mode/allowed_tools/disallowed_tools/mcp_config/lean 은 호출
@@ -199,6 +208,8 @@ class ClaudeProvider(LLMProvider):
                   else self._disallowed_tools)
         use_lean = self._lean if lean is None else lean
         use_debug = self._debug if debug is None else debug
+        use_partial = (self._partial_messages if partial_messages is None
+                       else partial_messages)
 
         cmd = [bin_path, "-p", prompt,
                "--output-format", output_format,
@@ -206,6 +217,9 @@ class ClaudeProvider(LLMProvider):
         if output_format == "stream-json":
             # stream-json은 반드시 --verbose 필요 (Claude Code 제약)
             cmd.append("--verbose")
+            if use_partial:
+                # 토큰 단위 델타(content_block_delta/text_delta) 방출.
+                cmd.append("--include-partial-messages")
         if use_debug:
             # claude 내부(MCP 연결/툴 호출/API 왕복) 로그를 stderr 로 끌어낸다.
             cmd.append("--debug")
@@ -450,7 +464,8 @@ class ClaudeProvider(LLMProvider):
                            disallowed_tools: list[str] | None = None,
                            lean: bool | None = None,
                            debug: bool | None = None,
-                           debug_log_path: str | None = None) -> AsyncIterator[StreamChunk]:
+                           debug_log_path: str | None = None,
+                           partial_messages: bool | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -466,6 +481,8 @@ class ClaudeProvider(LLMProvider):
         prompt = build_session_prompt(messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
+        use_partial = (self._partial_messages if partial_messages is None
+                       else partial_messages)
         # 만료된 session_id 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다. 어떤 출력이든
         # caller 에 전달된 뒤에는 재시도하지 않는다.
@@ -475,7 +492,8 @@ class ClaudeProvider(LLMProvider):
                 prompt, model, attempt_sid, "stream-json",
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug)
+                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                partial_messages=use_partial)
             if cmd is None:
                 yield StreamChunk(type="error", content="Claude CLI not found")
                 return
@@ -485,6 +503,9 @@ class ClaudeProvider(LLMProvider):
                     payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
                     prompt_tokens_reliable=False,
                     prompt_tokens_source="claude_cli_reported"))
+            # partial 모드: assistant 전체 블록 text/thinking 를 건너뛰고 델타로만
+            # 누적·방출한다 (이중 집계 방지). _dispatch_stream_event 가 참조.
+            state.extra["partial"] = use_partial
             retry_stale = False
             emitted = False
             async for chunk in self._run_stream_template(
@@ -507,22 +528,55 @@ class ClaudeProvider(LLMProvider):
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:
-        """Claude Code event 정규화 — text / thinking / tool_use / tool_result / event."""
+        """Claude Code event 정규화 — text / thinking / tool_use / tool_result / event.
+
+        ``--include-partial-messages`` 사용 시 Claude 는 토큰 델타를
+        ``{"type":"stream_event","event":{"type":"content_block_delta",
+        "delta":{"type":"text_delta","text":...}}}`` 로 내보낸다. 이때는 델타로
+        증분 방출하고, 뒤따르는 전체 ``assistant`` 블록의 text/thinking 는
+        건너뛴다(``state.extra["partial"]`` 가드) — 같은 내용을 두 번 세지 않기
+        위함. tool_use 는 (델타가 부분 JSON 이라) 전체 assistant 블록을 쓴다.
+        """
         etype = evt.get("type", "")
+        partial = bool(state.extra.get("partial"))
         if etype == "system" and evt.get("session_id"):
             state.final_session_id = evt["session_id"]
             yield StreamChunk(type="event", data=evt,
                               session_id=state.final_session_id)
+        elif etype == "stream_event":
+            ev = evt.get("event") or {}
+            if ev.get("type") == "content_block_delta":
+                delta = ev.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        state.text_parts.append(text)
+                        yield StreamChunk(type="text", content=text, data=delta)
+                elif dtype == "thinking_delta":
+                    thinking = delta.get("thinking", "")
+                    if thinking:
+                        yield StreamChunk(type="thinking",
+                                          content=thinking, data=delta)
+                # input_json_delta(툴 인자 부분 JSON) 등은 무시 — 전체 tool_use
+                # 블록을 assistant 이벤트에서 받는다.
+            # message_start/stop, content_block_start/stop, message_delta 는
+            # 내부 프로토콜 프레이밍 — 스트림 청크로 흘리지 않는다.
         elif etype == "assistant":
             msg = evt.get("message") or {}
             for block in msg.get("content") or []:
                 btype = block.get("type")
                 if btype == "text":
+                    # partial: 이미 text_delta 로 증분 스트리밍됨 → 중복 방지.
+                    if partial:
+                        continue
                     text = block.get("text", "")
                     if text:
                         state.text_parts.append(text)
                         yield StreamChunk(type="text", content=text, data=block)
                 elif btype == "thinking":
+                    if partial:
+                        continue
                     yield StreamChunk(type="thinking",
                                       content=block.get("thinking", ""),
                                       data=block)

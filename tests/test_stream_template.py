@@ -23,6 +23,40 @@ from tests._stream_helpers import (
 # ============================================================
 
 
+def test_stream_partial_messages_incremental_text(monkeypatch):
+    """partial_messages: text_delta 로 증분 방출, 뒤따르는 전체 assistant 블록은
+    중복 집계하지 않는다."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "index": 0, "delta": {"type": "text_delta", "text": "lo"}}},
+        # 델타와 별개로 전체 assistant 블록도 뒤따라온다 — 중복되면 안 된다.
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Hello"}]}},
+        {"type": "result", "subtype": "success", "result": "Hello",
+         "usage": {"input_tokens": 3, "output_tokens": 2}, "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    texts = [c.content for c in chunks if c.type == "text"]
+    # 증분 델타만 text 청크로, 전체 블록 중복 없음
+    assert texts == ["Hel", "lo"], f"got {texts}"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "Hello", "done content == 델타 합"
+
+
 def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
     """debug=True: 청크 타임라인 + redact argv + stderr 를 trace 파일로 기록."""
     import json

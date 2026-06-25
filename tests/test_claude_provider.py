@@ -272,6 +272,19 @@ def test_invoke_debug_off_no_flag(mock_find, mock_run):
     assert "--debug" not in mock_run.call_args[0][0]
 
 
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_build_cmd_partial_messages_flag(mock_find):
+    """partial_messages 는 stream-json 에만 --include-partial-messages 를 붙인다."""
+    p = ClaudeProvider()
+    cmd, _ = p._build_cmd("hi", "", "", "stream-json", partial_messages=True)
+    assert "--include-partial-messages" in cmd
+    cmd2, _ = p._build_cmd("hi", "", "", "stream-json", partial_messages=False)
+    assert "--include-partial-messages" not in cmd2
+    # 비스트리밍 json 에는 절대 붙지 않는다
+    cmd3, _ = p._build_cmd("hi", "", "", "json", partial_messages=True)
+    assert "--include-partial-messages" not in cmd3
+
+
 def test_invoke_async_via_base_fallback():
     """base 기본 구현: invoke_async는 to_thread로 동기 invoke를 실행."""
     import asyncio

@@ -455,7 +455,8 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `lean`, `debug`, `debug_log_path`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
+  (streaming-only).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
   **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
@@ -503,7 +504,22 @@ async for chunk in client.chat_stream(prompt, provider="claude",
     ...
 ```
 
-`lean` / `debug` are Claude-specific; other providers ignore them on fallback.
+By default Claude's `stream-json` emits whole message blocks, so a single long
+completion arrives as one `text` chunk near the end. Pass
+`partial_messages=True` (streaming only) to add `--include-partial-messages` so
+Claude emits token-level `text_delta`/`thinking_delta` events — `chat_stream`
+then yields incremental `text`/`thinking` chunks (live A/B: a 12s generation's
+first token dropped from ~12s to ~6s, 1 chunk → 28).
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                      provider_options={"partial_messages": True}):
+    if chunk.type == "text":
+        print(chunk.content, end="", flush=True)   # token-by-token
+```
+
+`lean` / `debug` / `partial_messages` are Claude-specific; other providers
+ignore them on fallback.
 
 ## Testing
 
@@ -512,7 +528,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-414 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, process-group teardown, and Codex/Copilot JSONL parsing.
+416 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

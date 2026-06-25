@@ -19,6 +19,14 @@
   concurrently during streaming to avoid a `--debug` pipe-buffer deadlock.
   Threaded through `invoke`/`invoke_async`/`stream_async` and
   `provider_options`. Default `False`.
+- **Token-level streaming for Claude (`partial_messages=True`, streaming-only).**
+  By default Claude's `stream-json` emits whole message blocks, so a single
+  long completion arrives as one `text` chunk at the end. `partial_messages`
+  adds `--include-partial-messages`; `_dispatch_stream_event` maps the
+  resulting `content_block_delta` (`text_delta`/`thinking_delta`) events to
+  incremental `text`/`thinking` chunks, suppressing the trailing full
+  `assistant` block to avoid double-counting. Live A/B (12s generation): first
+  token ~12s → ~6s, 1 chunk → 28. Default `False` — block-level unchanged.
 
 ### Fixed
 - **Zombie grandchild-process accumulation.** A CLI spawns its

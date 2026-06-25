@@ -231,7 +231,8 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `lean`, `debug`, `debug_log_path`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
+  (스트리밍 전용).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
   `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
   형태** — `{name: {url, bearer_token_env_var?}}`(HTTP; 토큰은 inline 헤더가 아니라
@@ -276,7 +277,21 @@ async for chunk in client.chat_stream(prompt, provider="claude",
     ...
 ```
 
-`lean`/`debug` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
+기본적으로 Claude 의 `stream-json` 은 메시지 블록 단위로 방출하므로, 단일 긴
+completion 은 거의 끝에 `text` 청크 하나로 온다. `partial_messages=True`(스트리밍
+전용)를 주면 `--include-partial-messages` 가 붙어 Claude 가 토큰 단위
+`text_delta`/`thinking_delta` 를 내보내고, `chat_stream` 이 이를 증분 `text`/
+`thinking` 청크로 흘린다(라이브 A/B: 12초 생성의 첫 토큰이 ~12초 → ~6초, 청크
+1개 → 28개).
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                      provider_options={"partial_messages": True}):
+    if chunk.type == "text":
+        print(chunk.content, end="", flush=True)   # 토큰 단위
+```
+
+`lean`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
 
 ## Provider 기능 비교
 
@@ -298,7 +313,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 414개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 416개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
