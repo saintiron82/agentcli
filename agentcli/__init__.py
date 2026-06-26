@@ -16,7 +16,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from .types import (
     Message, Conversation, LLMResponse, TokenUsage, StreamChunk,
-    ProviderHealth, STREAM_CHUNK_TYPES,
+    ProviderHealth, ProviderCapabilities, STREAM_CHUNK_TYPES,
     make_error_chunk, standardize_error_chunk,
 )
 from .client import LLMClient
@@ -40,6 +40,7 @@ __all__ = [
     "__version__",
     "LLMClient",
     "LLMResponse", "Message", "Conversation", "TokenUsage", "ProviderHealth",
+    "ProviderCapabilities",
     "StreamChunk", "STREAM_CHUNK_TYPES",
     "make_error_chunk", "standardize_error_chunk",
     "LLMProvider", "ProviderRegistry", "create_default_registry",

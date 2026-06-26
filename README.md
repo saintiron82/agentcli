@@ -370,6 +370,28 @@ use: durable session handles and usage logs, not conversation history.
 
 ## Provider capabilities
 
+Capabilities differ per provider **and per OS** (e.g. claude has no sessions on
+Windows). Query them before calling instead of guessing — the controller is the
+source of truth for "does this feature work on this provider here?":
+
+```python
+client.capabilities("claude")          # ProviderCapabilities (OS-aware)
+client.supports("codex", "lean")       # False — lean is claude-only
+client.capability_matrix()             # {provider: {...}} comparison table
+# Which passed options this provider will silently drop:
+client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
+# -> ["lean"]   (sandbox_mode is supported, lean is not)
+```
+
+| Capability | claude | codex | copilot | kiro |
+|---|---|---|---|---|
+| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
+| `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
+| claude-only options | `lean`, `debug`, `partial_messages` | — | — | — |
+
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
 | `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
@@ -558,7 +580,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-462 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+479 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

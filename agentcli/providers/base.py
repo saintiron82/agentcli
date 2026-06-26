@@ -180,6 +180,46 @@ class LLMProvider(ABC):
     # 히스토리를 소유하는 3-provider 는 False. 라이브러리가 컨텍스트를 직접
     # 관리해야 하는 custom 비세션 provider 만 True (기본값).
     stores_history: bool = True
+    # capability 선언 (provider 가 override). token_streaming=토큰 단위 델타,
+    # session_recovery=죽은 세션 자동 재개, session_liveness=session_alive 가
+    # bool 반환. capabilities() 가 이 플래그 + 시그니처 유래 옵션으로 조립.
+    supports_token_streaming: bool = False
+    supports_session_recovery: bool = False
+    supports_session_liveness: bool = False
+    # capabilities().options 에서 제외할 공통 호출 인자 (provider 고유 옵션만 남김).
+    _COMMON_CALL_ARGS = frozenset({
+        "self", "messages", "model", "timeout", "session_id", "cwd",
+        "alias", "resume_by_alias", "idle_timeout", "wall_timeout"})
+
+    def capabilities(self, *, capability_notes: str = "") -> "ProviderCapabilities":
+        """이 provider 가 현재 OS 에서 제공하는 기능 선언 (호출 전 질의용).
+
+        ``options`` 는 ``invoke``/``stream_async`` 시그니처에서 자동 유래 —
+        ``_supported_kwargs`` 와 같은 기준이라 "이 옵션이 이 provider 에서
+        먹히나?" 가 정확하다. ``supports_sessions`` 가 platform-conditional 인
+        claude 처럼 OS 에 따라 값이 달라진다.
+        """
+        import inspect
+        from ..types import ProviderCapabilities
+        opts: set[str] = set()
+        for mname in ("invoke", "stream_async"):
+            method = getattr(self, mname, None)
+            if method is None:
+                continue
+            for pname, p in inspect.signature(method).parameters.items():
+                if (pname not in self._COMMON_CALL_ARGS
+                        and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)):
+                    opts.add(pname)
+        return ProviderCapabilities(
+            provider=self.provider_id,
+            sessions=self.supports_sessions,
+            streaming=self.supports_streaming,
+            token_streaming=self.supports_token_streaming,
+            session_recovery=self.supports_session_recovery,
+            session_liveness=self.supports_session_liveness,
+            options=frozenset(opts),
+            notes=capability_notes,
+        )
 
     @abstractmethod
     def invoke(self, messages: list[Message], *,

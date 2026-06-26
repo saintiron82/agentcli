@@ -32,6 +32,16 @@
   `codex exec` / `copilot -p` runs grouped by process group (leader + its
   MCP/node children), flags `[long]` / `[residual]` / `[defunct]` groups, and
   can `--kill <PGID>` a stuck one. Zero deps (stdlib + `ps`, POSIX).
+- **Capability controller (`ProviderCapabilities` + client queries).** Features
+  differ per provider AND per OS; the controller declares them so callers can
+  check before calling instead of relying on silent option-dropping.
+  `LLMClient.capabilities(provider)` (OS-aware — claude has no `sessions` on
+  Windows), `supports(provider, feature)` (e.g. `supports("codex","lean")` →
+  False), `capability_matrix()` (comparison table), and
+  `unsupported_options(provider, opts)` (which passed keys this provider drops).
+  Each provider declares `supports_token_streaming` / `supports_session_recovery`
+  / `supports_session_liveness`; per-call options are auto-derived from the
+  invoke/stream signatures (same basis as `_supported_kwargs`).
 - **Session liveness check (`session_alive`).** `LLMProvider.session_alive` +
   `LLMClient.session_alive(provider, owner=, alias=, cwd=)` report whether a
   stored session can still be resumed — without a full LLM call. claude checks

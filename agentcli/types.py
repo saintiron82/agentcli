@@ -195,6 +195,43 @@ class ProviderHealth:
         }
 
 
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """한 provider 가 (현재 OS 에서) 실제로 제공하는 기능 선언.
+
+    "이 기능이 이 provider 에서 되나?" 를 호출 전에 확실히 알기 위한 제어기.
+    provider 마다, 그리고 OS 마다 다르다 (예: claude 세션은 Windows 에서 False).
+    ``options`` 는 그 provider 의 호출이 받는 ``provider_options`` 키 집합 —
+    여기 없는 키는 ``_supported_kwargs`` 가 조용히 버린다.
+    """
+    provider: str
+    sessions: bool            # 세션 resume 지원 (claude 는 Windows 에서 False)
+    streaming: bool           # 증분 스트리밍
+    token_streaming: bool     # 토큰 단위 델타 (False = 메시지 블록 단위)
+    session_recovery: bool    # 죽은 세션 자동 재개
+    session_liveness: bool    # session_alive 가 bool 반환 (None=미지원 아님)
+    options: frozenset        # 받는 per-call provider_options 키
+    notes: str = ""           # OS 등 단서
+
+    def to_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "sessions": self.sessions,
+            "streaming": self.streaming,
+            "token_streaming": self.token_streaming,
+            "session_recovery": self.session_recovery,
+            "session_liveness": self.session_liveness,
+            "options": sorted(self.options),
+            "notes": self.notes,
+        }
+
+    def supports(self, feature: str) -> bool:
+        """기능 플래그 이름 또는 옵션 키 이름으로 지원 여부 질의."""
+        if feature in self.options:
+            return True
+        return bool(getattr(self, feature, False)) if hasattr(self, feature) else False
+
+
 @dataclass
 class Conversation:
     id: str

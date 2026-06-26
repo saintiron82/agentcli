@@ -59,6 +59,75 @@ def test_collect_groups_includes_agent_group_with_children_only():
     assert {p["pid"] for p in groups[100]} == {100, 101}, "리더 + 자식 모두 포함"
 
 
+def test_snapshot_parses_ps_output(monkeypatch):
+    fake = ("  100    50   100 01:02:03 Ss   /u/claude -p hi --output-format json\n"
+            "bad short line\n"
+            "  101   100   100 00:05 S     node mcp-server.js\n")
+    monkeypatch.setattr(ps.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": fake})())
+    procs = ps._snapshot()
+    pids = {p["pid"]: p for p in procs}
+    assert pids[100]["elapsed"] == 3723         # 01:02:03
+    assert pids[101]["elapsed"] == 5            # 00:05
+    assert pids[100]["ppid"] == 50 and pids[100]["pgid"] == 100
+    # 짧은/깨진 라인은 건너뛴다
+    assert all("bad short" not in p["args"] for p in procs)
+
+
+def test_render_groups_with_flags():
+    groups = {100: [
+        {"pid": 100, "ppid": 50, "pgid": 100, "elapsed": 700, "stat": "Ss",
+         "args": "/u/claude -p hi --output-format json"},
+        {"pid": 101, "ppid": 1, "pgid": 100, "elapsed": 5, "stat": "Z",
+         "args": "<defunct>"},
+    ]}
+    out = ps.render(groups, 600)
+    assert "PGID 100" in out
+    assert "claude" in out
+    assert "long" in out and "defunct" in out and "residual" in out
+
+
+def test_render_empty_message():
+    assert "없음" in ps.render({}, 600)
+
+
+def _one_agent_snapshot():
+    return [{"pid": 100, "ppid": 50, "pgid": 100, "elapsed": 3, "stat": "S",
+             "args": "/u/claude -p x --output-format json"}]
+
+
+def test_main_json_output(monkeypatch, capsys):
+    monkeypatch.setattr(ps, "_snapshot", _one_agent_snapshot)
+    rc = ps.main(["--json"])
+    assert rc == 0
+    import json
+    data = json.loads(capsys.readouterr().out)
+    assert "100" in data and data["100"][0]["pid"] == 100
+
+
+def test_main_older_than_filters_out_young(monkeypatch, capsys):
+    monkeypatch.setattr(ps, "_snapshot", _one_agent_snapshot)
+    rc = ps.main(["--older-than", "600"])   # 3s < 600 → 걸러짐
+    assert rc == 0
+    assert "PGID 100" not in capsys.readouterr().out
+
+
+def test_main_kill_sends_sigkill(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(ps.os, "killpg", lambda pg, sig: calls.append((pg, sig)))
+    rc = ps.main(["--kill", "123"])
+    assert rc == 0
+    assert calls and calls[0][0] == 123
+
+
+def test_main_kill_missing_group_returns_1(monkeypatch, capsys):
+    def boom(pg, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(ps.os, "killpg", boom)
+    rc = ps.main(["--kill", "999"])
+    assert rc == 1
+
+
 def test_flags_defunct_residual_long():
     thr = 600
     assert "defunct" in ps._flags(

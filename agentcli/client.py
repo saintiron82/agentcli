@@ -21,8 +21,9 @@ from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
-from .types import (Message, LLMResponse, ProviderHealth, TokenUsage,
-                    StreamChunk, make_error_chunk, standardize_error_chunk)
+from .types import (Message, LLMResponse, ProviderCapabilities, ProviderHealth,
+                    TokenUsage, StreamChunk, make_error_chunk,
+                    standardize_error_chunk)
 from .store.base import ConversationStore
 from .providers.registry import ProviderRegistry, create_default_registry
 
@@ -970,6 +971,47 @@ class LLMClient:
         if not sid:
             return False
         return p.session_alive(sid, cwd=cwd)
+
+    # ---------- capability 제어기 (어느 기능이 어느 provider 에서 되나) ----------
+
+    def capabilities(self, provider: str) -> ProviderCapabilities:
+        """provider 가 현재 OS 에서 제공하는 기능 선언. 호출 전 질의용.
+
+        OS 의존: 예컨대 claude 세션은 Windows 에서 ``sessions=False`` (issue #4).
+        """
+        p = self._registry.get(provider)
+        if p is None:
+            raise ValueError(f"unknown provider: {provider}")
+        notes = ""
+        if p.provider_id == "claude" and not p.supports_sessions:
+            notes = "Windows: stateless — `-p`+`--resume` 데드락 회피 (issue #4)"
+        return p.capabilities(capability_notes=notes)
+
+    def supports(self, provider: str, feature: str) -> bool:
+        """기능/옵션 지원 여부 (예: supports('codex','lean') → False)."""
+        return self.capabilities(provider).supports(feature)
+
+    def capability_matrix(self) -> dict[str, dict]:
+        """등록된 모든 provider 의 capability 표 (claude vs codex vs ... 비교)."""
+        matrix: dict[str, dict] = {}
+        for row in self._registry.list_providers():
+            pid = row["id"]
+            try:
+                matrix[pid] = self.capabilities(pid).to_dict()
+            except ValueError:
+                continue
+        return matrix
+
+    def unsupported_options(self, provider: str,
+                            options: dict | None) -> list[str]:
+        """provider 가 받지 않는 provider_options 키 목록.
+
+        "claude 는 되는데 codex 는 안 됨" 을 호출 전에 확실히 알려준다 — 빈
+        리스트면 전부 지원. (실제 호출 시엔 ``_supported_kwargs`` 가 이 키들을
+        조용히 버린다.)
+        """
+        caps = self.capabilities(provider)
+        return sorted(k for k in (options or {}) if k not in caps.options)
 
     def get_token_stats(self, owner: str = "", days: int = 7,
                         *, alias: str = "", provider: str = "",

@@ -323,6 +323,28 @@ alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
 
 ## Provider 기능 비교
 
+기능은 **provider 마다, 그리고 OS 마다** 다르다(예: claude 는 Windows 에서 세션
+없음). 추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
+여기서 되나?"의 단일 진실 소스다:
+
+```python
+client.capabilities("claude")          # ProviderCapabilities (OS 반영)
+client.supports("codex", "lean")       # False — lean 은 claude 전용
+client.capability_matrix()             # {provider: {...}} 비교표
+# 이 provider 가 조용히 버릴 옵션이 뭔지:
+client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
+# -> ["lean"]   (sandbox_mode 는 지원, lean 은 미지원)
+```
+
+| Capability | claude | codex | copilot | kiro |
+|---|---|---|---|---|
+| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
+| `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
+| claude 전용 옵션 | `lean`, `debug`, `partial_messages` | — | — | — |
+
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
 | `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
@@ -341,7 +363,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 462개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 479개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 

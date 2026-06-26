@@ -64,6 +64,9 @@ class CopilotProvider(LLMProvider):
     provider_id = "copilot"
     supports_sessions = True
     supports_streaming = True
+    supports_token_streaming = True       # assistant.message_delta = 증분
+    supports_session_recovery = True      # --name resume → 없으면 같은 이름 새 세션
+    supports_session_liveness = False     # 세션 저장이 불투명 → session_alive None
     stores_history = False  # 히스토리는 Copilot CLI 세션이 소유
 
     def __init__(self,

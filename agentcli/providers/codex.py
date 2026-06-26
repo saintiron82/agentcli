@@ -109,6 +109,9 @@ class CodexProvider(LLMProvider):
     provider_id = "codex"
     supports_sessions = True
     supports_streaming = True
+    supports_token_streaming = False      # item.completed = 메시지 블록 단위
+    supports_session_recovery = True      # CODEX_STALE_MARKER → 새 세션
+    supports_session_liveness = True      # session_alive: rollout 파일 검사
     stores_history = False  # 히스토리는 Codex CLI 세션이 소유
 
     def __init__(self,
