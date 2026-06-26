@@ -223,6 +223,34 @@ def test_codex_stream_debug_writes_trace(monkeypatch, tmp_path):
     assert any(c["type"] == "text" for c in rec["chunks"])
 
 
+def test_copilot_stream_threads_debug_to_template(monkeypatch, tmp_path):
+    """copilot stream_async 가 debug/debug_log_path 를 공유 템플릿에 전달(전 provider)."""
+    from agentcli.providers.copilot import CopilotProvider
+    from agentcli.types import Message, StreamChunk
+    captured = {}
+
+    async def fake_template(self, cmd, state, **kwargs):
+        captured.update(kwargs)
+        yield StreamChunk(type="done", session_id="s")
+
+    monkeypatch.setattr(CopilotProvider, "_find_binary",
+                        lambda self: ("/usr/bin/copilot", False))
+    monkeypatch.setattr("agentcli.providers.copilot.build_env", lambda: {})
+    monkeypatch.setattr(
+        "agentcli.providers.base.LLMProvider._run_stream_template", fake_template)
+    prov = CopilotProvider()
+    dbg = str(tmp_path / "c.jsonl")
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")],
+            debug=True, debug_log_path=dbg)]
+
+    asyncio.run(run())
+    assert captured.get("debug") is True
+    assert captured.get("debug_log_path") == dbg
+
+
 def test_stream_partial_with_tool_use_interleave(monkeypatch):
     """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
     는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""

@@ -390,8 +390,13 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
+| `debug` (chunk-timeline trace) | ✅ | ✅ (streaming) | ✅ (streaming) | ❌ |
 | claude-only options | `lean`, `partial_messages` | — | — | — |
+
+`debug` covers the **streaming** path (per-chunk timeline + trace) on
+claude/codex/copilot; claude additionally instruments the non-streaming
+`invoke` path. A non-streaming codex/copilot call with `debug=True` is a no-op
+(the option is dropped) — use streaming to trace those two.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
@@ -621,7 +626,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-665 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+666 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

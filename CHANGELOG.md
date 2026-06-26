@@ -17,6 +17,9 @@
 - **`debug` is now a declared capability.** `ProviderCapabilities.debug` and the
   `capability_matrix()` row show which providers have debug instrumentation
   (claude/codex/copilot ✓, kiro ✗); `supports(provider, "debug")` reflects it.
+  Scope: codex/copilot `debug` covers the **streaming** path only; their
+  non-streaming `invoke` ignores `debug=True` (claude instruments both). Full
+  invoke-path parity for codex/copilot is a tracked follow-up.
 
 ## 0.6.3 — 2026-06-26
 

@@ -380,8 +380,13 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
+| `debug` (청크 타임라인 trace) | ✅ | ✅ (스트리밍) | ✅ (스트리밍) | ❌ |
 | claude 전용 옵션 | `lean`, `partial_messages` | — | — | — |
+
+`debug` 는 claude/codex/copilot 의 **스트리밍** 경로(청크 타임라인 + trace)를
+계측한다. claude 는 비스트리밍 `invoke` 경로도 추가로 계측한다. codex/copilot 의
+비스트리밍 호출에 `debug=True` 를 주면 무시된다(옵션 드롭) — 그 둘은 스트리밍으로
+추적할 것.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
@@ -401,7 +406,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 665개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 666개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
