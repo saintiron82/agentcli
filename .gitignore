@@ -10,3 +10,7 @@ dist/
 .venv/
 venv/
 .DS_Store
+
+# coverage (dev)
+.coverage
+htmlcov/

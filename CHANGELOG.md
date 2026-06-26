@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.6.2 — 2026-06-25
+
+### Added
+- **`ClaudeProvider` lean mode (`lean=True`).** For single-shot completions
+  (summarize/generate — no tool use), appends `--safe-mode` (disables
+  CLAUDE.md/skills/plugins/hooks/MCP/custom agents) + `--tools` allowlist
+  (`""` to disable all built-in tools, or the explicit `allowed_tools`). This
+  strips the agent harness so a large-context completion does not pay for
+  MCP startup or risk an autonomous tool loop. Constructor arg + per-call
+  override + `provider_options={"lean": True}`. MCP/`disallowed_tools` are
+  ignored in lean mode. Default `False` — existing behavior unchanged.
+- **Optional debug instrumentation (`debug=True`, `debug_log_path=...`).**
+  Appends Claude's `--debug` flag, logs the (prompt-redacted) argv, and — for
+  streaming — records a per-chunk timeline (`+{elapsed}s type evt/name`) so a
+  tool loop or init stall is legible. `debug_log_path` appends a JSON-Lines
+  trace (argv, chunk timeline, drained stderr, elapsed). stderr is drained
+  concurrently during streaming to avoid a `--debug` pipe-buffer deadlock.
+  Threaded through `invoke`/`invoke_async`/`stream_async` and
+  `provider_options`. Default `False`.
+- **Token-level streaming for Claude (`partial_messages=True`, streaming-only).**
+  By default Claude's `stream-json` emits whole message blocks, so a single
+  long completion arrives as one `text` chunk at the end. `partial_messages`
+  adds `--include-partial-messages`; `_dispatch_stream_event` maps the
+  resulting `content_block_delta` (`text_delta`/`thinking_delta`) events to
+  incremental `text`/`thinking` chunks, suppressing the trailing full
+  `assistant` block to avoid double-counting. Live A/B (12s generation): first
+  token ~12s → ~6s, 1 chunk → 28. Default `False` — block-level unchanged.
+
+- **`scripts/agentcli_ps.py` diagnostic.** Lists in-flight `claude -p` /
+  `codex exec` / `copilot -p` runs grouped by process group (leader + its
+  MCP/node children), flags `[long]` / `[residual]` / `[defunct]` groups, and
+  can `--kill <PGID>` a stuck one. Zero deps (stdlib + `ps`, POSIX).
+- **Pinned context (`pin_context` → `ContextSession`).** For "load one big
+  input (e.g. a transcript) and ask many things against it": `refine(prompt)`
+  continues the same session (transcript sent once; follow-ups send only the
+  instruction), while `fork(prompt)` re-seeds the transcript into a fresh
+  session per call so independent variations don't see each other. Crucially it
+  handles **coming back later / after a restart**: `refine` checks
+  `session_alive` and auto-re-seeds the transcript (with `new_session=True`) if
+  the session has expired, otherwise resumes without re-sending. `*_async` /
+  `*_stream` variants for both. The library still stores only the session id;
+  the host holds the transcript to (re)construct the handle.
+- **Capability controller (`ProviderCapabilities` + client queries).** Features
+  differ per provider AND per OS; the controller declares them so callers can
+  check before calling instead of relying on silent option-dropping.
+  `LLMClient.capabilities(provider)` (OS-aware — claude has no `sessions` on
+  Windows), `supports(provider, feature)` (e.g. `supports("codex","lean")` →
+  False), `capability_matrix()` (comparison table), and
+  `unsupported_options(provider, opts)` (which passed keys this provider drops).
+  Each provider declares `supports_token_streaming` / `supports_session_recovery`
+  / `supports_session_liveness`; per-call options are auto-derived from the
+  invoke/stream signatures (same basis as `_supported_kwargs`).
+- **Session liveness check (`session_alive`).** `LLMProvider.session_alive` +
+  `LLMClient.session_alive(provider, owner=, alias=, cwd=)` report whether a
+  stored session can still be resumed — without a full LLM call. claude checks
+  its `~/.claude/projects/<cwd>/<sid>.jsonl` file; codex globs its
+  `~/.codex/sessions/**/rollout-*<thread>.jsonl`; opaque providers (copilot)
+  return `None` (unknown). `True` = resumable, `False` = gone (next call
+  auto-opens a new session), `None` = unsupported.
+
+### Fixed
+- **Codex dead-session auto-reopen (parity with claude).** When a stored
+  codex thread is gone, `codex exec resume` fails with `no rollout found for
+  thread id`; `CodexProvider` now detects this and retries once in a fresh
+  session (invoke / invoke_async / stream_async), returning the new thread id —
+  matching claude's existing stale-session recovery. (Reopened sessions start
+  without prior history; the CLI owns history and agentcli stores only the id.)
+- **Zombie grandchild-process accumulation.** A CLI spawns its
+  own children (MCP servers, hooks, node helpers). Killing only the direct
+  child on timeout/cleanup left those grandchildren running — and a grandchild
+  holding the stdout pipe could even wedge `subprocess.run`'s post-timeout
+  cleanup. All spawn sites now start a new session (process group) and tear
+  down the **whole group** via `os.killpg(SIGKILL)` on every exit path —
+  timeout, cancel, early-exit, and clean completion (a grandchild that detaches
+  its stdout can outlive a normally-exiting parent) — (POSIX; Windows falls back
+  to direct kill). The sync runner's post-timeout cleanup is a single bounded
+  reap (no double `communicate`), and the streaming debug trace records a
+  `truncated` flag when stderr/chunks are partial. New `run_subprocess_sync` replaces
+  `subprocess.run` in `ClaudeProvider.invoke` for the same group teardown +
+  `stdin=DEVNULL`. Verified with deterministic repro tests (sync + async +
+  streaming).
+
+### Notes
+- `lean`/`debug` are Claude-specific (they map to Claude Code flags). The
+  client's `provider_options` filtering means other providers safely ignore
+  them; Codex/Copilot equivalents are not implemented.
+- The process-group teardown lives in the shared `base` runners, so the
+  streaming and async paths benefit across all providers; the sync
+  `run_subprocess_sync` switch is wired for claude (codex/copilot can adopt).
+
 ## 0.6.1 — 2026-06-21
 
 ### Added
@@ -273,7 +363,7 @@ First release under the `agentcli` name (previously internal `libs.llm`). Major 
 
 ### Changed
 - **No more history re-injection for session providers.** Prior `prev_messages` rolling-context injection (which duplicated what the CLI session already held) is removed. Non-session providers still serialize history if/when added.
-- **Atomic store writes**: failed calls leave no residue (no orphaned user messages in conversation history).
+- **Atomic store writes**: failed calls leave no residue (no unreferenced user messages in conversation history).
 - **Default fallback order**: `["claude", "copilot", "codex"]` (session-first, full-auto last).
 - **Claude uses `--output-format json`** and parses `usage.input_tokens` / `output_tokens` directly instead of stderr regex.
 - **Codex uses `--output-format json`** event stream parsing; `cached_input_tokens` flows into `TokenUsage.cached_tokens`.

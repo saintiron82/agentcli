@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.2"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -231,7 +231,8 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
+  (스트리밍 전용).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
   `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
   형태** — `{name: {url, bearer_token_env_var?}}`(HTTP; 토큰은 inline 헤더가 아니라
@@ -247,7 +248,127 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 편집한다면 `mcp_config` 는 필요 없다 — 생성자 `permission_mode`/`allowed_tools`
 (또는 이 호출 시점 오버라이드)로 충분하다.
 
+### lean 모드 & debug (claude)
+
+툴이 필요 없는 단일 completion — 큰 컨텍스트에 대한 요약/생성/초안 — 에서는
+`lean=True` 가 에이전트 하네스를 걷어낸다: `--safe-mode`(CLAUDE.md/skills/
+plugins/hooks/MCP/custom agents 없음) + `--tools ""`(빌트인 툴 없음). 그러면
+completion 이 MCP 기동 비용을 내지 않고 자율 툴 루프로 빠지지도 않는다. 남는
+지배 비용은 출력 토큰 생성이므로, 지연이 중요하면 더 빠른 모델도 함께 고른다.
+
+```python
+# 약 5만 자 텍스트 → 회의록, 툴 불필요:
+client.chat(report_text, provider="claude",
+            model="claude-haiku-4-5",            # 출력 속도가 본질적 레버
+            provider_options={"lean": True})     # 하네스 제거 + 툴 루프 차단
+```
+
+호출이 이유 없이 느리면 `debug=True`(필요 시 `debug_log_path` 와 함께)가 Claude
+의 `--debug` 를 붙이고, 프롬프트가 redact 된 argv 를 로깅하며, 스트리밍에서는
+청크별 타임라인을 기록해 툴 루프나 init 지연을 보이게 한다. `debug_log_path` 를
+주면 JSON Lines trace(argv·청크 타임라인·stderr·총 소요)가 append 되어, 느린
+호출을 재현한 뒤 들여다볼 수 있다.
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                       provider_options={
+                                           "debug": True,
+                                           "debug_log_path": "/tmp/agentcli.jsonl"}):
+    ...
+```
+
+기본적으로 Claude 의 `stream-json` 은 메시지 블록 단위로 방출하므로, 단일 긴
+completion 은 거의 끝에 `text` 청크 하나로 온다. `partial_messages=True`(스트리밍
+전용)를 주면 `--include-partial-messages` 가 붙어 Claude 가 토큰 단위
+`text_delta`/`thinking_delta` 를 내보내고, `chat_stream` 이 이를 증분 `text`/
+`thinking` 청크로 흘린다(라이브 A/B: 12초 생성의 첫 토큰이 ~12초 → ~6초, 청크
+1개 → 28개).
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                      provider_options={"partial_messages": True}):
+    if chunk.type == "text":
+        print(chunk.content, end="", flush=True)   # 토큰 단위
+```
+
+`lean`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
+
+### 실행 중인 CLI 추적 (진단)
+
+각 호출이 자기 프로세스 그룹으로 도므로(0.6.2+), 동봉된 `scripts/agentcli_ps.py`
+가 진행 중인 `claude -p` / `codex exec` / `copilot -p` 를 PGID 단위(리더 + 자식
+MCP 서버·node 헬퍼)로 묶어 보여주고 `[long]`/`[residual]`/`[defunct]` 그룹을
+표시한다. 의존성 0 (stdlib + `ps`, POSIX):
+
+```bash
+python3 scripts/agentcli_ps.py                  # 실행 중인 agent 그룹
+python3 scripts/agentcli_ps.py --older-than 300 # 의심스럽게 오래된 것만
+python3 scripts/agentcli_ps.py --kill <PGID>    # 멈춘 그룹 SIGKILL
+```
+
+### 세션 유지 & 복구
+
+세션은 호출 간(그리고 `SQLiteStore` 면 재시작 간에도) 재개된다. 저장된 세션이
+죽었으면 다음 호출이 자동으로 새 세션을 연다 — claude 는 `No conversation found
+with session ID`, codex 는 `no rollout found for thread id` 로 감지 — 그리고 새
+id 를 저장한다(재개된 세션은 이전 히스토리가 없다. CLI 가 히스토리를 소유하고
+agentcli 는 id 만 저장하므로).
+
+호출 전에 확인하려면 `session_alive` 가 LLM 호출 없이 세션 파일을 검사한다:
+
+```python
+alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
+# True = 재개 가능 · False = 죽음(다음 호출이 새로 엶) · None = 판단불가(예: copilot)
+```
+
+### Pinned context (큰 입력 1회, 다회 질의)
+
+"큰 전사록을 1회 넣고 그 위에서 여러 질의" — 예: 여러 형태의 회의록 + 수정 요구 —
+를 위해 `pin_context` 가 `ContextSession`(두 모드)을 반환한다:
+
+```python
+ctx = client.pin_context(transcript, provider="claude", owner="u", alias="mtg",
+                         model="claude-haiku-4-5")
+
+# refine(): 같은 세션 이어가기 — 전사록은 한 번만 전송, 이후엔 지시만(CLI 세션이
+# 전사록을 기억).
+ctx.refine("격식 회의록 작성")
+ctx.refine("더 짧게 수정")               # 앞 답을 봄
+
+# fork(): 독립 변형 — 변형마다 전사록을 새 세션에 재시드하여 서로 안 섞인다.
+ctx.fork("액션아이템만 추출")
+ctx.fork("캐주얼 요약", label="summary")
+```
+
+**잠시 있다가 다시 요청**(또는 프로세스 재시작): 같은 `alias` + 전사록으로 다시
+`pin_context`. `refine` 이 `session_alive` 를 확인 — 살아있으면 resume(재전송
+없음), 죽었으면(만료/삭제) **전사록을 새 세션에 자동 재시드**. 각 모드는
+`*_async`/`*_stream` 변형이 있다. (agentcli 는 세션 id 만 저장하므로 호스트가
+전사록을 들고 핸들을 재구성한다.)
+
 ## Provider 기능 비교
+
+기능은 **provider 마다, 그리고 OS 마다** 다르다(예: claude 는 Windows 에서 세션
+없음). 추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
+여기서 되나?"의 단일 진실 소스다:
+
+```python
+client.capabilities("claude")          # ProviderCapabilities (OS 반영)
+client.supports("codex", "lean")       # False — lean 은 claude 전용
+client.capability_matrix()             # {provider: {...}} 비교표
+# 이 provider 가 조용히 버릴 옵션이 뭔지:
+client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
+# -> ["lean"]   (sandbox_mode 는 지원, lean 은 미지원)
+```
+
+| Capability | claude | codex | copilot | kiro |
+|---|---|---|---|---|
+| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
+| `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
+| claude 전용 옵션 | `lean`, `debug`, `partial_messages` | — | — | — |
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
@@ -267,12 +388,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 344개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, Codex/Copilot JSONL parsing을 다룹니다.
+현재 659개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.1`
-- 릴리즈 노트: [docs/releases/v0.6.1.ko.md](docs/releases/v0.6.1.ko.md)
+- 현재 릴리즈: `0.6.2`
+- 릴리즈 노트: [docs/releases/v0.6.2.ko.md](docs/releases/v0.6.2.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 
 ## 라이선스

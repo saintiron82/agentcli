@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.1"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.2"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -370,6 +370,28 @@ use: durable session handles and usage logs, not conversation history.
 
 ## Provider capabilities
 
+Capabilities differ per provider **and per OS** (e.g. claude has no sessions on
+Windows). Query them before calling instead of guessing — the controller is the
+source of truth for "does this feature work on this provider here?":
+
+```python
+client.capabilities("claude")          # ProviderCapabilities (OS-aware)
+client.supports("codex", "lean")       # False — lean is claude-only
+client.capability_matrix()             # {provider: {...}} comparison table
+# Which passed options this provider will silently drop:
+client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
+# -> ["lean"]   (sandbox_mode is supported, lean is not)
+```
+
+| Capability | claude | codex | copilot | kiro |
+|---|---|---|---|---|
+| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
+| `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
+| claude-only options | `lean`, `debug`, `partial_messages` | — | — | — |
+
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
 | `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
@@ -455,7 +477,8 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`.
+  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
+  (streaming-only).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
   **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
@@ -473,6 +496,111 @@ above. If you only edit files in `cwd`, you don't need `mcp_config` at all — t
 `permission_mode` / `allowed_tools` constructor flags (or these per-call
 overrides) are enough.
 
+### Lean mode & debug (claude)
+
+For a single completion that needs no tools — summarize / generate / draft over
+a large context — `lean=True` strips the agent harness: it adds `--safe-mode`
+(no CLAUDE.md/skills/plugins/hooks/MCP/custom agents) and `--tools ""` (no
+built-in tools). The completion then can't pay for MCP startup or wander into an
+autonomous tool loop. The dominant remaining cost is output-token generation, so
+also pick a faster model when latency matters.
+
+```python
+# ~50k-char text → meeting minutes, no tools needed:
+client.chat(report_text, provider="claude",
+            model="claude-haiku-4-5",            # output speed is the main lever
+            provider_options={"lean": True})     # strip harness; block tool loops
+```
+
+When a call is mysteriously slow, `debug=True` (optionally with
+`debug_log_path`) appends Claude's `--debug`, logs the prompt-redacted argv, and
+for streaming records a per-chunk timeline so a tool loop or init stall is
+visible. A `debug_log_path` appends a JSON-Lines trace (argv, chunk timeline,
+stderr, elapsed) you can inspect after reproducing the slow call.
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                       provider_options={
+                                           "debug": True,
+                                           "debug_log_path": "/tmp/agentcli.jsonl"}):
+    ...
+```
+
+By default Claude's `stream-json` emits whole message blocks, so a single long
+completion arrives as one `text` chunk near the end. Pass
+`partial_messages=True` (streaming only) to add `--include-partial-messages` so
+Claude emits token-level `text_delta`/`thinking_delta` events — `chat_stream`
+then yields incremental `text`/`thinking` chunks (live A/B: a 12s generation's
+first token dropped from ~12s to ~6s, 1 chunk → 28).
+
+```python
+async for chunk in client.chat_stream(prompt, provider="claude",
+                                      provider_options={"partial_messages": True}):
+    if chunk.type == "text":
+        print(chunk.content, end="", flush=True)   # token-by-token
+```
+
+`lean` / `debug` / `partial_messages` are Claude-specific; other providers
+ignore them on fallback.
+
+### Tracking running CLIs (diagnostics)
+
+Because each spawn runs in its own process group (0.6.2+), the bundled
+`scripts/agentcli_ps.py` lists in-flight `claude -p` / `codex exec` /
+`copilot -p` runs grouped by PGID — leader plus its children (MCP servers, node
+helpers) — and flags `[long]` / `[residual]` / `[defunct]` groups. Zero deps
+(stdlib + `ps`, POSIX):
+
+```bash
+python3 scripts/agentcli_ps.py                 # running agent groups
+python3 scripts/agentcli_ps.py --older-than 300  # only suspiciously long ones
+python3 scripts/agentcli_ps.py --kill <PGID>     # SIGKILL a stuck group
+```
+
+### Session liveness & recovery
+
+Sessions resume across calls (and across restarts with `SQLiteStore`). If a
+stored session is gone, the next call auto-opens a fresh one — claude on
+`No conversation found with session ID`, codex on `no rollout found for thread
+id` — and persists the new id (the reopened session starts without prior
+history, since the CLI owns history and agentcli stores only the id).
+
+To check before calling, `session_alive` probes the session file without an LLM
+call:
+
+```python
+alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
+# True = resumable · False = gone (next call reopens) · None = unknown (e.g. copilot)
+```
+
+### Pinned context (one big input, many queries)
+
+For "load a big transcript once, then ask many things against it" — e.g. several
+meeting-minute formats and revision requests — `pin_context` returns a
+`ContextSession` with two modes:
+
+```python
+ctx = client.pin_context(transcript, provider="claude", owner="u", alias="mtg",
+                         model="claude-haiku-4-5")
+
+# refine(): continue the same session — the transcript is sent ONCE, follow-ups
+# send only the instruction (the CLI session remembers it).
+ctx.refine("Draft formal minutes.")
+ctx.refine("Make them shorter.")          # sees the prior answer
+
+# fork(): independent variations — each re-seeds the transcript in a fresh
+# session so they don't see each other.
+ctx.fork("Extract action items only.")
+ctx.fork("Write a casual summary.", label="summary")
+```
+
+Come back later (or after a process restart): re-`pin_context` with the same
+`alias` and transcript. `refine` checks `session_alive` — if the session is
+still alive it resumes (no re-send); if it died (expired/deleted) it
+**auto-re-seeds** the transcript into a fresh session. Each mode has
+`*_async` / `*_stream` variants. (agentcli stores only the session id, so the
+host holds the transcript to reconstruct the handle.)
+
 ## Testing
 
 ```bash
@@ -480,7 +608,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-344 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, and Codex/Copilot JSONL parsing.
+659 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
@@ -497,7 +625,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.6.1 release note: [docs/releases/v0.6.1.md](docs/releases/v0.6.1.md) / [docs/releases/v0.6.1.ko.md](docs/releases/v0.6.1.ko.md)
+- v0.6.2 release note: [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md) / [docs/releases/v0.6.2.ko.md](docs/releases/v0.6.2.ko.md)
 
 ## License
 

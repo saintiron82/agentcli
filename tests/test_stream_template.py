@@ -14,12 +14,281 @@ import pytest
 from agentcli.providers.base import StreamState
 from agentcli.providers.claude import ClaudeProvider
 from tests._stream_helpers import (
-    HangingReadline, jsonl_bytes, make_fake_proc, patch_subprocess_exec)
+    FakeReadline, HangingReadline, jsonl_bytes, make_fake_proc,
+    patch_subprocess_exec)
 
 
 # ============================================================
 # 정상 시퀀스 (sanity check + #11 일부)
 # ============================================================
+
+
+def test_stream_partial_messages_incremental_text(monkeypatch):
+    """partial_messages: text_delta 로 증분 방출, 뒤따르는 전체 assistant 블록은
+    중복 집계하지 않는다."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "index": 0, "delta": {"type": "text_delta", "text": "lo"}}},
+        # 델타와 별개로 전체 assistant 블록도 뒤따라온다 — 중복되면 안 된다.
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Hello"}]}},
+        {"type": "result", "subtype": "success", "result": "Hello",
+         "usage": {"input_tokens": 3, "output_tokens": 2}, "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    texts = [c.content for c in chunks if c.type == "text"]
+    # 증분 델타만 text 청크로, 전체 블록 중복 없음
+    assert texts == ["Hel", "lo"], f"got {texts}"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "Hello", "done content == 델타 합"
+
+
+def test_stream_partial_no_delta_falls_back_to_full_block(monkeypatch):
+    """partial=True 인데 델타 없이 전체 assistant 블록만 오면 텍스트를 유실하지
+    않고 fallback 으로 방출한다 (merge-gate Important 회귀)."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        # text_delta 가 한 번도 안 옴 — 전체 블록만 도착
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "WHOLE answer"}]}},
+        {"type": "result", "subtype": "success", "result": "WHOLE answer",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    texts = [c.content for c in chunks if c.type == "text"]
+    assert texts == ["WHOLE answer"], f"델타 없으면 전체 블록 fallback 필요, got {texts}"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "WHOLE answer", "텍스트 유실 금지"
+
+
+def test_stream_partial_thinking_and_message_start_reset(monkeypatch):
+    """partial: thinking_delta 는 thinking 청크로(텍스트 합엔 미포함), 그리고
+    message_start 가 delta-seen 플래그를 리셋한다."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "thinking_delta", "thinking": "hmm"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "ans"}}},
+        # 전체 블록 — thinking/text 모두 델타로 왔으니 중복 방출 금지
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "text", "text": "ans"}]}},
+        {"type": "result", "subtype": "success", "result": "ans",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    assert [c.content for c in chunks if c.type == "thinking"] == ["hmm"]
+    assert [c.content for c in chunks if c.type == "text"] == ["ans"]
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "ans", "thinking 은 최종 content 에 포함되지 않는다"
+
+
+def test_codex_stream_stale_session_recovers(monkeypatch):
+    """codex 스트리밍: 죽은 thread(첫 청크가 'no rollout found' 에러) → 새 세션
+    으로 1회 재시도해 복구."""
+    from agentcli.providers.codex import CodexProvider
+    from agentcli.types import Message
+    stale = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"Error: thread/resume failed: no rollout found for thread id abc")
+    fresh = make_fake_proc(stdout_lines=jsonl_bytes([
+        {"type": "thread.started", "thread_id": "tid-new"},
+        {"type": "item.completed",
+         "item": {"type": "agent_message", "text": "recovered"}},
+        {"type": "turn.completed",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]), returncode=0)
+    procs = iter([stale, fresh])
+
+    async def fake_create(*a, **k):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")], session_id="abc")]
+
+    chunks = asyncio.run(run())
+    # stale 에러는 caller 에 새지 않고, 복구된 text/done 만 보인다.
+    assert not any(c.type == "error" for c in chunks), "stale 에러 누출 금지"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "recovered"
+    assert done.session_id == "tid-new"
+
+
+def test_codex_stream_stale_recovery_is_bounded(monkeypatch):
+    """스트리밍 재시도(새 세션)도 stale 면 무한 루프 없이 에러를 caller 에 전달."""
+    from agentcli.providers.codex import CodexProvider
+    from agentcli.types import Message
+    stale = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"no rollout found for thread id abc")
+    # 두 번 모두 stale
+    procs = iter([stale, make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"no rollout found for thread id abc")])
+
+    async def fake_create(*a, **k):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")], session_id="abc")]
+
+    chunks = asyncio.run(run())
+    # 2번째(새 세션)도 실패 → 에러 청크가 caller 에 전달됨 (무한 루프 아님)
+    assert any(c.type == "error" for c in chunks)
+
+
+def test_stream_partial_with_tool_use_interleave(monkeypatch):
+    """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
+    는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""
+    from unittest.mock import patch
+    from agentcli.types import Message
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "Use tool"}}},
+        # 전체 블록: text(델타로 이미 옴 → skip) + tool_use(전체 블록에서 방출)
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Use tool"},
+            {"type": "tool_use", "name": "Read", "id": "t1", "input": {}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+        {"type": "result", "subtype": "success", "result": "Use tool",
+         "session_id": "s1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+
+    async def run():
+        with patch.object(provider, "_find_binary", return_value="/usr/bin/claude"):
+            return [c async for c in provider.stream_async(
+                [Message(role="user", content="hi")], partial_messages=True)]
+
+    chunks = asyncio.run(run())
+    assert [c.content for c in chunks if c.type == "text"] == ["Use tool"]
+    assert sum(1 for c in chunks if c.type == "tool_use") == 1
+    assert sum(1 for c in chunks if c.type == "tool_result") == 1
+    # 청크 순서: text → tool_use → tool_result
+    seq = [c.type for c in chunks if c.type in ("text", "tool_use", "tool_result")]
+    assert seq == ["text", "tool_use", "tool_result"]
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "Use tool"
+
+
+def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
+    """debug=True: 청크 타임라인 + redact argv + stderr 를 trace 파일로 기록."""
+    import json
+    events = [
+        {"type": "system", "session_id": "sys-1"},
+        {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "hi"}]}},
+        {"type": "result", "usage": {"input_tokens": 3, "output_tokens": 2},
+         "session_id": "sys-1"},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    # stderr 동시 드레인 검증을 위해 readline 가능한 fake 로 교체
+    proc.stderr = FakeReadline([b"debug: mcp connected\n",
+                                b"debug: tool_use Bash\n"])
+    patch_subprocess_exec(monkeypatch, proc)
+
+    provider = ClaudeProvider()
+    state = StreamState(final_session_id="seed")
+    trace = tmp_path / "trace.jsonl"
+    cmd = ["claude", "-p", "SECRET-PROMPT", "--debug",
+           "--output-format", "stream-json"]
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            cmd, state, model="m", debug=True, debug_log_path=str(trace))]
+
+    chunks = asyncio.run(run())
+    assert [c.type for c in chunks][-1] == "done"
+
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "stream"
+    assert rec["chunk_count"] >= 2
+    assert any(c["type"] == "text" for c in rec["chunks"])
+    # 정상 done 도달 → 부분 데이터 아님
+    assert rec["truncated"] is False
+    # 프롬프트 본문 redact
+    assert "SECRET-PROMPT" not in json.dumps(rec["argv"])
+    # stderr 동시 드레인되어 trace 에 담김
+    assert "mcp connected" in rec["stderr"]
+
+
+def test_run_stream_template_debug_trace_truncated_on_timeout(monkeypatch, tmp_path):
+    """idle timeout 으로 중단되면 trace 의 truncated=True (Fix B — 부분 데이터 표시)."""
+    import json
+    proc = make_fake_proc(stdout_lines=[], returncode=None)
+    proc.stdout = HangingReadline()       # readline 영원히 → idle timeout
+    proc.stderr = FakeReadline([b"partial\n"])
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+    state = StreamState()
+    trace = tmp_path / "t.jsonl"
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["claude", "-p", "X"], state, timeout=0.2,
+            debug=True, debug_log_path=str(trace))]
+
+    chunks = asyncio.run(run())
+    assert any(c.type == "error" for c in chunks)
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["truncated"] is True
 
 
 def test_run_stream_template_normal_sequence(monkeypatch):
@@ -464,4 +733,6 @@ def test_run_subprocess_async_timeout_still_kills_proc(monkeypatch):
     stdout_b, stderr_b, rc, timed_out = asyncio.run(run())
     assert timed_out is True
     assert rc == 124
-    proc.kill.assert_called_once()
+    # Fix A: 정상완료 포함 모든 경로에서 그룹 reap → except+finally 가 멱등적으로
+    # 두 번 kill 할 수 있다(해롭지 않음). 한 번 이상 호출되면 충분.
+    assert proc.kill.called
