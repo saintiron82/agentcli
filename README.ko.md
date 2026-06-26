@@ -58,7 +58,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 
 **대화 히스토리의 single source of truth는 provider CLI 세션입니다.** 라이브러리는 provider별 `session_id`만 저장하고 이전 대화를 prompt에 다시 주입하지 않습니다. 이 원칙 때문에 토큰 중복, 히스토리 중복 저장, 예측하기 어려운 context 증가를 피할 수 있습니다.
 
-- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다. 단 하나의 예외는 Windows의 Claude로, `-p` + `--resume` 조합이 인터랙티브 입력 대기로 빠져 행이 걸릴 수 있어(issue #4) 무상태로 동작합니다. macOS/Linux의 Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지).
+- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다(전 플랫폼). Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(macOS/Linux는 Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지). 과거 Windows hang(issue #4)은 `stdin=DEVNULL` spawn으로 전제가 해소되어 Windows resume 가드를 제거했습니다(issue #27, Windows 검증 진행 예정).
 - `Conversation.metadata["session_id:<provider>"]`만 저장합니다.
 - `system_prompt`와 `AgentProfile.instructions`는 해당 지시문 hash를 세션이 아직 보지 않았거나 변경되었을 때만 주입합니다.
 - 세션이 없는 custom provider를 추가할 경우에만 라이브러리가 이전 messages를 직렬화할 수 있습니다.
@@ -375,7 +375,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Capability | claude | codex | copilot | kiro |
 |---|---|---|---|---|
-| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
 | `streaming` | ✅ | ✅ | ✅ | ✅ |
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
@@ -392,14 +392,14 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
-| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
+| `ClaudeProvider` | ✅ | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
 | `CodexProvider` | ✅ | ✅ | `thread.started.thread_id` 파싱 |
 | `CopilotProvider` | ✅ | ✅ | `result.sessionId` 파싱 |
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` 결과의 `sessionId`; 전송 계층 = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
 
-`ClaudeProvider`는 macOS/Linux에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). Windows에서는 `-p`와 `--resume` 조합이 인터랙티브 입력 대기로 빠질 수 있어(issue #4) 무상태로 동작합니다.
+`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(macOS/Linux는 Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 모든 호출을 `stdin=DEVNULL`로 spawn하므로 Windows에서도 resume이 될 것으로 보입니다 — issue #27이 Windows 11에서 CLI 레벨 동작을 재현했고, 가드 제거의 end-to-end Windows 검증은 진행 예정입니다.
 
 ### Reasoning 제어
 

@@ -18,6 +18,16 @@
   identical to before.
 
 ### Changed
+- **Claude session resume now works on Windows too (issue #27).** The Windows
+  `supports_sessions=False` guard (added for the issue #4 `-p` + `--resume`
+  5-minute hang) is removed. Root cause of #4 was an interactive **stdin** wait;
+  every claude spawn closes or EOF-terminates stdin (`DEVNULL` for normal
+  prompts, write-then-close `PIPE` for prompts over 8,000 UTF-8 bytes since
+  issue #30), so the hang can't occur. `ClaudeProvider.supports_sessions` is now
+  `True` on every platform, so `owner`+`alias` session reuse (and `ContextSession`
+  pin-then-`refine`) works on Windows — no more re-sending the context every
+  call. Stale sessions still fall back to a fresh session via the
+  `STALE_SESSION_MARKER` auto-recovery path.
 - **`CopilotProvider(effort=...)` now validates against the canonical scale.**
   Previously (since v0.2.0) any string was passed straight through to the
   CLI's `--effort` flag. It now resolves through the same canonical scale as

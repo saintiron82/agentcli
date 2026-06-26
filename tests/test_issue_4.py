@@ -1,37 +1,50 @@
-"""Regression tests for issue #4 (Windows) + claude session resume (POSIX).
+"""Regression tests for issue #4 (resume vs -p hang) + #27 (Windows guard).
 
-Issue #4: on Windows, attaching ``--resume <sid>`` to a ``-p`` (print-mode)
-invocation falls back to waiting for interactive input and hangs for 5+
-minutes. The fix is platform-scoped: ``ClaudeProvider.supports_sessions`` is
-False on Windows, and ``_build_cmd`` never emits ``--resume`` in that mode.
+Issue #4: attaching ``--resume <sid>`` to a ``-p`` (print-mode) invocation
+fell back to waiting for interactive input and hung for 5+ minutes on Windows.
+The original fix forced ``supports_sessions=False`` on Windows.
 
-On macOS/Linux, ``claude -p --resume <sid>`` works correctly (verified
-against Claude Code 2.1.x: the resumed session keeps the same session ID),
-so the provider resumes natively there.
+Issue #27: the real trigger was the interactive **stdin wait**; agentcli now
+spawns every claude call with ``stdin=DEVNULL`` (base.py), so that wait can't
+happen — #27 reproduces the CLI behavior on Windows 11
+(``claude -p --resume <sid> < /dev/null`` resumes cleanly). The Windows guard
+was removed and ``supports_sessions`` is now ``True`` on every platform
+(end-to-end Windows verification of the change is pending).
 
-The stateless-mode guarantee is locked in by forcing ``supports_sessions``
-to False on a provider instance, which is exactly what the class attribute
-evaluates to on Windows.
+These tests keep covering the *conditional* ``_build_cmd`` behavior: when
+``supports_sessions`` is forced False (legacy/opt-in stateless mode) no
+``--resume`` is emitted; when True (now the default everywhere) a stored sid
+resumes. On macOS/Linux this resume is verified against Claude Code 2.1.x
+(the resumed session keeps the same session ID).
 
-Reference: https://github.com/saintiron82/agentcli/issues/4
+Reference: https://github.com/saintiron82/agentcli/issues/4 , /issues/27
 """
 
+import platform
 from unittest.mock import patch
 
 from agentcli.providers.claude import ClaudeProvider
 
 
 def _stateless_provider() -> ClaudeProvider:
-    """Simulate Windows mode: supports_sessions=False on the instance."""
+    """Force stateless mode (supports_sessions=False) on the instance."""
     p = ClaudeProvider()
     p.supports_sessions = False
     return p
 
 
+def test_issue_27_supports_sessions_true_on_all_platforms():
+    """#27: 플랫폼 가드 제거 — 클래스 기본값이 Windows 포함 항상 True."""
+    assert ClaudeProvider.supports_sessions is True
+    assert ClaudeProvider().supports_sessions is True, (
+        f"on {platform.system()}: stdin=DEVNULL 로 #4 데드락이 없으므로 "
+        "Windows 에서도 세션 resume 이 허용되어야 한다 (#27)")
+
+
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary",
        return_value="/usr/bin/claude")
 def test_issue_4_no_resume_in_stateless_mode(_mock_find):
-    """Windows(stateless) 모드에서는 session_id가 와도 ``--resume`` 금지."""
+    """강제 stateless 모드에서는 session_id가 와도 ``--resume`` 금지."""
     p = _stateless_provider()
     cmd, used_sid = p._build_cmd(
         prompt="hello",
