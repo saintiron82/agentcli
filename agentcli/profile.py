@@ -134,8 +134,14 @@ class AgentProfile:
         """
         if self.instructions:
             return self.instructions
-        if self.instructions_file and self.instructions_file.exists():
+        if self.instructions_file:
+            # exists()/stat()/read 를 모두 try 안에 둔다 — 파일시스템 오류(디스크
+            # 장애 등)로 resolve 가 raise 하지 않게. 특히 구버전 Path.exists 는
+            # 비-ENOENT OSError 를 re-raise 하므로(3.14 는 삼킴) 버전 독립적으로
+            # 빈 문자열 폴백을 보장한다.
             try:
+                if not self.instructions_file.exists():
+                    return ""
                 stat = self.instructions_file.stat()
                 cache = self.__dict__.get("_inst_cache")
                 if cache and cache[0] == stat.st_mtime:
