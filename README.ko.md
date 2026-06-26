@@ -340,6 +340,18 @@ ctx.fork("액션아이템만 추출")
 ctx.fork("캐주얼 요약", label="summary")
 ```
 
+**출력도 큰 결과가 여러 개** 필요하면 `fork_many` 가 독립 변형들을 동시 상한과
+함께 **병렬** 실행한다(wall-time ≈ 합이 아닌 가장 느린 1개):
+
+```python
+results = await ctx.fork_many(
+    ["상세 회의록.", "전체 이슈 표.", "이해관계자 보고서."],
+    concurrency=3, labels=["minutes", "issues", "report"])
+```
+
+큰 출력은 항목별로 `fork_stream` 으로 파일에 흘리거나, lean 을 끄고 에이전트가
+직접 파일을 쓰게 한다(`Write` 툴, `cwd` 에).
+
 **잠시 있다가 다시 요청**(또는 프로세스 재시작): 같은 `alias` + 전사록으로 다시
 `pin_context`. `refine` 이 `session_alive` 를 확인 — 살아있으면 resume(재전송
 없음), 죽었으면(만료/삭제) **전사록을 새 세션에 자동 재시드**. 각 모드는
@@ -388,7 +400,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 659개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 661개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 

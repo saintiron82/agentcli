@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.3 — unreleased
+
+### Added
+- **`ContextSession.fork_many(prompts, concurrency=N)`.** Run multiple
+  independent variations of a pinned context **in parallel** with a concurrency
+  cap — for "one big input, several big outputs." Each variation re-seeds the
+  transcript in its own session (no cross-contamination); results return in
+  input order; `concurrency` bounds the simultaneous subprocesses. Wall-time
+  converges to the slowest variation rather than the sum (live: 3 large outputs
+  in ~28s instead of ~90s+). For streaming large outputs to files, use
+  `fork_stream` per item or run the agent non-lean so it writes files itself.
+
 ## 0.6.2 — 2026-06-25
 
 ### Added

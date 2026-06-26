@@ -86,6 +86,47 @@ def test_fork_reseeds_independent_sessions():
     assert "sum" in a2[1]["alias"]
 
 
+def test_fork_many_parallel_with_concurrency_cap():
+    """복수 독립 변형을 병렬 실행 — 순서 보존, 동시 상한 준수, 각 변형 재시드."""
+    import asyncio
+    client = MagicMock()
+    client.session_alive.return_value = True
+    state = {"cur": 0, "max": 0}
+
+    async def fake_chat_async(prompt, **kw):
+        state["cur"] += 1
+        state["max"] = max(state["max"], state["cur"])
+        await asyncio.sleep(0.02)
+        state["cur"] -= 1
+        return f"R:{prompt[:8]}"
+
+    client.chat_async = AsyncMock(side_effect=fake_chat_async)
+    ctx = ContextSession(client, "CTX", provider="claude", owner="u", alias="m")
+    prompts = [f"q{i}" for i in range(6)]
+    results = asyncio.run(ctx.fork_many(prompts, concurrency=2))
+
+    assert len(results) == 6
+    assert state["max"] <= 2, "동시 실행 상한 준수"
+    # 결과는 입력 순서대로 (q0..q5 → R:CTX...)
+    assert all(r.startswith("R:CTX") for r in results)  # 각 prompt 재시드(CTX 로 시작)
+    # alias 가 모두 고유 (독립 세션)
+    aliases = [c.kwargs["alias"] for c in client.chat_async.call_args_list]
+    assert len(set(aliases)) == 6
+    assert all(c.kwargs.get("new_session") is True
+               for c in client.chat_async.call_args_list)
+
+
+def test_fork_many_respects_explicit_labels():
+    import asyncio
+    client = MagicMock()
+    client.chat_async = AsyncMock(return_value="ok")
+    ctx = ContextSession(client, "CTX", provider="claude", owner="u", alias="m")
+    asyncio.run(ctx.fork_many(["a", "b"], labels=["formal", "casual"]))
+    aliases = [c.kwargs["alias"] for c in client.chat_async.call_args_list]
+    assert any("formal" in a for a in aliases)
+    assert any("casual" in a for a in aliases)
+
+
 def test_is_alive_delegates_with_cwd():
     client = MagicMock()
     client.session_alive.return_value = True

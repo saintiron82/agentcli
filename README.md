@@ -594,6 +594,18 @@ ctx.fork("Extract action items only.")
 ctx.fork("Write a casual summary.", label="summary")
 ```
 
+When you need **several big outputs**, `fork_many` runs independent variations
+in parallel with a concurrency cap (wall-time ≈ the slowest, not the sum):
+
+```python
+results = await ctx.fork_many(
+    ["Detailed minutes.", "Full issue table.", "Stakeholder report."],
+    concurrency=3, labels=["minutes", "issues", "report"])
+```
+
+For large outputs, `fork_stream` each item to a file, or run non-lean and let
+the agent write the files itself (`Write` tool in `cwd`).
+
 Come back later (or after a process restart): re-`pin_context` with the same
 `alias` and transcript. `refine` checks `session_alive` — if the session is
 still alive it resumes (no re-send); if it died (expired/deleted) it
@@ -608,7 +620,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-659 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+661 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

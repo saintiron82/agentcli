@@ -1272,3 +1272,28 @@ class ContextSession:
     def fork_stream(self, prompt: str, *, label: str = "", **kw):
         p, a = self._fork_target(prompt, label)
         return self._client.chat_stream(p, new_session=True, **self._opts(a, kw))
+
+    async def fork_many(self, prompts, *, concurrency: int = 4,
+                        labels=None, **kw):
+        """여러 독립 변형을 **병렬** 실행 (동시 개수 상한). 결과는 입력 순서대로.
+
+        출력도 큰 복수 결과를 동시에 뽑을 때 — 각 변형은 전사록을 자기 세션에
+        재시드(서로 안 섞임)하고, ``concurrency`` 로 동시 서브프로세스 수를
+        제한한다(각 ``claude -p`` 가 무겁기 때문). wall-time 은 (상한 내에서)
+        가장 느린 변형으로 수렴한다.
+
+        labels 가 없으면 인덱스를 라벨로 써 alias 가 결정적·고유해진다(공유
+        카운터 race 회피). 큰 출력을 파일로 흘리려면 대신 ``fork_stream`` 을
+        항목별로 쓰거나, lean 을 끄고 에이전트에게 직접 파일을 쓰게 한다.
+        """
+        prompts = list(prompts)
+        if labels is None:
+            labels = [str(i) for i in range(len(prompts))]
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(prompt, label):
+            async with sem:
+                return await self.fork_async(prompt, label=label, **kw)
+
+        return await asyncio.gather(
+            *(_one(p, lbl) for p, lbl in zip(prompts, labels)))

@@ -39,6 +39,16 @@ def main() -> None:
     f2 = ctx.fork("이해관계자에게 보낼 캐주얼한 요약 한 문단.", label="casual")
     print("=== 캐주얼 요약 (독립) ===\n", f2.content, "\n")
 
+    # ── 출력도 큰 복수 결과 → fork_many 로 병렬 (동시 상한) ──
+    import asyncio
+    results = asyncio.run(ctx.fork_many(
+        ["상세 회의록을 길게 작성.",
+         "모든 이슈를 우선순위·담당자·기한 표로 정리.",
+         "이해관계자용 종합 보고서를 섹션 나눠 작성."],
+        concurrency=3, labels=["minutes", "issues", "report"]))
+    for lbl, r in zip(["minutes", "issues", "report"], results):
+        print(f"=== [{lbl}] ({len(r.content)}자) ===\n", r.content[:200], "...\n")
+
     # ── 잠시 있다가 다시 요청 (또는 다른 프로세스) ──
     # 같은 alias + 전사록으로 재구성하면, 세션이 살아있으면 resume,
     # 죽었으면 전사록을 자동 재시드한다.
