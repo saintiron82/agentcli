@@ -70,19 +70,21 @@ def _emit_invoke_debug(cmd: list[str], rc, latency_ms: int, stderr: str,
 
 class ClaudeProvider(LLMProvider):
     provider_id = "claude"
-    # macOS/Linux: `claude -p --resume <sid>` 가 네이티브 세션을 재개하며
-    # resume 후에도 동일 session_id 가 유지된다 (Claude Code 2.1.x 검증).
-    # Windows: `-p` + `--resume` 조합이 인터랙티브 입력 대기로 폴백되어
-    # 5분+ hang (issue #4) — Windows 에서만 stateless 로 동작하고
-    # `--session-id <new-uuid>` 는 usage audit 식별자로만 쓴다.
-    supports_sessions = platform.system() != "Windows"
+    # `claude -p --resume <sid>` 가 네이티브 세션을 재개하며 resume 후에도 동일
+    # session_id 가 유지된다 (Claude Code 2.1.x 검증). 전 플랫폼 동일.
+    #
+    # issue #4 (Windows 에서 `-p` + `--resume` 가 5분+ hang) 은 인터랙티브 stdin
+    # 대기가 원인이었는데, 지금은 모든 spawn 이 stdin=DEVNULL 이라(base.py:
+    # _run_stream_template / run_subprocess_sync) 그 대기가 발생할 수 없다. 따라서
+    # Windows 전용 stateless 가드는 불필요 → 제거 (issue #27). 만료 세션은
+    # STALE_SESSION_MARKER 자동복구로 새 세션 graceful fallback.
+    supports_sessions = True
     supports_streaming = True
     supports_token_streaming = True       # partial_messages → text_delta
     supports_session_recovery = True      # STALE_SESSION_MARKER → 새 세션
     supports_session_liveness = True      # session_alive: 세션 파일 검사
     supports_debug = True                 # --debug + 청크 타임라인 + trace
-    # 어느 모드든 히스토리는 Claude CLI 가 소유 — 라이브러리는 대화 내용을
-    # 저장하지 않는다 (Windows stateless 모드 포함).
+    # 어느 모드든 히스토리는 Claude CLI 가 소유 — 라이브러리는 대화 내용을 저장하지 않는다.
     stores_history = False
 
     def __init__(self,
@@ -274,9 +276,8 @@ class ClaudeProvider(LLMProvider):
                 if strict_mcp_config:
                     cmd.append("--strict-mcp-config")
 
-        # macOS/Linux: 저장된 session_id 가 있으면 `--resume` 으로 재개.
-        # Windows (supports_sessions=False): issue #4 데드락 회피를 위해
-        # resume 하지 않고 항상 새 식별자만 부여한다.
+        # 저장된 session_id 가 있으면 `--resume` 으로 재개 (전 플랫폼; stdin=DEVNULL
+        # 이라 #4 데드락 없음 — issue #27). 없으면 새 식별자를 부여한다.
         if session_id and self.supports_sessions:
             cmd += ["--resume", session_id]
             used_session_id = session_id

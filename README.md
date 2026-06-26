@@ -70,7 +70,7 @@ For a fuller product boundary, see [docs/positioning.md](docs/positioning.md).
 
 **The CLI session is the single source of truth for history.** The library stores only `session_id` per provider — it does not re-inject prior turns into prompts. This is what keeps the library lightweight and tokens predictable.
 
-- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag). The one exception is Claude on Windows, which stays stateless — see [Provider capabilities](#provider-capabilities).
+- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag), on every platform — see [Provider capabilities](#provider-capabilities).
 - `Conversation.metadata["session_id:<provider>"]` is persisted; content is not.
 - `system_prompt` / `AgentProfile.instructions` are injected only when a session has not seen that instruction hash yet, or when the instruction changes; prior user/assistant turns are not.
 - Sessionless providers (e.g., plain HTTP models if added later) still work — the library serializes prior messages for them.
@@ -385,7 +385,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Capability | claude | codex | copilot | kiro |
 |---|---|---|---|---|
-| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
 | `streaming` | ✅ | ✅ | ✅ | ✅ |
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
@@ -400,21 +400,22 @@ claude/codex/copilot; claude additionally instruments the non-streaming
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
-| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
+| `ClaudeProvider` | ✅ | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
 | `CodexProvider` | ✅ | ✅ | Parsed from `thread.started.thread_id` |
 | `CopilotProvider` | ✅ | ✅ | Parsed from `result.sessionId` |
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` result `sessionId`; transport = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider` drives `kiro-cli acp` (line-delimited JSON-RPC 2.0) as one-shot turns per call: `initialize` → first turn `session/new` / resume `session/load(stored sessionId)` → `session/prompt` → `session/update` stream. Token usage comes from `usage_update` notifications; permissions are auto-answered via `session/request_permission` (`trust_all`/`trust_tools`). Authentication uses `KIRO_API_KEY` (or `kiro-cli login`).
 
-`ClaudeProvider` runs `claude -p` with native session resume on macOS/Linux:
+`ClaudeProvider` runs `claude -p` with native session resume on every platform:
 the first call mints a fresh `--session-id`, the library stores it, and later
 calls on the same conversation pass `--resume <sid>`. The resumed session keeps
-the same ID (verified against Claude Code 2.1.x). On Windows, `-p` combined
-with `--resume` can fall back to interactive input and hang (issue #4), so the
-provider stays stateless there: each call gets a fresh per-call `--session-id`
-used for usage audit only, and no conversation content is persisted by the
-library.
+the same ID (verified against Claude Code 2.1.x on macOS/Linux). The earlier
+Windows hang (issue #4) was caused by an interactive **stdin** wait; agentcli
+now spawns every call with `stdin=DEVNULL`, so resume should work on Windows too
+— issue #27 reproduces the CLI-level behavior on Windows 11, and the guard
+removal is pending end-to-end Windows verification. No conversation content is
+persisted by the library.
 
 ## Security notes
 

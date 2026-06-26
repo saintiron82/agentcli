@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.5 — unreleased
+
+### Changed
+- **Claude session resume now works on Windows too (issue #27).** The Windows
+  `supports_sessions=False` guard (added for the issue #4 `-p` + `--resume`
+  5-minute hang) is removed. Root cause of #4 was an interactive **stdin** wait;
+  every claude spawn already uses `stdin=DEVNULL`, so the hang can't occur.
+  Issue #27 reproduces the CLI-level behavior on Windows 11
+  (`claude -p --resume <sid> < /dev/null` resumes cleanly, plain and
+  `--safe-mode`). `ClaudeProvider.supports_sessions` is now `True` on every
+  platform, so `owner`+`alias` session reuse (and `ContextSession`
+  pin-then-`refine`) is expected to work on Windows — no more re-sending the
+  context every call. Stale sessions still fall back to a fresh session via the
+  `STALE_SESSION_MARKER` auto-recovery path. End-to-end Windows verification of
+  the guard removal (incl. an MCP-on regression matrix) is pending before this
+  is released.
+
 ## 0.6.4 — unreleased
 
 ### Added
