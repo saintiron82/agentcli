@@ -22,8 +22,8 @@ import time
 from typing import AsyncIterator
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
-                   estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command, run_subprocess_async)
+                   emit_invoke_debug, estimate_payload_prompt_tokens,
+                   health_from_response, run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -277,7 +277,9 @@ class CodexProvider(LLMProvider):
                cwd: str | None = None,
                sandbox_mode: str | None = None,
                approval_policy: str | None = None,
-               mcp_config: dict | None = None) -> LLMResponse:
+               mcp_config: dict | None = None,
+               debug: bool = False,
+               debug_log_path: str | None = None) -> LLMResponse:
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
@@ -299,6 +301,10 @@ class CodexProvider(LLMProvider):
                 cmd, capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
             latency = int((time.time() - start) * 1000)
+            if debug:
+                emit_invoke_debug("codex", cmd, result.returncode, latency,
+                                  result.stderr or "", session_id=session_id,
+                                  path=debug_log_path)
 
             if result.returncode != 0:
                 if session_id and _is_codex_stale(result.stderr):
@@ -307,7 +313,8 @@ class CodexProvider(LLMProvider):
                     return self.invoke(
                         messages, model=model, timeout=timeout,
                         session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
-                        approval_policy=approval_policy, mcp_config=mcp_config)
+                        approval_policy=approval_policy, mcp_config=mcp_config,
+                        debug=debug, debug_log_path=debug_log_path)
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
                 logger.error("Codex 실패 (code=%d): %s",
                              result.returncode, msg)
@@ -363,6 +370,10 @@ class CodexProvider(LLMProvider):
             )
         except subprocess.TimeoutExpired:
             logger.error("Codex 타임아웃 (%d초)", timeout)
+            if debug:
+                emit_invoke_debug("codex", cmd, 124,
+                                  int((time.time() - start) * 1000), "",
+                                  session_id=session_id, path=debug_log_path)
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 error=f"timeout after {timeout}s",
                                 error_type="timeout",
@@ -382,7 +393,9 @@ class CodexProvider(LLMProvider):
                            cwd: str | None = None,
                            sandbox_mode: str | None = None,
                            approval_policy: str | None = None,
-                           mcp_config: dict | None = None) -> LLMResponse:
+                           mcp_config: dict | None = None,
+                           debug: bool = False,
+                           debug_log_path: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
@@ -410,6 +423,10 @@ class CodexProvider(LLMProvider):
                                 exit_code=127)
         if timed_out:
             logger.error("Codex 타임아웃 (%d초)", timeout)
+            if debug:
+                emit_invoke_debug("codex", cmd, 124,
+                                  int((time.time() - start) * 1000), "",
+                                  session_id=session_id, path=debug_log_path)
             return LLMResponse(content="", provider=self.provider_id,
                                 model=model, session_id=session_id,
                                 error=f"timeout after {timeout}s",
@@ -417,6 +434,9 @@ class CodexProvider(LLMProvider):
                                 exit_code=124)
         latency = int((time.time() - start) * 1000)
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
+        if debug:
+            emit_invoke_debug("codex", cmd, rc, latency, stderr_txt,
+                              session_id=session_id, path=debug_log_path)
 
         if rc != 0:
             if session_id and _is_codex_stale(stderr_txt):
@@ -425,7 +445,8 @@ class CodexProvider(LLMProvider):
                 return await self.invoke_async(
                     messages, model=model, timeout=timeout,
                     session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
-                    approval_policy=approval_policy, mcp_config=mcp_config)
+                    approval_policy=approval_policy, mcp_config=mcp_config,
+                    debug=debug, debug_log_path=debug_log_path)
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             logger.error("Codex 실패 (code=%d): %s", rc, msg)
             return LLMResponse(

@@ -23,7 +23,7 @@ import time
 from typing import AsyncIterator
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
-                   health_from_response, run_health_command,
+                   emit_invoke_debug, health_from_response, run_health_command,
                    run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
                      ProviderHealth, TokenUsage, StreamChunk, classify_error)
@@ -204,7 +204,9 @@ class CopilotProvider(LLMProvider):
                session_id: str = "",
                cwd: str | None = None,
                alias: str = "",
-               resume_by_alias: bool = True) -> LLMResponse:
+               resume_by_alias: bool = True,
+               debug: bool = False,
+               debug_log_path: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
@@ -223,6 +225,11 @@ class CopilotProvider(LLMProvider):
                 cmd, capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
             latency = int((time.time() - start) * 1000)
+            if debug:
+                emit_invoke_debug("copilot", cmd, result.returncode, latency,
+                                  result.stderr or "",
+                                  session_id=session_id or alias,
+                                  path=debug_log_path)
 
             if result.returncode != 0:
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
@@ -249,6 +256,11 @@ class CopilotProvider(LLMProvider):
             )
         except subprocess.TimeoutExpired:
             logger.error("Copilot 타임아웃 (%d초)", timeout)
+            if debug:
+                emit_invoke_debug("copilot", cmd, 124,
+                                  int((time.time() - start) * 1000), "",
+                                  session_id=session_id or alias,
+                                  path=debug_log_path)
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 session_id=session_id or alias,
                                 error=f"timeout after {timeout}s",
@@ -268,7 +280,9 @@ class CopilotProvider(LLMProvider):
                            session_id: str = "",
                            cwd: str | None = None,
                            alias: str = "",
-                           resume_by_alias: bool = True) -> LLMResponse:
+                           resume_by_alias: bool = True,
+                           debug: bool = False,
+                           debug_log_path: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
@@ -295,6 +309,11 @@ class CopilotProvider(LLMProvider):
                                 exit_code=127)
         if timed_out:
             logger.error("Copilot 타임아웃 (%d초)", timeout)
+            if debug:
+                emit_invoke_debug("copilot", cmd, 124,
+                                  int((time.time() - start) * 1000), "",
+                                  session_id=session_id or alias,
+                                  path=debug_log_path)
             return LLMResponse(content="", provider=self.provider_id, model=model,
                                 session_id=session_id or alias,
                                 error=f"timeout after {timeout}s",
@@ -303,6 +322,10 @@ class CopilotProvider(LLMProvider):
         latency = int((time.time() - start) * 1000)
         stdout_txt = stdout_b.decode("utf-8", errors="replace")
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
+        if debug:
+            emit_invoke_debug("copilot", cmd, rc, latency, stderr_txt,
+                              session_id=session_id or alias,
+                              path=debug_log_path)
 
         if rc != 0:
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
