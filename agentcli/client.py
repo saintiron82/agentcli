@@ -944,6 +944,33 @@ class LLMClient:
                     timeout=timeout, cwd=cwd, probe=probe)
         return result
 
+    def session_alive(self, provider: str, *, owner: str = "",
+                      alias: str = "", conversation_id: str = "",
+                      cwd: str | None = None) -> bool | None:
+        """저장된 세션이 (전체 LLM 호출 없이) 재개 가능한지 저렴하게 확인.
+
+        반환: ``True`` = 재개 가능 / ``False`` = 세션 없음 또는 죽음(다음 호출이
+        새 세션을 자동 발급) / ``None`` = provider 가 판단 불가(예: copilot).
+
+        ``cwd`` 는 claude 처럼 세션 경로가 cwd 로 해시되는 provider 에서 호출 때와
+        동일해야 정확하다.
+        """
+        p = self._registry.get(provider)
+        if p is None:
+            raise ValueError(f"unknown provider: {provider}")
+        with self._store_lock():
+            conv = None
+            if conversation_id:
+                conv = self._store.get(conversation_id)
+            elif alias:
+                conv = self._store.find_by_alias(owner, alias)
+        if conv is None:
+            return False  # 추적 중인 세션 없음
+        sid = conv.metadata.get(SESSION_KEY_FMT.format(provider=provider), "")
+        if not sid:
+            return False
+        return p.session_alive(sid, cwd=cwd)
+
     def get_token_stats(self, owner: str = "", days: int = 7,
                         *, alias: str = "", provider: str = "",
                         model: str = "", agent: str = "",

@@ -115,6 +115,44 @@ def test_invoke_new_session(mock_env, mock_run, mock_find):
     assert "resume" not in cmd
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_stale_session_auto_recovers(mock_env, mock_run, mock_find):
+    """죽은 thread(resume 실패: 'no rollout found') → 새 세션으로 1회 자동 재시도."""
+    stale = MagicMock(
+        returncode=1, stdout="",
+        stderr="Error: thread/resume failed: no rollout found for thread id abc (code -32600)")
+    fresh = MagicMock(
+        returncode=0,
+        stdout=('{"type":"thread.started","thread_id":"tid-new"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"recovered"}}\n'
+                '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'),
+        stderr="")
+    mock_run.side_effect = [stale, fresh]
+    p = CodexProvider()
+    resp = p.invoke([Message(role="user", content="hi")], session_id="abc")
+    assert resp.content == "recovered"
+    assert resp.session_id == "tid-new", "새 세션 thread_id 반환"
+    assert mock_run.call_count == 2
+    # 1차는 resume, 2차(재시도)는 새 세션(resume 아님)
+    assert "resume" in mock_run.call_args_list[0][0][0]
+    assert "resume" not in mock_run.call_args_list[1][0][0]
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_other_resume_failure_not_retried(mock_env, mock_run, mock_find):
+    """stale 외의 resume 실패는 재시도 없이 에러 반환."""
+    mock_run.return_value = MagicMock(
+        returncode=1, stdout="", stderr="some other error")
+    p = CodexProvider()
+    resp = p.invoke([Message(role="user", content="hi")], session_id="abc")
+    assert resp.error
+    assert mock_run.call_count == 1
+
+
 @patch("agentcli.providers.codex.shutil.which", return_value=r"C:\Users\u\AppData\Roaming\npm\codex.CMD")
 def test_build_cmd_uses_resolved_binary_path(mock_which):
     p = CodexProvider()

@@ -496,6 +496,17 @@ class LLMProvider(ABC):
                 f"supported selectors: {supported}")
         return selector
 
+    def session_alive(self, session_id: str, *,
+                      cwd: str | None = None) -> bool | None:
+        """세션이 (전체 LLM 호출 없이) 살아있는지 저렴하게 추정.
+
+        반환: ``True`` = 재개 가능 / ``False`` = 죽음(다음 호출이 새 세션을
+        자동 발급) / ``None`` = 판단 불가·미지원. 세션 파일을 들여다볼 수 있는
+        provider 만 override 한다 (claude/codex). copilot 등 불투명 provider 는
+        기본 ``None`` 을 그대로 둔다.
+        """
+        return None
+
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,
                      probe: bool = False) -> ProviderHealth:

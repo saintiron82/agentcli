@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import pathlib
 import platform
 import shutil
 import time
@@ -134,6 +136,23 @@ class ClaudeProvider(LLMProvider):
 
     def list_models(self) -> list[dict]:
         return list(CLAUDE_MODELS)
+
+    def session_alive(self, session_id: str, *,
+                      cwd: str | None = None) -> bool | None:
+        """Claude 네이티브 세션 파일 존재 여부로 liveness 판정 (호출 없이).
+
+        Claude Code 는 세션을 ``~/.claude/projects/<cwd의 '/'→'-'>/<sid>.jsonl``
+        에 저장한다(2.1.x 검증). 파일이 없으면 다음 ``--resume`` 이 실패하고
+        새 세션으로 자동 복구된다. cwd 는 호출 때와 동일해야 정확하다(경로가
+        cwd 로 해시되므로) — None 이면 현재 프로세스 cwd 를 쓴다.
+        """
+        if not session_id or not self.supports_sessions:
+            return False if session_id else None
+        base = cwd if cwd is not None else os.getcwd()
+        encoded = base.replace("/", "-")
+        path = (pathlib.Path.home() / ".claude" / "projects"
+                / encoded / f"{session_id}.jsonl")
+        return path.exists()
 
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,

@@ -32,8 +32,21 @@
   `codex exec` / `copilot -p` runs grouped by process group (leader + its
   MCP/node children), flags `[long]` / `[residual]` / `[defunct]` groups, and
   can `--kill <PGID>` a stuck one. Zero deps (stdlib + `ps`, POSIX).
+- **Session liveness check (`session_alive`).** `LLMProvider.session_alive` +
+  `LLMClient.session_alive(provider, owner=, alias=, cwd=)` report whether a
+  stored session can still be resumed — without a full LLM call. claude checks
+  its `~/.claude/projects/<cwd>/<sid>.jsonl` file; codex globs its
+  `~/.codex/sessions/**/rollout-*<thread>.jsonl`; opaque providers (copilot)
+  return `None` (unknown). `True` = resumable, `False` = gone (next call
+  auto-opens a new session), `None` = unsupported.
 
 ### Fixed
+- **Codex dead-session auto-reopen (parity with claude).** When a stored
+  codex thread is gone, `codex exec resume` fails with `no rollout found for
+  thread id`; `CodexProvider` now detects this and retries once in a fresh
+  session (invoke / invoke_async / stream_async), returning the new thread id —
+  matching claude's existing stale-session recovery. (Reopened sessions start
+  without prior history; the CLI owns history and agentcli stores only the id.)
 - **Zombie grandchild-process accumulation.** A CLI spawns its
   own children (MCP servers, hooks, node helpers). Killing only the direct
   child on timeout/cleanup left those grandchildren running — and a grandchild

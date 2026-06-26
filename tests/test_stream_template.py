@@ -121,6 +121,44 @@ def test_stream_partial_thinking_and_message_start_reset(monkeypatch):
     assert done.content == "ans", "thinking 은 최종 content 에 포함되지 않는다"
 
 
+def test_codex_stream_stale_session_recovers(monkeypatch):
+    """codex 스트리밍: 죽은 thread(첫 청크가 'no rollout found' 에러) → 새 세션
+    으로 1회 재시도해 복구."""
+    from agentcli.providers.codex import CodexProvider
+    from agentcli.types import Message
+    stale = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"Error: thread/resume failed: no rollout found for thread id abc")
+    fresh = make_fake_proc(stdout_lines=jsonl_bytes([
+        {"type": "thread.started", "thread_id": "tid-new"},
+        {"type": "item.completed",
+         "item": {"type": "agent_message", "text": "recovered"}},
+        {"type": "turn.completed",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]), returncode=0)
+    procs = iter([stale, fresh])
+
+    async def fake_create(*a, **k):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")], session_id="abc")]
+
+    chunks = asyncio.run(run())
+    # stale 에러는 caller 에 새지 않고, 복구된 text/done 만 보인다.
+    assert not any(c.type == "error" for c in chunks), "stale 에러 누출 금지"
+    done = [c for c in chunks if c.type == "done"][-1]
+    assert done.content == "recovered"
+    assert done.session_id == "tid-new"
+
+
 def test_stream_partial_with_tool_use_interleave(monkeypatch):
     """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
     는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""

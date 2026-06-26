@@ -14,6 +14,7 @@ Codex CLI (v0.118+)는 세션과 JSONL 이벤트 스트림을 제공:
 import asyncio
 import json
 import logging
+import pathlib
 import shutil
 import subprocess
 import time
@@ -28,6 +29,10 @@ from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
 from ..utils import build_env
 
 logger = logging.getLogger(__name__)
+
+# 저장된 thread(세션)가 삭제/만료되면 `codex exec resume` 가 이 메시지와 함께
+# 실패한다 — 이때만 새 세션으로 1회 자동 복구한다 (claude STALE_SESSION_MARKER 대응).
+CODEX_STALE_MARKER = "no rollout found for thread id"
 
 _CODEX_INITIAL_GREETINGS = {
     "ready. what would you like me to work on?",
@@ -125,6 +130,22 @@ class CodexProvider(LLMProvider):
 
     def list_models(self) -> list[dict]:
         return list(CODEX_MODELS)
+
+    def session_alive(self, session_id: str, *,
+                      cwd: str | None = None) -> bool | None:
+        """Codex thread(rollout) 파일 존재 여부로 liveness 판정 (호출 없이).
+
+        Codex 는 세션을 ``~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>
+        .jsonl`` 로 저장한다. thread_id 가 파일명에 들어가므로 그 sid 로
+        recursive glob 한다. 없으면 ``resume`` 이 ``no rollout found`` 로 실패하고
+        새 세션으로 자동 복구된다. (cwd 무관 — codex 세션 경로는 날짜 기반)
+        """
+        if not session_id:
+            return None
+        root = pathlib.Path.home() / ".codex" / "sessions"
+        if not root.exists():
+            return False
+        return any(root.glob(f"**/rollout-*{session_id}.jsonl"))
 
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,
@@ -266,6 +287,13 @@ class CodexProvider(LLMProvider):
             latency = int((time.time() - start) * 1000)
 
             if result.returncode != 0:
+                if session_id and CODEX_STALE_MARKER in (result.stderr or ""):
+                    logger.warning(
+                        "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
+                    return self.invoke(
+                        messages, model=model, timeout=timeout,
+                        session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
+                        approval_policy=approval_policy, mcp_config=mcp_config)
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
                 logger.error("Codex 실패 (code=%d): %s",
                              result.returncode, msg)
@@ -377,6 +405,13 @@ class CodexProvider(LLMProvider):
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
 
         if rc != 0:
+            if session_id and CODEX_STALE_MARKER in stderr_txt:
+                logger.warning(
+                    "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
+                return await self.invoke_async(
+                    messages, model=model, timeout=timeout,
+                    session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
+                    approval_policy=approval_policy, mcp_config=mcp_config)
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             logger.error("Codex 실패 (code=%d): %s", rc, msg)
             return LLMResponse(
@@ -424,24 +459,41 @@ class CodexProvider(LLMProvider):
           error / turn.failed                         → error
         """
         prompt = build_session_prompt(messages)
-        cmd = self._build_cmd(prompt, model, cwd, session_id,
-                              sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy,
-                              mcp_config=mcp_config)
-        if cmd is None:
-            yield StreamChunk(type="error", content="codex CLI not found")
-            return
-        state = StreamState(
-            final_session_id=session_id,
-            final_usage=TokenUsage(
-                payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
-                prompt_tokens_reliable=False,
-                prompt_tokens_source="codex_cli_reported"))
-        async for chunk in self._run_stream_template(
-                cmd, state, model=model, cwd=cwd, timeout=timeout,
-                idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                env=build_env()):
-            yield chunk
+        # 만료된 thread 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
+        # stale-session 에러일 때만 새 세션으로 1회 재시도한다 (claude 동일 패턴).
+        attempt_sid = session_id
+        for _attempt in range(2):
+            cmd = self._build_cmd(prompt, model, cwd, attempt_sid,
+                                  sandbox_mode=sandbox_mode,
+                                  approval_policy=approval_policy,
+                                  mcp_config=mcp_config)
+            if cmd is None:
+                yield StreamChunk(type="error", content="codex CLI not found")
+                return
+            state = StreamState(
+                final_session_id=attempt_sid,
+                final_usage=TokenUsage(
+                    payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
+                    prompt_tokens_reliable=False,
+                    prompt_tokens_source="codex_cli_reported"))
+            retry_stale = False
+            emitted = False
+            async for chunk in self._run_stream_template(
+                    cmd, state, model=model, cwd=cwd, timeout=timeout,
+                    idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                    env=build_env()):
+                if (attempt_sid and not emitted
+                        and chunk.type == "error"
+                        and CODEX_STALE_MARKER in (chunk.content or "")):
+                    retry_stale = True
+                    break
+                emitted = True
+                yield chunk
+            if not retry_stale:
+                return
+            logger.warning(
+                "Codex 세션 %s 만료 — 새 세션으로 스트림 재시도", attempt_sid[:8])
+            attempt_sid = ""
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:

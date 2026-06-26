@@ -535,6 +535,22 @@ python3 scripts/agentcli_ps.py --older-than 300  # only suspiciously long ones
 python3 scripts/agentcli_ps.py --kill <PGID>     # SIGKILL a stuck group
 ```
 
+### Session liveness & recovery
+
+Sessions resume across calls (and across restarts with `SQLiteStore`). If a
+stored session is gone, the next call auto-opens a fresh one — claude on
+`No conversation found with session ID`, codex on `no rollout found for thread
+id` — and persists the new id (the reopened session starts without prior
+history, since the CLI owns history and agentcli stores only the id).
+
+To check before calling, `session_alive` probes the session file without an LLM
+call:
+
+```python
+alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
+# True = resumable · False = gone (next call reopens) · None = unknown (e.g. copilot)
+```
+
 ## Testing
 
 ```bash
@@ -542,7 +558,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-442 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+451 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
