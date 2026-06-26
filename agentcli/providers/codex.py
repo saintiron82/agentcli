@@ -12,6 +12,7 @@ Codex CLI (v0.118+)는 세션과 JSONL 이벤트 스트림을 제공:
 """
 
 import asyncio
+import glob as _glob
 import json
 import logging
 import pathlib
@@ -32,7 +33,14 @@ logger = logging.getLogger(__name__)
 
 # 저장된 thread(세션)가 삭제/만료되면 `codex exec resume` 가 이 메시지와 함께
 # 실패한다 — 이때만 새 세션으로 1회 자동 복구한다 (claude STALE_SESSION_MARKER 대응).
-CODEX_STALE_MARKER = "no rollout found for thread id"
+# 실제 stderr: "thread/resume failed: no rollout found for thread id <uuid>".
+# 버전별 표기 흔들림(대소문자 등)에 견디도록 짧은 anchor + 소문자 비교.
+CODEX_STALE_MARKER = "no rollout found"
+
+
+def _is_codex_stale(text: str | None) -> bool:
+    return CODEX_STALE_MARKER in (text or "").lower()
+
 
 _CODEX_INITIAL_GREETINGS = {
     "ready. what would you like me to work on?",
@@ -145,7 +153,9 @@ class CodexProvider(LLMProvider):
         root = pathlib.Path.home() / ".codex" / "sessions"
         if not root.exists():
             return False
-        return any(root.glob(f"**/rollout-*{session_id}.jsonl"))
+        # session_id 의 glob 메타문자(*,?,[)를 escape — 안 하면 '*' 가 아무 파일
+        # 이나 매칭해 죽은 세션을 살아있다고 오판할 수 있다.
+        return any(root.glob(f"**/rollout-*{_glob.escape(session_id)}.jsonl"))
 
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,
@@ -287,7 +297,7 @@ class CodexProvider(LLMProvider):
             latency = int((time.time() - start) * 1000)
 
             if result.returncode != 0:
-                if session_id and CODEX_STALE_MARKER in (result.stderr or ""):
+                if session_id and _is_codex_stale(result.stderr):
                     logger.warning(
                         "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
                     return self.invoke(
@@ -405,7 +415,7 @@ class CodexProvider(LLMProvider):
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
 
         if rc != 0:
-            if session_id and CODEX_STALE_MARKER in stderr_txt:
+            if session_id and _is_codex_stale(stderr_txt):
                 logger.warning(
                     "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
                 return await self.invoke_async(
@@ -484,7 +494,7 @@ class CodexProvider(LLMProvider):
                     env=build_env()):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"
-                        and CODEX_STALE_MARKER in (chunk.content or "")):
+                        and _is_codex_stale(chunk.content)):
                     retry_stale = True
                     break
                 emitted = True

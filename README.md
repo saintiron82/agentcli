@@ -558,7 +558,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-451 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+462 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

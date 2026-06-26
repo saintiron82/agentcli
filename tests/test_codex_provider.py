@@ -153,6 +153,74 @@ def test_invoke_other_resume_failure_not_retried(mock_env, mock_run, mock_find):
     assert mock_run.call_count == 1
 
 
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_stale_recovery_is_bounded(mock_env, mock_run, mock_find):
+    """재시도(새 세션)도 stale 면 무한 루프 없이 1회로 끝낸다."""
+    stale = MagicMock(returncode=1, stdout="",
+                      stderr="no rollout found for thread id abc")
+    mock_run.side_effect = [stale, stale]
+    p = CodexProvider()
+    resp = p.invoke([Message(role="user", content="hi")], session_id="abc")
+    assert mock_run.call_count == 2, "정확히 1회 재시도 (무한 루프 금지)"
+    assert resp.error  # 2번째(새 세션)도 실패 → 에러 반환, 3번째 호출 없음
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_stale_recovery_preserves_options(mock_env, mock_run, mock_find):
+    """stale 재시도(새 세션)에 sandbox/approval 이 적용된다 (resume 는 무시하던 것)."""
+    stale = MagicMock(returncode=1, stdout="",
+                      stderr="no rollout found for thread id abc")
+    fresh = MagicMock(
+        returncode=0,
+        stdout='{"type":"thread.started","thread_id":"tid-new"}\n'
+               '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+        stderr="")
+    mock_run.side_effect = [stale, fresh]
+    p = CodexProvider()
+    p.invoke([Message(role="user", content="hi")], session_id="abc",
+             sandbox_mode="workspace-write", approval_policy="never")
+    cmd2 = mock_run.call_args_list[1][0][0]
+    assert "resume" not in cmd2
+    assert "-s" in cmd2 and "workspace-write" in cmd2
+    assert "-a" in cmd2 and "never" in cmd2
+
+
+def test_is_codex_stale_case_insensitive():
+    """버전별 표기 흔들림(대소문자)에 견디는 stale 마커 매칭."""
+    from agentcli.providers.codex import _is_codex_stale
+    assert _is_codex_stale(
+        "Error: thread/resume failed: no rollout found for thread id abc (code -32600)")
+    assert _is_codex_stale("No Rollout Found for thread id X")  # 대문자 변형
+    assert _is_codex_stale("no rollout found")
+    assert not _is_codex_stale("some unrelated error")
+    assert not _is_codex_stale(None)
+    assert not _is_codex_stale("")
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_async_stale_session_auto_recovers(mock_env, mock_find):
+    """async 경로도 죽은 thread → 새 세션 1회 자동 재시도 (sync 와 parity)."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    stale = (b"", b"thread/resume failed: no rollout found for thread id abc", 1, False)
+    fresh = (b'{"type":"thread.started","thread_id":"tid-new"}\n'
+             b'{"type":"item.completed","item":{"type":"agent_message","text":"recovered"}}\n',
+             b"", 0, False)
+    with patch("agentcli.providers.codex.run_subprocess_async",
+               new=AsyncMock(side_effect=[stale, fresh])) as m:
+        p = CodexProvider()
+        resp = asyncio.run(p.invoke_async(
+            [Message(role="user", content="hi")], session_id="abc"))
+    assert resp.content == "recovered"
+    assert resp.session_id == "tid-new"
+    assert m.call_count == 2
+
+
 @patch("agentcli.providers.codex.shutil.which", return_value=r"C:\Users\u\AppData\Roaming\npm\codex.CMD")
 def test_build_cmd_uses_resolved_binary_path(mock_which):
     p = CodexProvider()

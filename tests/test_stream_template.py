@@ -159,6 +159,36 @@ def test_codex_stream_stale_session_recovers(monkeypatch):
     assert done.session_id == "tid-new"
 
 
+def test_codex_stream_stale_recovery_is_bounded(monkeypatch):
+    """스트리밍 재시도(새 세션)도 stale 면 무한 루프 없이 에러를 caller 에 전달."""
+    from agentcli.providers.codex import CodexProvider
+    from agentcli.types import Message
+    stale = make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"no rollout found for thread id abc")
+    # 두 번 모두 stale
+    procs = iter([stale, make_fake_proc(
+        stdout_lines=[], returncode=1,
+        stderr_bytes=b"no rollout found for thread id abc")])
+
+    async def fake_create(*a, **k):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")], session_id="abc")]
+
+    chunks = asyncio.run(run())
+    # 2번째(새 세션)도 실패 → 에러 청크가 caller 에 전달됨 (무한 루프 아님)
+    assert any(c.type == "error" for c in chunks)
+
+
 def test_stream_partial_with_tool_use_interleave(monkeypatch):
     """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
     는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""

@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import platform
+import re
 import shutil
 import time
 import uuid
@@ -141,15 +142,17 @@ class ClaudeProvider(LLMProvider):
                       cwd: str | None = None) -> bool | None:
         """Claude 네이티브 세션 파일 존재 여부로 liveness 판정 (호출 없이).
 
-        Claude Code 는 세션을 ``~/.claude/projects/<cwd의 '/'→'-'>/<sid>.jsonl``
-        에 저장한다(2.1.x 검증). 파일이 없으면 다음 ``--resume`` 이 실패하고
-        새 세션으로 자동 복구된다. cwd 는 호출 때와 동일해야 정확하다(경로가
-        cwd 로 해시되므로) — None 이면 현재 프로세스 cwd 를 쓴다.
+        Claude Code 는 세션을 ``~/.claude/projects/<encode(cwd)>/<sid>.jsonl``
+        에 저장한다(2.1.x 검증). 인코딩 규칙은 **영숫자 외 모든 문자를 '-' 로**
+        치환 — 예: ``/Users/x/.claude`` → ``-Users-x--claude``(`/`·`.` 둘 다 '-').
+        파일이 없으면 다음 ``--resume`` 이 실패하고 새 세션으로 자동 복구된다.
+        cwd 는 호출 때와 동일해야 정확하다(경로가 cwd 로 해시되므로) — None 이면
+        현재 프로세스 cwd. symlink/trailing slash 는 ``realpath`` 로 정규화.
         """
         if not session_id or not self.supports_sessions:
             return False if session_id else None
-        base = cwd if cwd is not None else os.getcwd()
-        encoded = base.replace("/", "-")
+        base = os.path.realpath(cwd if cwd is not None else os.getcwd())
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", base)
         path = (pathlib.Path.home() / ".claude" / "projects"
                 / encoded / f"{session_id}.jsonl")
         return path.exists()
