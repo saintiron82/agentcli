@@ -380,7 +380,8 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| claude 전용 옵션 | `lean`, `debug`, `partial_messages` | — | — | — |
+| `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
+| claude 전용 옵션 | `lean`, `partial_messages` | — | — | — |
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
@@ -400,7 +401,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 662개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 665개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 

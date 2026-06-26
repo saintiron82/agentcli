@@ -80,6 +80,7 @@ class ClaudeProvider(LLMProvider):
     supports_token_streaming = True       # partial_messages → text_delta
     supports_session_recovery = True      # STALE_SESSION_MARKER → 새 세션
     supports_session_liveness = True      # session_alive: 세션 파일 검사
+    supports_debug = True                 # --debug + 청크 타임라인 + trace
     # 어느 모드든 히스토리는 Claude CLI 가 소유 — 라이브러리는 대화 내용을
     # 저장하지 않는다 (Windows stateless 모드 포함).
     stores_history = False

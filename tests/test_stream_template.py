@@ -189,6 +189,40 @@ def test_codex_stream_stale_recovery_is_bounded(monkeypatch):
     assert any(c.type == "error" for c in chunks)
 
 
+def test_codex_stream_debug_writes_trace(monkeypatch, tmp_path):
+    """codex 스트리밍도 debug 계측(청크 타임라인 + trace) — 전 provider 확대."""
+    import json
+    from agentcli.providers.codex import CodexProvider
+    from agentcli.types import Message
+    events = [
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "item.completed",
+         "item": {"type": "agent_message", "text": "hi"}},
+        {"type": "turn.completed",
+         "usage": {"input_tokens": 3, "output_tokens": 2}},
+    ]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    proc.stderr = FakeReadline([b"codex debug stderr\n"])
+    patch_subprocess_exec(monkeypatch, proc)
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    prov = CodexProvider()
+    trace = tmp_path / "codex.jsonl"
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="hi")],
+            debug=True, debug_log_path=str(trace))]
+
+    chunks = asyncio.run(run())
+    assert any(c.type == "text" for c in chunks)
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "stream"
+    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+    assert any(c["type"] == "text" for c in rec["chunks"])
+
+
 def test_stream_partial_with_tool_use_interleave(monkeypatch):
     """partial: 텍스트는 델타로, tool_use 는 전체 assistant 블록에서, tool_result
     는 user 블록에서 — 텍스트 중복 없이 올바른 순서/최종 content."""

@@ -390,7 +390,8 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| claude-only options | `lean`, `debug`, `partial_messages` | — | — | — |
+| `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
+| claude-only options | `lean`, `partial_messages` | — | — | — |
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
@@ -620,7 +621,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-662 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+665 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
