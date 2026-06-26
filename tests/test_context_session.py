@@ -116,6 +116,14 @@ def test_fork_many_parallel_with_concurrency_cap():
                for c in client.chat_async.call_args_list)
 
 
+def test_fork_many_mismatched_labels_raises():
+    """labels 길이가 prompts 와 다르면 zip 절단으로 누락되므로 명시적 거부."""
+    import asyncio
+    ctx = ContextSession(MagicMock(), "C", provider="claude", owner="u", alias="m")
+    with pytest.raises(ValueError):
+        asyncio.run(ctx.fork_many(["a", "b", "c"], labels=["only-one"]))
+
+
 def test_fork_many_respects_explicit_labels():
     import asyncio
     client = MagicMock()

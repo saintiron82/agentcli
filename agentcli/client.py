@@ -1289,6 +1289,11 @@ class ContextSession:
         prompts = list(prompts)
         if labels is None:
             labels = [str(i) for i in range(len(prompts))]
+        elif len(labels) != len(prompts):
+            # 길이 불일치면 zip 이 조용히 잘라 prompt 를 누락시킨다 → 명시적 거부.
+            raise ValueError(
+                f"labels length ({len(labels)}) must match prompts "
+                f"({len(prompts)})")
         sem = asyncio.Semaphore(max(1, concurrency))
 
         async def _one(prompt, label):
