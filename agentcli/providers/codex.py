@@ -112,6 +112,7 @@ class CodexProvider(LLMProvider):
     supports_token_streaming = False      # item.completed = 메시지 블록 단위
     supports_session_recovery = True      # CODEX_STALE_MARKER → 새 세션
     supports_session_liveness = True      # session_alive: rollout 파일 검사
+    supports_debug = True                 # 스트리밍 청크 타임라인 + trace
     stores_history = False  # 히스토리는 Codex CLI 세션이 소유
 
     def __init__(self,
@@ -457,7 +458,9 @@ class CodexProvider(LLMProvider):
                            wall_timeout: int | None = None,
                            sandbox_mode: str | None = None,
                            approval_policy: str | None = None,
-                           mcp_config: dict | None = None) -> AsyncIterator[StreamChunk]:
+                           mcp_config: dict | None = None,
+                           debug: bool = False,
+                           debug_log_path: str | None = None) -> AsyncIterator[StreamChunk]:
         """Codex exec --json JSONL 이벤트 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -494,7 +497,7 @@ class CodexProvider(LLMProvider):
             async for chunk in self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=build_env()):
+                    env=build_env(), debug=debug, debug_log_path=debug_log_path):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"
                         and _is_codex_stale(chunk.content)):

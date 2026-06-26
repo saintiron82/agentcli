@@ -212,6 +212,7 @@ class ProviderCapabilities:
     session_liveness: bool    # session_alive 가 bool 반환 (None=미지원 아님)
     options: frozenset        # 받는 per-call provider_options 키
     notes: str = ""           # OS 등 단서
+    debug: bool = False        # debug 계측(청크 타임라인/trace) 지원
 
     def to_dict(self) -> dict:
         return {
@@ -221,6 +222,7 @@ class ProviderCapabilities:
             "token_streaming": self.token_streaming,
             "session_recovery": self.session_recovery,
             "session_liveness": self.session_liveness,
+            "debug": self.debug,
             "options": sorted(self.options),
             "notes": self.notes,
         }

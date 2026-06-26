@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.4 — unreleased
+
+### Added
+- **Debug instrumentation promoted to first-class, cross-provider.** The
+  streaming debug trace (per-chunk timeline + concurrent stderr drain) now works
+  for **codex and copilot** too, not just claude — their `stream_async` accept
+  `debug` / `debug_log_path` and delegate to the shared `_run_stream_template`
+  (verified live: a real codex stream produced a chunk-timeline trace). kiro is
+  out of scope (ACP transport, not the stream-json template).
+- **Trace robustness.** Every trace record now carries a `schema` (format
+  version, currently `1`) and a unique `call_id`, so interleaved traces from
+  parallel `fork_many` runs are groupable and consumers can branch on format.
+  `write_debug_trace` serializes writes with a lock so concurrent appends from
+  multiple threads can't corrupt a line.
+- **`debug` is now a declared capability.** `ProviderCapabilities.debug` and the
+  `capability_matrix()` row show which providers have debug instrumentation
+  (claude/codex/copilot ✓, kiro ✗); `supports(provider, "debug")` reflects it.
+  Scope: codex/copilot `debug` covers the **streaming** path only; their
+  non-streaming `invoke` ignores `debug=True` (claude instruments both). Full
+  invoke-path parity for codex/copilot is a tracked follow-up.
+
 ## 0.6.3 — 2026-06-26
 
 ### Added

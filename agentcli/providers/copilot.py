@@ -67,6 +67,7 @@ class CopilotProvider(LLMProvider):
     supports_token_streaming = True       # assistant.message_delta = 증분
     supports_session_recovery = True      # --name resume → 없으면 같은 이름 새 세션
     supports_session_liveness = False     # 세션 저장이 불투명 → session_alive None
+    supports_debug = True                 # 스트리밍 청크 타임라인 + trace
     stores_history = False  # 히스토리는 Copilot CLI 세션이 소유
 
     def __init__(self,
@@ -335,7 +336,9 @@ class CopilotProvider(LLMProvider):
                            alias: str = "",
                            resume_by_alias: bool = True,
                            idle_timeout: int | None = None,
-                           wall_timeout: int | None = None) -> AsyncIterator[StreamChunk]:
+                           wall_timeout: int | None = None,
+                           debug: bool = False,
+                           debug_log_path: str | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -362,7 +365,7 @@ class CopilotProvider(LLMProvider):
         async for chunk in self._run_stream_template(
                 cmd, state, model=model, cwd=cwd, timeout=timeout,
                 idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                env=build_env()):
+                env=build_env(), debug=debug, debug_log_path=debug_log_path):
             yield chunk
 
     async def _dispatch_stream_event(self, evt: dict,

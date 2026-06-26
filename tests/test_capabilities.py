@@ -50,12 +50,26 @@ def test_client_supports_query():
 def test_client_unsupported_options_guides():
     c = _client()
     # codex 는 sandbox_mode 만 받고 lean/debug 는 안 받는다
+    # codex 는 debug(스트리밍 계측)·sandbox_mode 를 받지만 lean 은 claude 전용.
     assert c.unsupported_options(
-        "codex", {"lean": 1, "debug": 1, "sandbox_mode": "x"}) == ["debug", "lean"]
+        "codex", {"lean": 1, "debug": 1, "sandbox_mode": "x"}) == ["lean"]
     # claude 는 셋 다 받음(단 sandbox_mode 는 claude 옵션 아님) → sandbox_mode 만 미지원
     assert c.unsupported_options(
         "claude", {"lean": 1, "debug": 1, "sandbox_mode": 1}) == ["sandbox_mode"]
     assert c.unsupported_options("claude", None) == []
+
+
+def test_capability_debug_flag_cross_provider():
+    """debug 계측은 claude/codex/copilot(stream-json·JSONL) 지원, kiro(ACP) 미지원."""
+    c = _client()
+    assert c.capabilities("claude").debug is True
+    assert c.capabilities("codex").debug is True
+    assert c.capabilities("copilot").debug is True
+    assert c.capabilities("kiro").debug is False
+    assert c.supports("codex", "debug") is True       # 옵션으로도 노출
+    m = c.capability_matrix()
+    assert m["codex"]["debug"] is True
+    assert m["kiro"]["debug"] is False
 
 
 def test_capability_matrix_lists_all_providers():

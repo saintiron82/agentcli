@@ -6,7 +6,9 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -137,15 +139,27 @@ def redact_argv(cmd: list[str]) -> list[str]:
     return out
 
 
+# debug trace 포맷 버전 — 필드가 바뀌면 올린다(소비자가 분기 가능).
+DEBUG_TRACE_SCHEMA = 1
+# 같은 파일에 여러 스레드(예: 병렬 sync invoke)가 append 할 때 라인 깨짐 방지.
+_TRACE_LOCK = threading.Lock()
+
+
 def write_debug_trace(path: str, record: dict) -> None:
     """Append one JSON-Lines trace record to ``path`` (best-effort, zero-dep).
 
-    실패는 경고만 남기고 호출을 막지 않는다 — 디버그 보조 기능이 본 호출을
-    깨뜨리면 안 된다.
+    모든 레코드에 ``schema``(포맷 버전) 와 ``call_id``(호출 고유 id)를 stamp 한다
+    — 병렬 fork 처럼 여러 호출의 trace 가 한 파일에 섞여도 call_id 로 구분된다.
+    프로세스 내 동시 쓰기는 ``_TRACE_LOCK`` 으로 직렬화(라인 interleave 방지).
+    실패는 경고만 — 디버그 보조가 본 호출을 깨뜨리면 안 된다.
     """
+    rec = {**record, "schema": DEBUG_TRACE_SCHEMA}
+    rec.setdefault("call_id", uuid.uuid4().hex[:12])
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with _TRACE_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "debug trace 기록 실패 (%s): %s", path, exc)
@@ -186,6 +200,7 @@ class LLMProvider(ABC):
     supports_token_streaming: bool = False
     supports_session_recovery: bool = False
     supports_session_liveness: bool = False
+    supports_debug: bool = False   # debug 계측(청크 타임라인/trace) 지원
     # capabilities().options 에서 제외할 공통 호출 인자 (provider 고유 옵션만 남김).
     _COMMON_CALL_ARGS = frozenset({
         "self", "messages", "model", "timeout", "session_id", "cwd",
@@ -217,6 +232,7 @@ class LLMProvider(ABC):
             token_streaming=self.supports_token_streaming,
             session_recovery=self.supports_session_recovery,
             session_liveness=self.supports_session_liveness,
+            debug=self.supports_debug,
             options=frozenset(opts),
             notes=capability_notes,
         )
