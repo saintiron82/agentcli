@@ -65,6 +65,20 @@ def _cleanup(tag: str) -> None:
     subprocess.run(["pkill", "-f", f"sleep {tag}"], capture_output=True)
 
 
+def _wait_gone(tag: str, timeout: float = 5.0) -> bool:
+    """좀비 손자가 사라질 때까지 폴링 — 고정 sleep 대신 조건 대기로 부하 무관 견고.
+
+    SIGKILL 후 OS 가 손자를 reap 하는 데 부하 시 시간이 더 걸릴 수 있어, 고정
+    0.4s 대기는 간헐 실패를 낳았다. 사라지면 즉시 True 반환.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _zombie_alive(tag):
+            return True
+        time.sleep(0.05)
+    return not _zombie_alive(tag)
+
+
 def test_run_subprocess_sync_reaps_grandchild():
     """타임아웃 시 그룹 kill → 손자 sleep 이 남지 않아야 한다."""
     tag = "9182731"
@@ -72,8 +86,7 @@ def test_run_subprocess_sync_reaps_grandchild():
         _out, _err, _rc, timed = run_subprocess_sync(
             ["sh", "-c", f"sleep {tag} & exit 0"], timeout=1)
         assert timed is True
-        time.sleep(0.4)
-        assert not _zombie_alive(tag), "그룹 kill 후 좀비 sleep 손자가 남으면 안 됨"
+        assert _wait_gone(tag), "그룹 kill 후 좀비 sleep 손자가 남으면 안 됨"
     finally:
         _cleanup(tag)
 
@@ -89,8 +102,7 @@ def test_run_subprocess_async_reaps_grandchild():
     try:
         _out, _err, _rc, timed = asyncio.run(run())
         assert timed is True
-        time.sleep(0.4)
-        assert not _zombie_alive(tag)
+        assert _wait_gone(tag)
     finally:
         _cleanup(tag)
 
@@ -117,7 +129,6 @@ def test_run_stream_template_reaps_grandchild():
     try:
         chunks = asyncio.run(run())
         assert any(c.type == "error" for c in chunks), "idle timeout error chunk 기대"
-        time.sleep(0.4)
-        assert not _zombie_alive(tag), "스트리밍 그룹 kill 후 좀비 손자가 남으면 안 됨"
+        assert _wait_gone(tag), "스트리밍 그룹 kill 후 좀비 손자가 남으면 안 됨"
     finally:
         _cleanup(tag)
