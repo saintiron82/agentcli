@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.3 — unreleased
+## 0.6.3 — 2026-06-26
 
 ### Added
 - **`ContextSession.fork_many(prompts, concurrency=N)`.** Run multiple
