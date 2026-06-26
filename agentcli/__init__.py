@@ -19,7 +19,7 @@ from .types import (
     ProviderHealth, ProviderCapabilities, STREAM_CHUNK_TYPES,
     make_error_chunk, standardize_error_chunk,
 )
-from .client import LLMClient
+from .client import LLMClient, ContextSession
 from .providers.base import LLMProvider
 from .providers.registry import ProviderRegistry, create_default_registry
 from .store.base import ConversationStore
@@ -38,7 +38,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "__version__",
-    "LLMClient",
+    "LLMClient", "ContextSession",
     "LLMResponse", "Message", "Conversation", "TokenUsage", "ProviderHealth",
     "ProviderCapabilities",
     "StreamChunk", "STREAM_CHUNK_TYPES",

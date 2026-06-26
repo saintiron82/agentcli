@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import uuid
 import weakref
 from contextlib import nullcontext
 from datetime import datetime
@@ -1002,6 +1003,24 @@ class LLMClient:
                 continue
         return matrix
 
+    def pin_context(self, context: str, *, provider: str = "", owner: str = "",
+                    alias: str = "", cwd: str | None = None, model: str = "",
+                    separator: str = "\n\n---\n",
+                    **chat_kwargs) -> "ContextSession":
+        """큰 컨텍스트(예: 5만 자 전사록)를 1회 주입하고 그 위에서 여러 질의.
+
+        반환된 ``ContextSession`` 은 ``refine()``(이어가기)·``fork()``(독립 변형)
+        를 제공한다. 같은 ``alias`` 로 다시 ``pin_context`` 하면 — 시간이 지났거나
+        프로세스를 재시작했어도 — 세션이 살아있으면 전사록 재전송 없이 이어가고,
+        죽었으면 자동으로 전사록을 재시드한다. 자세한 동작은 ``ContextSession``.
+
+        라이브러리는 세션 id 만 저장하므로(설계 불변식), 전사록 본문은 호스트가
+        들고 이 핸들을 (재)구성한다.
+        """
+        return ContextSession(
+            self, context, provider=provider, owner=owner, alias=alias,
+            cwd=cwd, model=model, separator=separator, **chat_kwargs)
+
     def unsupported_options(self, provider: str,
                             options: dict | None) -> list[str]:
         """provider 가 받지 않는 provider_options 키 목록.
@@ -1145,3 +1164,111 @@ class LLMClient:
                         "cleared_keys": keys_to_clear,
                     })
             return rows
+
+
+class ContextSession:
+    """큰 컨텍스트를 1회 주입하고 그 위에서 여러 질의를 던지는 핸들.
+
+    ``LLMClient.pin_context(...)`` 가 생성. 두 가지 방식:
+
+    - ``refine(prompt)`` — **이어가기**: 같은 세션을 resume 하여 이전 답을 본다.
+      세션이 살아있으면 전사록을 재전송하지 않고 지시만 보낸다(효율). 시간이
+      지났거나/프로세스 재시작/세션 만료로 세션이 죽었으면 ``session_alive`` 로
+      판정해 **자동으로 전사록을 재시드**한다 — "잠시 있다가 다시 요청" 대응.
+    - ``fork(prompt)`` — **독립 변형**: 매번 전사록을 새 세션에 재시드하여 변형
+      끼리 섞이지 않는다(예: 같은 전사록으로 격식 회의록 / 액션아이템 / 캐주얼
+      요약을 따로). 효율은 provider 의 프롬프트 캐싱에 의존.
+
+    라이브러리는 세션 id 만 저장하므로(설계 불변식), 전사록 본문은 호스트(이
+    객체)가 들고 있다. 나중에 같은 ``alias`` 로 다시 ``pin_context`` 하면 살아
+    있으면 resume, 죽었으면 재시드한다.
+
+    각 메서드는 sync/async/stream 3종: ``refine``/``refine_async``/
+    ``refine_stream``, ``fork``/``fork_async``/``fork_stream``. 순차 사용 전제.
+    """
+
+    def __init__(self, client: "LLMClient", context: str, *,
+                 provider: str = "", owner: str = "", alias: str = "",
+                 cwd: str | None = None, model: str = "",
+                 separator: str = "\n\n---\n", **chat_kwargs):
+        if not context:
+            raise ValueError("context must be a non-empty string")
+        self._client = client
+        self._context = context
+        self._provider = provider
+        self._owner = owner
+        self._alias = alias or f"ctx-{uuid.uuid4().hex[:8]}"
+        self._cwd = cwd
+        self._model = model
+        self._sep = separator
+        self._chat_kwargs = chat_kwargs
+        self._seeded = False
+        self._fork_n = 0
+
+    @property
+    def alias(self) -> str:
+        return self._alias
+
+    def is_alive(self) -> bool | None:
+        """pin 된 세션이 현재 재개 가능한지 (LLM 호출 없이)."""
+        return self._client.session_alive(
+            self._provider, owner=self._owner, alias=self._alias, cwd=self._cwd)
+
+    def _seed_prompt(self, prompt: str) -> str:
+        return f"{self._context}{self._sep}{prompt}"
+
+    def _opts(self, alias: str, kw: dict) -> dict:
+        opts = dict(provider=self._provider, owner=self._owner, alias=alias,
+                    cwd=self._cwd, model=self._model)
+        opts.update(self._chat_kwargs)
+        opts.update(kw)
+        return opts
+
+    def _refine(self, prompt: str) -> tuple[str, dict]:
+        """세션 생존 여부로 전사록 재시드 결정. ``(prompt, extra_kwargs)`` 반환.
+
+        살아있음(True) → 지시만(전사록 이미 세션에 있음), resume. 죽음/없음(False)
+        → 전사록 재시드 + ``new_session=True``(죽은 sid 에 의존하지 않고 새 세션을
+        명시적으로 시작). 판단불가(None, 예: copilot) → 이 프로세스에서 시드한 적
+        있으면 신뢰(resume), 아니면 안전하게 재시드.
+        """
+        alive = self.is_alive()
+        need_seed = (alive is False) or (alive is None and not self._seeded)
+        self._seeded = True
+        if need_seed:
+            return self._seed_prompt(prompt), {"new_session": True}
+        return prompt, {}
+
+    # ---- refine: 이어가기 (resume; 죽었으면 새 세션에 재시드) ----
+    def refine(self, prompt: str, **kw):
+        p, extra = self._refine(prompt)
+        return self._client.chat(p, **self._opts(self._alias, {**extra, **kw}))
+
+    async def refine_async(self, prompt: str, **kw):
+        p, extra = self._refine(prompt)
+        return await self._client.chat_async(
+            p, **self._opts(self._alias, {**extra, **kw}))
+
+    def refine_stream(self, prompt: str, **kw):
+        p, extra = self._refine(prompt)
+        return self._client.chat_stream(
+            p, **self._opts(self._alias, {**extra, **kw}))
+
+    # ---- fork: 독립 변형 (매번 새 세션에 전사록 재시드) ----
+    def _fork_target(self, prompt: str, label: str) -> tuple[str, str]:
+        self._fork_n += 1
+        return (self._seed_prompt(prompt),
+                f"{self._alias}#fork:{label or self._fork_n}")
+
+    def fork(self, prompt: str, *, label: str = "", **kw):
+        p, a = self._fork_target(prompt, label)
+        return self._client.chat(p, new_session=True, **self._opts(a, kw))
+
+    async def fork_async(self, prompt: str, *, label: str = "", **kw):
+        p, a = self._fork_target(prompt, label)
+        return await self._client.chat_async(
+            p, new_session=True, **self._opts(a, kw))
+
+    def fork_stream(self, prompt: str, *, label: str = "", **kw):
+        p, a = self._fork_target(prompt, label)
+        return self._client.chat_stream(p, new_session=True, **self._opts(a, kw))

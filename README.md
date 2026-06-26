@@ -573,6 +573,34 @@ alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
 # True = resumable · False = gone (next call reopens) · None = unknown (e.g. copilot)
 ```
 
+### Pinned context (one big input, many queries)
+
+For "load a big transcript once, then ask many things against it" — e.g. several
+meeting-minute formats and revision requests — `pin_context` returns a
+`ContextSession` with two modes:
+
+```python
+ctx = client.pin_context(transcript, provider="claude", owner="u", alias="mtg",
+                         model="claude-haiku-4-5")
+
+# refine(): continue the same session — the transcript is sent ONCE, follow-ups
+# send only the instruction (the CLI session remembers it).
+ctx.refine("Draft formal minutes.")
+ctx.refine("Make them shorter.")          # sees the prior answer
+
+# fork(): independent variations — each re-seeds the transcript in a fresh
+# session so they don't see each other.
+ctx.fork("Extract action items only.")
+ctx.fork("Write a casual summary.", label="summary")
+```
+
+Come back later (or after a process restart): re-`pin_context` with the same
+`alias` and transcript. `refine` checks `session_alive` — if the session is
+still alive it resumes (no re-send); if it died (expired/deleted) it
+**auto-re-seeds** the transcript into a fresh session. Each mode has
+`*_async` / `*_stream` variants. (agentcli stores only the session id, so the
+host holds the transcript to reconstruct the handle.)
+
 ## Testing
 
 ```bash
@@ -580,7 +608,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-648 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+659 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 

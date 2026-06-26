@@ -32,6 +32,16 @@
   `codex exec` / `copilot -p` runs grouped by process group (leader + its
   MCP/node children), flags `[long]` / `[residual]` / `[defunct]` groups, and
   can `--kill <PGID>` a stuck one. Zero deps (stdlib + `ps`, POSIX).
+- **Pinned context (`pin_context` → `ContextSession`).** For "load one big
+  input (e.g. a transcript) and ask many things against it": `refine(prompt)`
+  continues the same session (transcript sent once; follow-ups send only the
+  instruction), while `fork(prompt)` re-seeds the transcript into a fresh
+  session per call so independent variations don't see each other. Crucially it
+  handles **coming back later / after a restart**: `refine` checks
+  `session_alive` and auto-re-seeds the transcript (with `new_session=True`) if
+  the session has expired, otherwise resumes without re-sending. `*_async` /
+  `*_stream` variants for both. The library still stores only the session id;
+  the host holds the transcript to (re)construct the handle.
 - **Capability controller (`ProviderCapabilities` + client queries).** Features
   differ per provider AND per OS; the controller declares them so callers can
   check before calling instead of relying on silent option-dropping.

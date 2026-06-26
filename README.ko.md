@@ -321,6 +321,31 @@ alive = client.session_alive("claude", owner="team", alias="triager", cwd=cwd)
 # True = 재개 가능 · False = 죽음(다음 호출이 새로 엶) · None = 판단불가(예: copilot)
 ```
 
+### Pinned context (큰 입력 1회, 다회 질의)
+
+"큰 전사록을 1회 넣고 그 위에서 여러 질의" — 예: 여러 형태의 회의록 + 수정 요구 —
+를 위해 `pin_context` 가 `ContextSession`(두 모드)을 반환한다:
+
+```python
+ctx = client.pin_context(transcript, provider="claude", owner="u", alias="mtg",
+                         model="claude-haiku-4-5")
+
+# refine(): 같은 세션 이어가기 — 전사록은 한 번만 전송, 이후엔 지시만(CLI 세션이
+# 전사록을 기억).
+ctx.refine("격식 회의록 작성")
+ctx.refine("더 짧게 수정")               # 앞 답을 봄
+
+# fork(): 독립 변형 — 변형마다 전사록을 새 세션에 재시드하여 서로 안 섞인다.
+ctx.fork("액션아이템만 추출")
+ctx.fork("캐주얼 요약", label="summary")
+```
+
+**잠시 있다가 다시 요청**(또는 프로세스 재시작): 같은 `alias` + 전사록으로 다시
+`pin_context`. `refine` 이 `session_alive` 를 확인 — 살아있으면 resume(재전송
+없음), 죽었으면(만료/삭제) **전사록을 새 세션에 자동 재시드**. 각 모드는
+`*_async`/`*_stream` 변형이 있다. (agentcli 는 세션 id 만 저장하므로 호스트가
+전사록을 들고 핸들을 재구성한다.)
+
 ## Provider 기능 비교
 
 기능은 **provider 마다, 그리고 OS 마다** 다르다(예: claude 는 Windows 에서 세션
@@ -363,7 +388,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 648개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 659개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
