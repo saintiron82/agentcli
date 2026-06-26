@@ -310,6 +310,7 @@ class LLMProvider(ABC):
         debug_chunks: list[dict] = []
         debug_stderr: list[str] = []
         stderr_task = None
+        reached_done = False   # clean done 도달 여부 (debug trace truncated 판정)
         idle_limit = idle_timeout if idle_timeout is not None else timeout
         # issue #9: ``wall_timeout=0`` 도 의미 있는 입력 (즉시 만료) 이므로
         # ``if wall_timeout`` (falsy check) 대신 ``is not None`` 명시적 검사.
@@ -446,6 +447,7 @@ class LLMProvider(ABC):
                     data={"returncode": rc})
                 return
 
+            reached_done = True
             yield StreamChunk(
                 type="done",
                 content="".join(state.text_parts),
@@ -462,11 +464,14 @@ class LLMProvider(ABC):
             yield StreamChunk(type="error", content=str(exc))
         finally:
             # issue #10: GeneratorExit 포함 모든 종료 경로에서 proc 정리.
-            # 직속만이 아니라 그룹 전체를 죽여 MCP/hook 손자까지 reap.
-            if proc is not None and proc.returncode is None:
+            # 직속만이 아니라 그룹 전체를 죽여 MCP/hook 손자까지 reap. 정상완료
+            # (returncode set) 경로에서도 떨어져나간 손자가 그룹에 남아있을 수
+            # 있어 best-effort 로 그룹 kill (그룹 없으면 ProcessLookupError 가드).
+            if proc is not None:
                 try:
                     _kill_process_group(proc)
-                    await proc.wait()
+                    if proc.returncode is None:
+                        await proc.wait()
                 except Exception:
                     # cleanup 실패는 silent — 더 이상 할 수 있는 게 없음
                     pass
@@ -490,6 +495,8 @@ class LLMProvider(ABC):
                         "chunk_count": len(debug_chunks),
                         "chunks": debug_chunks,
                         "session_id": state.final_session_id,
+                        # timeout/early-break 면 stderr·chunks 가 부분 데이터다.
+                        "truncated": not reached_done,
                         "stderr": "\n".join(debug_stderr)[-20000:],
                     })
 
@@ -624,14 +631,15 @@ async def run_subprocess_async(
         _kill_process_group(proc)
         return b"", f"timeout after {timeout}s".encode(), 124, True
     finally:
-        # 호출 task 취소(CancelledError) 포함 모든 종료 경로에서 proc 정리.
-        # 직속만이 아니라 그룹 전체 kill — CLI 가 띄운 MCP/hook 손자 좀비 방지.
-        if proc.returncode is None:
-            try:
-                _kill_process_group(proc)
+        # 호출 task 취소(CancelledError)·정상완료 포함 모든 종료 경로에서 그룹
+        # 전체 reap — 직속만이 아니라, 정상완료 시에도 떨어져나간 손자가 그룹에
+        # 남아있을 수 있어 best-effort killpg (그룹 없으면 ProcessLookupError 가드).
+        try:
+            _kill_process_group(proc)
+            if proc.returncode is None:
                 await proc.wait()
-            except Exception:
-                pass
+        except Exception:
+            pass
     return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
 
 
@@ -670,21 +678,19 @@ def run_subprocess_sync(
         stdout_b, stderr_b = proc.communicate(timeout=timeout)
         return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
     except subprocess.TimeoutExpired:
-        # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제 → 재-communicate 가 즉시
-        # EOF (직속만 kill 하던 subprocess.run 의 정리-행을 회피).
+        # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제. 잔여 reap-communicate 는
+        # finally 가 한 번만 수행 (except+finally 이중 communicate 로 인한 최대
+        # ~20s 지연 회피).
         _kill_process_group(proc)
-        try:
-            proc.communicate(timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
         return b"", f"timeout after {timeout}s".encode(), 124, True
     finally:
-        if proc.returncode is None:
+        # 정상완료 포함 모든 경로에서 그룹 전체 reap — 떨어져나간 손자까지.
+        try:
             _kill_process_group(proc)
-            try:
+            if proc.returncode is None:
                 proc.communicate(timeout=10)
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def run_health_command(cmd: list[str], *, timeout: int = 10,

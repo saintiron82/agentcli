@@ -261,10 +261,34 @@ def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
     assert rec["phase"] == "stream"
     assert rec["chunk_count"] >= 2
     assert any(c["type"] == "text" for c in rec["chunks"])
+    # 정상 done 도달 → 부분 데이터 아님
+    assert rec["truncated"] is False
     # 프롬프트 본문 redact
     assert "SECRET-PROMPT" not in json.dumps(rec["argv"])
     # stderr 동시 드레인되어 trace 에 담김
     assert "mcp connected" in rec["stderr"]
+
+
+def test_run_stream_template_debug_trace_truncated_on_timeout(monkeypatch, tmp_path):
+    """idle timeout 으로 중단되면 trace 의 truncated=True (Fix B — 부분 데이터 표시)."""
+    import json
+    proc = make_fake_proc(stdout_lines=[], returncode=None)
+    proc.stdout = HangingReadline()       # readline 영원히 → idle timeout
+    proc.stderr = FakeReadline([b"partial\n"])
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+    state = StreamState()
+    trace = tmp_path / "t.jsonl"
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["claude", "-p", "X"], state, timeout=0.2,
+            debug=True, debug_log_path=str(trace))]
+
+    chunks = asyncio.run(run())
+    assert any(c.type == "error" for c in chunks)
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["truncated"] is True
 
 
 def test_run_stream_template_normal_sequence(monkeypatch):
@@ -709,4 +733,6 @@ def test_run_subprocess_async_timeout_still_kills_proc(monkeypatch):
     stdout_b, stderr_b, rc, timed_out = asyncio.run(run())
     assert timed_out is True
     assert rc == 124
-    proc.kill.assert_called_once()
+    # Fix A: 정상완료 포함 모든 경로에서 그룹 reap → except+finally 가 멱등적으로
+    # 두 번 kill 할 수 있다(해롭지 않음). 한 번 이상 호출되면 충분.
+    assert proc.kill.called

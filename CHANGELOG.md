@@ -62,8 +62,12 @@
   child on timeout/cleanup left those grandchildren running — and a grandchild
   holding the stdout pipe could even wedge `subprocess.run`'s post-timeout
   cleanup. All spawn sites now start a new session (process group) and tear
-  down the **whole group** via `os.killpg(SIGKILL)` on timeout/cancel/early-exit
-  (POSIX; Windows falls back to direct kill). New `run_subprocess_sync` replaces
+  down the **whole group** via `os.killpg(SIGKILL)` on every exit path —
+  timeout, cancel, early-exit, and clean completion (a grandchild that detaches
+  its stdout can outlive a normally-exiting parent) — (POSIX; Windows falls back
+  to direct kill). The sync runner's post-timeout cleanup is a single bounded
+  reap (no double `communicate`), and the streaming debug trace records a
+  `truncated` flag when stderr/chunks are partial. New `run_subprocess_sync` replaces
   `subprocess.run` in `ClaudeProvider.invoke` for the same group teardown +
   `stdin=DEVNULL`. Verified with deterministic repro tests (sync + async +
   streaming).

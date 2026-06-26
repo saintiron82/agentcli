@@ -107,6 +107,39 @@ def test_run_subprocess_async_reaps_grandchild():
         _cleanup(tag)
 
 
+def test_run_subprocess_sync_reaps_detached_grandchild_on_clean_exit():
+    """정상완료(타임아웃 아님)여도 떨어져나간 손자를 reap (Fix A).
+
+    손자 sleep 이 stdout 을 /dev/null 로 돌려 파이프를 안 물면 sh 가 즉시
+    종료 → communicate 정상 반환(타임아웃 아님). 그래도 finally 의 그룹 kill 이
+    살아있는 손자를 reap 해야 한다."""
+    tag = "9182741"
+    try:
+        _out, _err, rc, timed = run_subprocess_sync(
+            ["sh", "-c", f"sleep {tag} >/dev/null 2>&1 & exit 0"], timeout=5)
+        assert timed is False, "손자가 파이프를 안 물어 정상완료여야 함"
+        assert rc == 0
+        assert _wait_gone(tag), "정상완료여도 떨어져나간 손자가 reap 돼야 함"
+    finally:
+        _cleanup(tag)
+
+
+def test_run_subprocess_async_reaps_detached_grandchild_on_clean_exit():
+    tag = "9182742"
+
+    async def run():
+        return await run_subprocess_async(
+            ["sh", "-c", f"sleep {tag} >/dev/null 2>&1 & exit 0"], timeout=5)
+
+    try:
+        _out, _err, rc, timed = asyncio.run(run())
+        assert timed is False
+        assert rc == 0
+        assert _wait_gone(tag)
+    finally:
+        _cleanup(tag)
+
+
 def test_run_stream_template_reaps_grandchild():
     """스트리밍 경로(_run_stream_template)도 idle 타임아웃 시 그룹 전체 killpg.
 
