@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.4 — unreleased
+## 0.6.4 — 2026-06-29
 
 ### Added
 - **Debug instrumentation promoted to first-class, cross-provider, both paths.**
