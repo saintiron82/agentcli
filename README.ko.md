@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.3"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -380,13 +380,13 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (청크 타임라인 trace) | ✅ | ✅ (스트리밍) | ✅ (스트리밍) | ❌ |
+| `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
 | claude 전용 옵션 | `lean`, `partial_messages` | — | — | — |
 
-`debug` 는 claude/codex/copilot 의 **스트리밍** 경로(청크 타임라인 + trace)를
-계측한다. claude 는 비스트리밍 `invoke` 경로도 추가로 계측한다. codex/copilot 의
-비스트리밍 호출에 `debug=True` 를 주면 무시된다(옵션 드롭) — 그 둘은 스트리밍으로
-추적할 것.
+`debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
+타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr trace 를 남긴다.
+`debug_log_path` 는 JSON-Lines 레코드를 append 한다(각 레코드에 `schema` 버전 +
+`call_id` stamp). kiro(ACP)는 debug 계측이 없다.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
@@ -406,12 +406,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 666개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 668개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.3`
-- 릴리즈 노트: [docs/releases/v0.6.3.ko.md](docs/releases/v0.6.3.ko.md)
+- 현재 릴리즈: `0.6.4`
+- 릴리즈 노트: [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 
 ## 라이선스

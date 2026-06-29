@@ -93,6 +93,28 @@ def test_parse_jsonl_events_ignores_codex_initial_greeting():
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
 @patch("agentcli.providers.codex.subprocess.run")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_debug_writes_invoke_trace(mock_env, mock_run, mock_find, tmp_path):
+    """#29: codex 비스트리밍 invoke 도 debug trace(phase=invoke) 를 남긴다."""
+    import json
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout='{"type":"item.completed","item":{"type":"agent_message","text":"A"}}\n',
+        stderr="codex debug stderr")
+    trace = tmp_path / "codex_invoke.jsonl"
+    resp = CodexProvider().invoke(
+        [Message(role="user", content="hi")],
+        debug=True, debug_log_path=str(trace))
+    assert resp.content == "A"
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "invoke" and rec["provider"] == "codex"
+    assert rec["returncode"] == 0
+    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+    assert "codex debug stderr" in rec["stderr"]
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_new_session(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
         returncode=0,

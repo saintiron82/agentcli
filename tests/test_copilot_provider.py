@@ -75,6 +75,26 @@ def test_parse_ignores_malformed_lines():
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
+def test_invoke_debug_writes_invoke_trace(mock_find, mock_env, mock_run, tmp_path):
+    """#29: copilot 비스트리밍 invoke 도 debug trace(phase=invoke) 를 남긴다."""
+    import json
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout=_SAMPLE_STDOUT, stderr="cp dbg")
+    trace = tmp_path / "copilot_invoke.jsonl"
+    resp = CopilotProvider().invoke(
+        [Message(role="user", content="hi")],
+        debug=True, debug_log_path=str(trace))
+    assert resp.content == "Hello world"
+    rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "invoke" and rec["provider"] == "copilot"
+    assert rec["returncode"] == 0
+    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+
+
+@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
 def test_invoke_new_session_parses_result_sessionid(mock_find, mock_env, mock_run):
     """sessionId가 없는 호출 → result 이벤트의 sessionId를 session_id로 반환."""
     mock_run.return_value = MagicMock(

@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.3"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -390,13 +390,13 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (chunk-timeline trace) | ✅ | ✅ (streaming) | ✅ (streaming) | ❌ |
+| `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
 | claude-only options | `lean`, `partial_messages` | — | — | — |
 
-`debug` covers the **streaming** path (per-chunk timeline + trace) on
-claude/codex/copilot; claude additionally instruments the non-streaming
-`invoke` path. A non-streaming codex/copilot call with `debug=True` is a no-op
-(the option is dropped) — use streaming to trace those two.
+`debug` instruments both paths on claude/codex/copilot: streaming records a
+per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr
+trace. `debug_log_path` appends JSON-Lines records (each stamped with a `schema`
+version and `call_id`). kiro (ACP) has no debug instrumentation.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
@@ -626,7 +626,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-666 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+668 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
@@ -643,7 +643,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.6.3 release note: [docs/releases/v0.6.3.md](docs/releases/v0.6.3.md) / [docs/releases/v0.6.3.ko.md](docs/releases/v0.6.3.ko.md)
+- v0.6.4 release note: [docs/releases/v0.6.4.md](docs/releases/v0.6.4.md) / [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
 
 ## License
 

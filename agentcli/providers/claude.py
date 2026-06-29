@@ -13,9 +13,9 @@ import uuid
 from typing import AsyncIterator
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
-                   estimate_payload_prompt_tokens, health_from_response,
-                   redact_argv, run_health_command, run_subprocess_async,
-                   run_subprocess_sync, write_debug_trace)
+                   emit_invoke_debug, estimate_payload_prompt_tokens,
+                   health_from_response, run_health_command,
+                   run_subprocess_async, run_subprocess_sync)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -54,18 +54,9 @@ CLAUDE_MODELS = [
 
 def _emit_invoke_debug(cmd: list[str], rc, latency_ms: int, stderr: str,
                        sid: str, path: str | None, phase: str) -> None:
-    """비스트리밍 invoke 경로의 debug 로깅 + 선택적 trace 기록."""
-    logger.info("[debug] claude %s rc=%s latency=%dms argv=%s",
-                phase, rc, latency_ms, redact_argv(cmd))
-    tail = (stderr or "").strip()
-    if tail:
-        logger.info("[debug] claude stderr tail:\n%s", tail[-2000:])
-    if path:
-        write_debug_trace(path, {
-            "provider": "claude", "phase": phase, "returncode": rc,
-            "latency_ms": latency_ms, "argv": redact_argv(cmd),
-            "session_id": sid, "stderr": (stderr or "")[-20000:],
-        })
+    """비스트리밍 invoke debug — 공용 ``emit_invoke_debug`` 에 위임."""
+    emit_invoke_debug("claude", cmd, rc, latency_ms, stderr,
+                      session_id=sid, path=path, phase=phase)
 
 
 class ClaudeProvider(LLMProvider):

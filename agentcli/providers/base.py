@@ -165,6 +165,28 @@ def write_debug_trace(path: str, record: dict) -> None:
             "debug trace 기록 실패 (%s): %s", path, exc)
 
 
+def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
+                      stderr: str, *, session_id: str = "",
+                      path: str | None = None, phase: str = "invoke") -> None:
+    """비스트리밍 invoke 경로의 debug 로깅 + 선택적 trace 기록 (provider 공용).
+
+    claude/codex/copilot 의 invoke·invoke_async 가 공유한다 — 스트리밍 경로의
+    청크 타임라인과 짝을 이루는 비스트리밍 진단(argv·rc·latency·stderr).
+    """
+    log = logging.getLogger(f"agentcli.providers.{provider_id}")
+    log.info("[debug] %s %s rc=%s latency=%dms argv=%s",
+             provider_id, phase, rc, latency_ms, redact_argv(cmd))
+    tail = (stderr or "").strip()
+    if tail:
+        log.info("[debug] %s stderr tail:\n%s", provider_id, tail[-2000:])
+    if path:
+        write_debug_trace(path, {
+            "provider": provider_id, "phase": phase, "returncode": rc,
+            "latency_ms": latency_ms, "argv": redact_argv(cmd),
+            "session_id": session_id, "stderr": (stderr or "")[-20000:],
+        })
+
+
 async def _drain_stderr(stream, sink: list[str], logger, provider_id: str) -> None:
     """Concurrently drain a subprocess stderr pipe into ``sink``.
 

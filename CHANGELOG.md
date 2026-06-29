@@ -1,14 +1,21 @@
 # Changelog
 
-## 0.6.4 — unreleased
+## 0.6.4 — 2026-06-29
 
 ### Added
-- **Debug instrumentation promoted to first-class, cross-provider.** The
-  streaming debug trace (per-chunk timeline + concurrent stderr drain) now works
-  for **codex and copilot** too, not just claude — their `stream_async` accept
-  `debug` / `debug_log_path` and delegate to the shared `_run_stream_template`
-  (verified live: a real codex stream produced a chunk-timeline trace). kiro is
-  out of scope (ACP transport, not the stream-json template).
+- **Debug instrumentation promoted to first-class, cross-provider, both paths.**
+  Debug now works for **codex and copilot** too, not just claude, on **both** the
+  streaming and non-streaming paths:
+  - Streaming: `stream_async` accepts `debug` / `debug_log_path` and delegates to
+    the shared `_run_stream_template` (per-chunk timeline + concurrent stderr
+    drain; verified live with a real codex stream).
+  - Non-streaming: `invoke` / `invoke_async` accept `debug` / `debug_log_path`
+    and emit an argv/rc/latency/stderr trace via a shared `emit_invoke_debug`
+    helper (claude's `_emit_invoke_debug` now delegates to it). So
+    `supports(provider, "debug")` is honest for every call path — no more silent
+    no-op on a non-streaming codex/copilot call.
+
+  kiro is out of scope (ACP transport, not the stream-json template).
 - **Trace robustness.** Every trace record now carries a `schema` (format
   version, currently `1`) and a unique `call_id`, so interleaved traces from
   parallel `fork_many` runs are groupable and consumers can branch on format.
@@ -16,10 +23,8 @@
   multiple threads can't corrupt a line.
 - **`debug` is now a declared capability.** `ProviderCapabilities.debug` and the
   `capability_matrix()` row show which providers have debug instrumentation
-  (claude/codex/copilot ✓, kiro ✗); `supports(provider, "debug")` reflects it.
-  Scope: codex/copilot `debug` covers the **streaming** path only; their
-  non-streaming `invoke` ignores `debug=True` (claude instruments both). Full
-  invoke-path parity for codex/copilot is a tracked follow-up.
+  (claude/codex/copilot ✓, kiro ✗); `supports(provider, "debug")` reflects it
+  and is now accurate for both streaming and non-streaming calls.
 
 ## 0.6.3 — 2026-06-26
 
