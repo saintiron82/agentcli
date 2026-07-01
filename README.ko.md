@@ -413,6 +413,7 @@ pytest
 - 현재 릴리즈: `0.6.4`
 - 릴리즈 노트: [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
+- Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 
 ## 라이선스
 

@@ -644,6 +644,7 @@ pytest
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
 - v0.6.4 release note: [docs/releases/v0.6.4.md](docs/releases/v0.6.4.md) / [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
+- Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)
 
 ## License
 
