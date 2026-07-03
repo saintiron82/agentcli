@@ -416,7 +416,10 @@ print(resp.reasoning.effort.applied)   # 실제 적용된 native 레벨
 (`resp.reasoning`, 그리고 스트리밍 `event` 청크). Provider 별 특이사항: codex 는
 effort 를 `high` 까지만 지원(xhigh/max 는 clamp); copilot 의 thinking 은
 불리언(`concise`/`detailed` 모두 summaries 를 켠다); claude 는 thinking 토글이
-없다(미지원으로 보고).
+없다(미지원으로 보고). 스트리밍 reasoning `event` 는 요청이 실행되었는지가 아니라
+*어떻게 해석되었는지*를 보고하므로 provider 바이너리를 찾지 못한 경우에도 그대로
+방출되며, 반대로 비스트리밍 `invoke`/`invoke_async` 는 CLI 가 아예 실행되지
+않았다면 `LLMResponse.reasoning` 을 설정하지 않는다.
 
 ## 테스트
 

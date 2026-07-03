@@ -433,6 +433,10 @@ Unsupported levels clamp to the nearest and are reported (`resp.reasoning`,
 and a streaming `event` chunk). Provider specifics: codex caps effort at
 `high` (xhigh/max clamp); copilot thinking is boolean (`concise`/`detailed`
 both enable summaries); claude has no thinking toggle (reported unsupported).
+The streaming reasoning `event` reports how the request was *resolved*, not
+whether it executed, so it is still emitted when the provider binary turns
+out to be missing — whereas non-streaming `invoke`/`invoke_async` leave
+`LLMResponse.reasoning` unset when the CLI never ran.
 
 ## Security notes
 
