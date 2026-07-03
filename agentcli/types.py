@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .reasoning import ReasoningResolution
+
 
 @dataclass
 class TokenUsage:
@@ -49,6 +51,8 @@ class LLMResponse:
     exit_code: int | None = None
     recoverable: bool = False
     suggested_action: str = ""
+    # 정규화 reasoning 제어(effort/thinking)의 요청/적용 결과. 둘 다 미사용이면 None.
+    reasoning: "ReasoningResolution | None" = None
 
     def __post_init__(self) -> None:
         if self.error and not self.error_type:

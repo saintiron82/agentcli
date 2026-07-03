@@ -50,3 +50,8 @@ def test_level_queries():
     assert thinking_levels("claude") == frozenset()          # unsupported
     assert thinking_levels("copilot") == frozenset({"off","concise"})  # detailed clamps
     assert thinking_levels("codex") == frozenset({"off","concise","detailed"})
+
+def test_llmresponse_has_reasoning_field_defaulting_none():
+    from agentcli.types import LLMResponse
+    r = LLMResponse(content="hi", provider="claude", model="sonnet")
+    assert r.reasoning is None
