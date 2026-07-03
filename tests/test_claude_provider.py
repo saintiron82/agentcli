@@ -434,7 +434,8 @@ def test_claude_no_reasoning_means_no_args_and_none():
     assert args == [] and res is None
 
 
-def test_claude_build_cmd_includes_effort_via_reasoning_args():
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_claude_build_cmd_includes_effort_via_reasoning_args(mock_find):
     p = ClaudeProvider()
     args, _ = p._reasoning_flags("xhigh", None)
     cmd, _sid = p._build_cmd("hi", "", "", reasoning_args=args)
