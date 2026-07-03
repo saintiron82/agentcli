@@ -135,6 +135,85 @@ def test_fork_many_respects_explicit_labels():
     assert any("casual" in a for a in aliases)
 
 
+def test_fork_many_cancels_slow_sibling_when_one_raises():
+    """한 fork 가 예기치 못한 예외(LLM 에러 아님 — 그건 LLMResponse 로 옴)를 던지면,
+    아직 도는 형제 fork(실제로는 서브프로세스 하나에 해당)는 방치되지 않고 취소돼야
+    한다. caller 에는 원본 예외 타입이 그대로 전파된다(ExceptionGroup 로 감싸지 않음:
+    기존 gather(return_exceptions=False) 호출자의 ``except SomeError`` 계약 유지)."""
+    import asyncio
+
+    async def _run():
+        client = MagicMock()
+        state = {"slow_cancelled": False, "slow_completed": False}
+
+        async def fake_chat_async(prompt, **kw):
+            # 두 task 모두 각자의 분기(raise vs sleep)까지 진행되도록 한 번 양보.
+            await asyncio.sleep(0)
+            if "boom" in prompt:
+                raise RuntimeError("boom")
+            try:
+                await asyncio.sleep(10)
+                state["slow_completed"] = True
+            except asyncio.CancelledError:
+                state["slow_cancelled"] = True
+                raise
+
+        client.chat_async = AsyncMock(side_effect=fake_chat_async)
+        ctx = ContextSession(client, "CTX", provider="claude", owner="u", alias="m")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await ctx.fork_many(["boom", "slow"], concurrency=2)
+
+        assert state["slow_cancelled"] is True, "형제 fork 가 취소돼야 한다"
+        assert state["slow_completed"] is False, "취소된 형제는 완료되면 안 된다"
+
+    asyncio.run(_run())
+
+
+def test_fork_many_preserves_input_order_despite_completion_order():
+    """완료 순서가 뒤바뀌어도 반환 결과는 입력 prompts 순서를 유지해야 한다."""
+    import asyncio
+
+    client = MagicMock()
+
+    async def fake_chat_async(prompt, **kw):
+        # p0 를 가장 늦게 끝나도록 지연시켜 완료 순서를 입력 순서와 뒤집는다.
+        await asyncio.sleep(0.03 if prompt.endswith("p0") else 0.0)
+        return prompt
+
+    client.chat_async = AsyncMock(side_effect=fake_chat_async)
+    ctx = ContextSession(client, "CTX", provider="claude", owner="u", alias="m")
+    prompts = [f"p{i}" for i in range(4)]
+    results = asyncio.run(ctx.fork_many(prompts, concurrency=4))
+
+    assert results == [ctx._seed_prompt(p) for p in prompts]
+
+
+def test_fork_target_concurrent_calls_produce_unique_labels():
+    """동시 ``_fork_target`` 호출(동기 ``fork()`` 경로, 향후 스레드 유입 대비)이
+    자동 label 을 유일하게 생성해야 한다 — 공유 카운터 race 회피가 실제 불변식."""
+    import threading
+
+    client = MagicMock()
+    ctx = ContextSession(client, "CTX", provider="claude", owner="u", alias="m")
+    aliases: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        _, alias = ctx._fork_target("p", "")
+        with lock:
+            aliases.append(alias)
+
+    threads = [threading.Thread(target=worker) for _ in range(200)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(aliases) == 200
+    assert len(set(aliases)) == 200, "모든 자동 label 이 유일해야 한다(경합 없음)"
+
+
 def test_is_alive_delegates_with_cwd():
     client = MagicMock()
     client.session_alive.return_value = True

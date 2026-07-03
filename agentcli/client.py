@@ -14,6 +14,7 @@
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import threading
 import uuid
@@ -1203,7 +1204,9 @@ class ContextSession:
         self._sep = separator
         self._chat_kwargs = chat_kwargs
         self._seeded = False
-        self._fork_n = 0
+        # itertools.count().__next__ 는 GIL/이벤트루프 인터리빙 모두에서 원자적
+        # (읽기-수정-쓰기 3단계 아님) — 동기 fork()/향후 스레드 유입 대비 하드닝.
+        self._fork_n = itertools.count(1)
 
     @property
     def alias(self) -> str:
@@ -1256,9 +1259,9 @@ class ContextSession:
 
     # ---- fork: 독립 변형 (매번 새 세션에 전사록 재시드) ----
     def _fork_target(self, prompt: str, label: str) -> tuple[str, str]:
-        self._fork_n += 1
+        n = next(self._fork_n)
         return (self._seed_prompt(prompt),
-                f"{self._alias}#fork:{label or self._fork_n}")
+                f"{self._alias}#fork:{label or n}")
 
     def fork(self, prompt: str, *, label: str = "", **kw):
         p, a = self._fork_target(prompt, label)
@@ -1300,5 +1303,17 @@ class ContextSession:
             async with sem:
                 return await self.fork_async(prompt, label=label, **kw)
 
-        return await asyncio.gather(
-            *(_one(p, lbl) for p, lbl in zip(prompts, labels)))
+        # gather(..., return_exceptions=False) 는 한 fork 가 예외를 던지면 그
+        # 예외만 전파하고 나머지 in-flight fork(실제 서브프로세스)는 취소하지
+        # 않은 채 계속 돈다 → TaskGroup 으로 교체해 형제 취소를 보장한다.
+        # TaskGroup 은 실패를 ExceptionGroup 으로 감싸므로, gather 시절과 같은
+        # "원본 예외 타입을 그대로 캐치" 하는 호출자 계약을 지키기 위해 첫 번째
+        # 예외만 풀어서 재전파한다.
+        tasks: list[asyncio.Task] = []
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(_one(p, lbl))
+                         for p, lbl in zip(prompts, labels)]
+        except* BaseException as eg:
+            raise eg.exceptions[0] from eg
+        return [t.result() for t in tasks]
