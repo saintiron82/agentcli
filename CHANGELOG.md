@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 — unreleased
+
+### Added
+- **Normalized reasoning controls.** First-class `effort` (minimal…max) and
+  `thinking` (off/concise/detailed) on `chat`/`chat_async`/`chat_stream` and on
+  each provider, mapped per provider with clamp-and-report (`LLMResponse.reasoning`
+  + a streaming `event` chunk). `capability_matrix()` gains `effort_levels` /
+  `thinking_levels`. claude has no thinking toggle (reported unsupported); kiro
+  out of scope.
+
+### Changed
+- **`CopilotProvider(effort=...)` now validates against the canonical scale.**
+  Previously (since v0.2.0) any string was passed straight through to the
+  CLI's `--effort` flag. It now resolves through the same canonical scale as
+  the other providers (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) and
+  raises `ValueError` for a non-canonical string — including copilot's own
+  native `"none"`; pass canonical `"minimal"`, which maps to native `none`.
+
 ## 0.6.4 — 2026-06-29
 
 ### Added
@@ -395,7 +413,11 @@ First release under the `agentcli` name (previously internal `libs.llm`). Major 
 - **Permission controls per provider**:
   - Claude: `permission_mode`, `allowed_tools`, `disallowed_tools`.
   - Codex: `sandbox_mode`, `approval_policy`, `full_auto`.
-  - Copilot: `allow_all_tools`, `allowed_tools`, `disallowed_tools`, `available_tools`, `add_dirs`, `effort`.
+  - Copilot: `allow_all_tools`, `allowed_tools`, `disallowed_tools`,
+    `available_tools`, `add_dirs` (constructor-only), `effort`
+    (constructor default; became a per-call option too in 0.7.0 — see
+    `capabilities().options`, which for copilot is currently `debug`,
+    `debug_log_path`, `effort`, `thinking`).
 - **`cwd` parameter** flows through `LLMClient` → provider subprocess, isolating session files per project.
 - **MemoryStore TTL + cap**; **SQLiteStore WAL + busy_timeout**; `build_env()` caches `gh auth token`.
 

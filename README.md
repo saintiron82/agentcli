@@ -416,6 +416,24 @@ provider stays stateless there: each call gets a fresh per-call `--session-id`
 used for usage audit only, and no conversation content is persisted by the
 library.
 
+### Reasoning controls
+
+Two independent, normalized controls, per call or as provider defaults:
+
+- `effort` — how hard the model reasons: `minimal · low · medium · high · xhigh · max`.
+- `thinking` — reasoning-output visibility: `off · concise · detailed`.
+
+```python
+resp = await client.chat_async("…", provider="codex",
+                               effort="high", thinking="concise")
+print(resp.reasoning.effort.applied)   # native level actually used
+```
+
+Unsupported levels clamp to the nearest and are reported (`resp.reasoning`,
+and a streaming `event` chunk). Provider specifics: codex caps effort at
+`high` (xhigh/max clamp); copilot thinking is boolean (`concise`/`detailed`
+both enable summaries); claude has no thinking toggle (reported unsupported).
+
 ## Security notes
 
 Each provider exposes its permission flags. **Defaults are permissive for dev convenience** — tighten them when embedding into multi-tenant or untrusted contexts.
