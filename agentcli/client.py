@@ -124,8 +124,20 @@ def _merge_options(base: dict, provider_options: dict | None) -> dict:
     return base
 
 
+def _reject_reasoning_conflict(effort, thinking, provider_options):
+    """effort/thinking 를 1급 kwarg 와 provider_options 양쪽에 주면 모호 → 거부."""
+    if not provider_options:
+        return
+    for name, val in (("effort", effort), ("thinking", thinking)):
+        if val is not None and name in provider_options:
+            raise ValueError(
+                f"{name} given both as a keyword and in provider_options; "
+                f"pass it once")
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
+                       effort=None, thinking=None,
                        provider_options=None):
     kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
@@ -134,6 +146,8 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
         "cwd": cwd,
         "alias": alias,
         "resume_by_alias": resume_by_alias,
+        "effort": effort,
+        "thinking": thinking,
     }, provider_options))
     return provider_obj.invoke(messages, **kwargs)
 
@@ -141,6 +155,7 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     session_id, cwd, alias,
                                     resume_by_alias=True,
+                                    effort=None, thinking=None,
                                     provider_options=None):
     kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
@@ -149,6 +164,8 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
         "cwd": cwd,
         "alias": alias,
         "resume_by_alias": resume_by_alias,
+        "effort": effort,
+        "thinking": thinking,
     }, provider_options))
     return await provider_obj.invoke_async(messages, **kwargs)
 
@@ -156,6 +173,7 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
 def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         session_id, cwd, alias, idle_timeout=None,
                         wall_timeout=None, resume_by_alias=True,
+                        effort=None, thinking=None,
                         provider_options=None):
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
@@ -166,6 +184,8 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
         "idle_timeout": idle_timeout,
         "wall_timeout": wall_timeout,
         "resume_by_alias": resume_by_alias,
+        "effort": effort,
+        "thinking": thinking,
     }, provider_options))
     return provider_obj.stream_async(messages, **kwargs)
 
@@ -479,8 +499,11 @@ class LLMClient:
              fallback: bool = False,
              wall_timeout: int | None = None,
              new_session: bool = False,
+             effort: str | None = None,
+             thinking: str | None = None,
              provider_options: dict | None = None,
              ) -> LLMResponse:
+        _reject_reasoning_conflict(effort, thinking, provider_options)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -501,7 +524,8 @@ class LLMClient:
                 provider, messages, fallback_messages, model,
                 wall_timeout or timeout, session_id, cwd,
                 alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback, provider_options=provider_options)
+                allow_fallback=fallback, effort=effort, thinking=thinking,
+                provider_options=provider_options)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -524,6 +548,8 @@ class LLMClient:
                               *, alias: str = "",
                               resume_by_alias: bool = True,
                               allow_fallback: bool = False,
+                              effort: str | None = None,
+                              thinking: str | None = None,
                               provider_options: dict | None = None) -> LLMResponse:
         last_resp: LLMResponse | None = None
 
@@ -534,6 +560,7 @@ class LLMClient:
                 p, messages, model=model, timeout=timeout,
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
+                effort=effort, thinking=thinking,
                 provider_options=provider_options)
             if resp.content:
                 return resp
@@ -569,6 +596,7 @@ class LLMClient:
                 np, fallback_messages, model="", timeout=timeout,
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
+                effort=effort, thinking=thinking,
                 provider_options=provider_options)
             if resp.content:
                 return resp
@@ -606,8 +634,11 @@ class LLMClient:
                          fallback: bool = False,
                          wall_timeout: int | None = None,
                          new_session: bool = False,
+                         effort: str | None = None,
+                         thinking: str | None = None,
                          provider_options: dict | None = None,
                          ) -> LLMResponse:
+        _reject_reasoning_conflict(effort, thinking, provider_options)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -628,7 +659,8 @@ class LLMClient:
                 provider, messages, fallback_messages, model,
                 wall_timeout or timeout, session_id, cwd,
                 alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback, provider_options=provider_options)
+                allow_fallback=fallback, effort=effort, thinking=thinking,
+                provider_options=provider_options)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -652,6 +684,8 @@ class LLMClient:
                                           *, alias: str = "",
                                           resume_by_alias: bool = True,
                                           allow_fallback: bool = False,
+                                          effort: str | None = None,
+                                          thinking: str | None = None,
                               provider_options: dict | None = None) -> LLMResponse:
         last_resp: LLMResponse | None = None
 
@@ -661,6 +695,7 @@ class LLMClient:
                 p, messages, model=model, timeout=timeout,
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
+                effort=effort, thinking=thinking,
                 provider_options=provider_options)
             if resp.content:
                 return resp
@@ -694,6 +729,7 @@ class LLMClient:
                 np, fallback_messages, model="", timeout=timeout,
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
+                effort=effort, thinking=thinking,
                 provider_options=provider_options)
             if resp.content:
                 return resp
@@ -724,6 +760,8 @@ class LLMClient:
                           idle_timeout: int | None = None,
                           wall_timeout: int | None = None,
                           new_session: bool = False,
+                          effort: str | None = None,
+                          thinking: str | None = None,
                           provider_options: dict | None = None,
                           ) -> AsyncIterator[StreamChunk]:
         """스트리밍 호출. 청크를 yield하면서 응답을 누적하고 완료 시 저장.
@@ -735,6 +773,7 @@ class LLMClient:
         fallback=True는 첫 출력 전 실패에만 다른 provider를 시도한다.
         text/tool/event 등 어떤 출력이라도 나간 뒤 실패하면 provider를 바꾸지 않는다.
         """
+        _reject_reasoning_conflict(effort, thinking, provider_options)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model, created_conversation, resolved_alias, alias_to_set,
@@ -795,6 +834,7 @@ class LLMClient:
                             idle_timeout=idle_timeout,
                             wall_timeout=wall_timeout,
                             resume_by_alias=resume_by_alias,
+                            effort=effort, thinking=thinking,
                             provider_options=provider_options):
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
