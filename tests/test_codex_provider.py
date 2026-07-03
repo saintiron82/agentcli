@@ -1,5 +1,6 @@
 from unittest.mock import patch, MagicMock
 import subprocess
+from agentcli.providers.base import PROMPT_STDIN_THRESHOLD
 from agentcli.providers.codex import CodexProvider, _parse_jsonl_events
 from agentcli.types import Message
 
@@ -474,3 +475,121 @@ def test_codex_thinking_detailed_via_config():
 def test_codex_thinking_off_maps_to_none():
     args, _ = CodexProvider()._reasoning_flags(None, "off")
     assert args == ["-c", 'model_reasoning_summary="none"']
+
+
+# ===== issue #30: 큰 프롬프트 stdin 전달 (Windows 32,767자 argv 한계 우회) =====
+
+def _big_prompt() -> str:
+    """PROMPT_STDIN_THRESHOLD 를 넘는 ascii 프롬프트 (1 byte/char)."""
+    return "x" * (PROMPT_STDIN_THRESHOLD + 1)
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+def test_build_cmd_new_session_stdin_mode_uses_dash_sentinel(mock_find):
+    p = CodexProvider()
+    cmd = p._build_cmd("giant prompt body", "", None, "", prompt_via_stdin=True)
+    assert cmd is not None
+    assert "giant prompt body" not in cmd
+    assert cmd[-1] == "-", "-- 뒤 위치 인자는 stdin sentinel '-' 여야 한다"
+    assert cmd[cmd.index("--") + 1] == "-"
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+def test_build_cmd_resume_stdin_mode_uses_dash_sentinel(mock_find):
+    p = CodexProvider()
+    cmd = p._build_cmd("giant prompt body", "", None, "sid-123",
+                       prompt_via_stdin=True)
+    assert cmd is not None
+    assert "giant prompt body" not in cmd
+    dd = cmd.index("--")
+    assert cmd[dd + 1] == "sid-123"
+    assert cmd[dd + 2] == "-"
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+def test_build_cmd_default_still_inlines_prompt(mock_find):
+    """prompt_via_stdin 미지정(기본 False) 은 기존과 byte-identical."""
+    p = CodexProvider()
+    cmd = p._build_cmd("small prompt", "", None, "")
+    assert cmd[-1] == "small prompt"
+    cmd_resume = p._build_cmd("small prompt", "", None, "sid-123")
+    assert cmd_resume[-1] == "small prompt"
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_large_prompt_routes_via_stdin_input(mock_env, mock_run, mock_find):
+    """8000바이트 초과 프롬프트는 argv 가 아니라 subprocess.run(input=...) 로."""
+    big = _big_prompt()
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+        stderr="")
+    p = CodexProvider()
+    p.invoke([Message(role="user", content=big)])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert big not in cmd, "큰 프롬프트가 argv 에 그대로 남으면 안 된다"
+    assert cmd[-1] == "-"
+    assert kwargs.get("input") == big
+    assert "stdin" not in kwargs, "input= 과 stdin= 은 동시에 못 쓴다"
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_small_prompt_stdin_untouched(mock_env, mock_run, mock_find):
+    """임계치 이하 프롬프트는 기존과 동일하게 argv 로, stdin=DEVNULL 유지."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+        stderr="")
+    p = CodexProvider()
+    p.invoke([Message(role="user", content="small prompt")])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert cmd[-1] == "small prompt"
+    assert kwargs.get("stdin") == subprocess.DEVNULL
+    assert "input" not in kwargs
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_async_large_prompt_routes_via_input_bytes(mock_env, mock_find):
+    """async 경로도 큰 프롬프트는 use_stdin_devnull 대신 input_bytes 를 쓴다."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    big = _big_prompt()
+    with patch("agentcli.providers.codex.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b'{"type":"item.completed","item":'
+                                b'{"type":"agent_message","text":"ok"}}\n',
+                                b"", 0, False))) as m:
+        p = CodexProvider()
+        resp = asyncio.run(p.invoke_async([Message(role="user", content=big)]))
+    assert resp.content == "ok"
+    cmd = m.call_args.args[0]
+    assert big not in cmd
+    assert cmd[-1] == "-"
+    assert m.call_args.kwargs.get("use_stdin_devnull") is False
+    assert m.call_args.kwargs.get("input_bytes") == big.encode("utf-8")
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_async_small_prompt_still_closes_stdin_devnull(mock_env, mock_find):
+    """작은 프롬프트는 여전히 use_stdin_devnull=True, input_bytes 없음(불변)."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    with patch("agentcli.providers.codex.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b'{"type":"item.completed","item":'
+                                b'{"type":"agent_message","text":"ok"}}\n',
+                                b"", 0, False))) as m:
+        p = CodexProvider()
+        asyncio.run(p.invoke_async([Message(role="user", content="hi")]))
+    assert m.call_args.kwargs.get("use_stdin_devnull") is True
+    assert m.call_args.kwargs.get("input_bytes") is None
