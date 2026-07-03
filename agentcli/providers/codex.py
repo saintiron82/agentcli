@@ -116,9 +116,20 @@ def _codex_run_kwargs(prompt: str, use_stdin: bool, *,
     write-then-close 전달한다(codex sync invoke 는 ``text=True`` 라 str 그대로
     넘긴다; base.py 의 bytes 계약과 달리 codex 는 이 헬퍼가 자체 subprocess.run
     을 쓰므로 인코딩 불일치 없음).
+
+    ``encoding=`` 을 명시하지 않으면 ``text=True`` 는 stdin 인코딩과 stdout/
+    stderr 디코딩 모두에 ``locale.getpreferredencoding(False)`` 를 쓴다 —
+    이는 3.11~3.14 에서 OS/로케일에 따라 UTF-8 이 아닐 수 있어(PEP 686 UTF-8
+    기본값 이전), non-ASCII 대용량 프롬프트가 non-UTF-8 로케일 Windows 환경
+    (이 기능의 타깃)에서 UnicodeEncodeError 나 mojibake 를 낼 수 있다.
+    ``encoding="utf-8"`` 을 강제해 입출력 모두 결정적으로 만든다. codex 비동기
+    경로(``invoke_async``)가 ``.decode("utf-8", errors="replace")`` 로 stdout/
+    stderr 를 디코딩하는 기존 관례와 맞추기 위해 ``errors="replace"`` 도 함께
+    지정한다(동기 경로만 다른 동작을 하지 않도록).
     """
     kwargs: dict = dict(capture_output=True, text=True, timeout=timeout,
-                        env=build_env(), cwd=cwd)
+                        env=build_env(), cwd=cwd,
+                        encoding="utf-8", errors="replace")
     if use_stdin:
         kwargs["input"] = prompt
     else:

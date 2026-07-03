@@ -593,3 +593,66 @@ def test_invoke_async_small_prompt_still_closes_stdin_devnull(mock_env, mock_fin
         asyncio.run(p.invoke_async([Message(role="user", content="hi")]))
     assert m.call_args.kwargs.get("use_stdin_devnull") is True
     assert m.call_args.kwargs.get("input_bytes") is None
+
+
+# ===== review fix: codex 동기 stdin 경로는 로케일과 무관하게 UTF-8 이어야
+# 한다 (issue #30 후속 — non-UTF-8 로케일에서 UnicodeEncodeError/mojibake) =====
+
+def _big_korean_prompt() -> str:
+    """PROMPT_STDIN_THRESHOLD 를 넘는 non-ASCII(한글) 프롬프트."""
+    unit = "안녕하세요 이것은 큰 프롬프트입니다 — 유니코드 왕복 테스트. "
+    text = ""
+    while len(text.encode("utf-8")) <= PROMPT_STDIN_THRESHOLD:
+        text += unit
+    return text
+
+
+@patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
+@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_invoke_large_korean_prompt_uses_utf8_encoding_kwargs(mock_env, mock_run, mock_find):
+    """non-ASCII 대용량 프롬프트가 codex 동기 invoke 를 거칠 때, subprocess.run
+    에 전달되는 kwargs 는 로케일과 무관하게 encoding="utf-8" 로 고정돼야
+    한다 — 아니면 non-UTF-8 로케일 환경(``LC_ALL=C`` 등)에서
+    UnicodeEncodeError 나 mojibake 가 날 수 있다."""
+    big = _big_korean_prompt()
+    assert len(big.encode("utf-8")) > PROMPT_STDIN_THRESHOLD
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+        stderr="")
+    p = CodexProvider()
+    p.invoke([Message(role="user", content=big)])
+    kwargs = mock_run.call_args[1]
+    assert kwargs.get("encoding") == "utf-8"
+    assert kwargs.get("errors") == "replace"
+    assert kwargs.get("input") == big, "프롬프트 본문이 무손실로 전달돼야 한다"
+
+
+@patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
+def test_codex_run_kwargs_korean_stdin_roundtrips_through_real_subprocess(mock_env):
+    """실제 자식 프로세스(``sys.executable -c``)에 ``_codex_run_kwargs`` 로
+    조립한 kwargs 를 그대로 넘겨 한글 프롬프트를 stdin 으로 보내고 그대로
+    echo 받는다. 자식은 ``sys.stdin.buffer``/``sys.stdout.buffer`` 로 원시
+    바이트만 주고받아 자식 프로세스 자체의 로케일에 좌우되지 않게 하고,
+    부모(``subprocess.run``) 측의 encode/decode 만 검증한다 —
+    ``encoding="utf-8"`` 가 없으면 부모가 ``locale.getpreferredencoding``
+    으로 인코딩/디코딩해서 왕복 도중 깨질 수 있다."""
+    import sys
+    from agentcli.providers.codex import _codex_run_kwargs
+
+    korean = _big_korean_prompt()
+    assert len(korean.encode("utf-8")) > PROMPT_STDIN_THRESHOLD
+
+    child_script = ("import sys\n"
+                    "data = sys.stdin.buffer.read()\n"
+                    "sys.stdout.buffer.write(data)\n")
+    cmd = [sys.executable, "-c", child_script]
+    kwargs = _codex_run_kwargs(korean, use_stdin=True, timeout=10, cwd=None)
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+
+    result = subprocess.run(cmd, **kwargs)
+
+    assert result.returncode == 0
+    assert result.stdout == korean

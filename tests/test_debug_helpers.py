@@ -40,6 +40,25 @@ def test_redact_argv_dash_p_as_last_arg_untouched():
     assert redact_argv(cmd) == cmd
 
 
+def test_redact_argv_argv_mode_dash_prefixed_prompt_redacted():
+    """리뷰 회귀 재현: argv 모드에서 프롬프트 본문 자체가 ``-`` 로 시작해도
+    (content-sniffing이 아니라 위치로 판별하므로) 정상적으로 redact 되어야
+    한다 — 그렇지 않으면 debug trace 에 프롬프트가 그대로 새어나간다."""
+    cmd = ["/bin/claude", "-p", "--not-a-flag-just-my-prompt-text",
+           "--output-format", "json"]
+    out = redact_argv(cmd)
+    assert out[2].startswith("<prompt:") and out[2].endswith("chars>")
+    assert "--not-a-flag-just-my-prompt-text" not in out
+
+
+def test_redact_argv_stdin_mode_output_format_not_redacted():
+    """stdin 모드(위치 인자로서의 prompt 없음)에서 ``-p`` 바로 다음의
+    ``--output-format`` 은 프롬프트가 아니므로 그대로 보존되어야 한다."""
+    cmd = ["/bin/claude", "-p", "--output-format", "json",
+           "--permission-mode", "default"]
+    assert redact_argv(cmd) == cmd
+
+
 def test_write_debug_trace_appends_jsonl(tmp_path):
     p = tmp_path / "trace.jsonl"
     write_debug_trace(str(p), {"a": 1})

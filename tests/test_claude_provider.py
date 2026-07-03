@@ -534,6 +534,21 @@ def _big_prompt() -> str:
     return "x" * (PROMPT_STDIN_THRESHOLD + 1)
 
 
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_prompt_exactly_at_threshold_stays_argv_mode(mock_find, mock_run):
+    """경계값: 정확히 PROMPT_STDIN_THRESHOLD 바이트인 프롬프트는 (엄격한
+    ``>`` 비교이므로) 여전히 ARGV 모드 — stdin 으로 넘어가지 않는다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    exact = "x" * PROMPT_STDIN_THRESHOLD
+    p = ClaudeProvider()
+    p.invoke([Message(role="user", content=exact)])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert cmd[cmd.index("-p") + 1] == exact
+    assert kwargs.get("input_bytes") is None
+
+
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_build_cmd_prompt_via_stdin_omits_positional_prompt(mock_find):
     p = ClaudeProvider()

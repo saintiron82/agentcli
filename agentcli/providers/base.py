@@ -129,6 +129,16 @@ def estimate_payload_prompt_tokens(prompt: str) -> int:
 
 # ---- optional debug instrumentation (opt-in; zero cost when disabled) ----
 
+# claude._build_cmd 가 prompt_via_stdin=True 일 때 ``-p`` 바로 다음에 무조건
+# 붙이는 유일한 리터럴 플래그(항상 ``cmd += ["--output-format", ...]`` 가
+# 조건 없이 뒤따른다). redact_argv 는 이 정확한 문자열과만 비교해서 stdin
+# 모드를 판별한다 — "-" 로 시작하는지로 판별(content-sniffing)하면 프롬프트
+# 본문 자체가 ``-`` 로 시작하는 경우(argv 모드, 예: "-1 is negative") 그
+# 프롬프트가 플래그로 오인되어 redact 되지 않고 debug trace 에 그대로
+# 새어나간다 — 내용이 아니라 위치(구조)로만 판별해야 하는 이유다.
+_CLAUDE_STDIN_MODE_NEXT_FLAG = "--output-format"
+
+
 def redact_argv(cmd: list[str]) -> list[str]:
     """Return argv with the `-p <prompt>` payload replaced by a length marker.
 
@@ -136,9 +146,10 @@ def redact_argv(cmd: list[str]) -> list[str]:
     않도록, ``-p`` 다음 인자만 ``<prompt:N chars>`` 로 치환한다.
 
     큰 프롬프트는 stdin 으로 전달되어 ``-p`` 뒤에 위치 인자가 아예 없을 수
-    있다(issue #30) — 이때 ``-p`` 바로 다음이 ``--output-format`` 같은 플래그면
-    프롬프트로 오인해 redact 하면 안 되므로, 다음 토큰이 ``-`` 로 시작하지
-    않을 때만 프롬프트로 간주한다.
+    있다(issue #30) — 이때 ``-p`` 바로 다음 토큰이 stdin 모드의 리터럴 플래그
+    (``_CLAUDE_STDIN_MODE_NEXT_FLAG``)와 정확히 일치할 때만 "프롬프트 없음"
+    으로 간주한다. 그 외에는(설령 ``-`` 로 시작하더라도) argv 모드의 실제
+    프롬프트 본문으로 보고 redact 한다.
     """
     out: list[str] = []
     i = 0
@@ -146,7 +157,8 @@ def redact_argv(cmd: list[str]) -> list[str]:
     while i < n:
         arg = cmd[i]
         out.append(arg)
-        if arg == "-p" and i + 1 < n and not cmd[i + 1].startswith("-"):
+        if (arg == "-p" and i + 1 < n
+                and cmd[i + 1] != _CLAUDE_STDIN_MODE_NEXT_FLAG):
             out.append(f"<prompt:{len(cmd[i + 1])} chars>")
             i += 2
             continue
