@@ -80,3 +80,19 @@ def effort_levels(provider_id):
 
 def thinking_levels(provider_id):
     return _levels(THINKING, _THINKING_MAP, provider_id)
+
+
+def needs_event(res) -> bool:
+    """clamp 또는 미지원이 하나라도 있으면 스트리밍 event 로 알린다."""
+    for lr in (res.effort, res.thinking):
+        if lr is not None and (lr.clamped or not lr.supported):
+            return True
+    return False
+
+
+def to_dict(res) -> dict:
+    def _one(lr):
+        return None if lr is None else {
+            "requested": lr.requested, "applied": lr.applied,
+            "clamped": lr.clamped, "supported": lr.supported}
+    return {"effort": _one(res.effort), "thinking": _one(res.thinking)}

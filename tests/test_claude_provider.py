@@ -402,3 +402,40 @@ def test_invoke_not_found(mock_find):
     resp = p.invoke([Message(role="user", content="hi")])
     assert resp.content == ""
     assert resp.error
+
+
+def test_claude_effort_flag_and_report():
+    p = ClaudeProvider()
+    args, res = p._reasoning_flags("high", None)
+    assert args == ["--effort", "high"]
+    assert res.effort.applied == "high" and res.effort.clamped is False
+
+
+def test_claude_effort_minimal_clamps_up_to_low():
+    args, res = ClaudeProvider()._reasoning_flags("minimal", None)
+    assert args == ["--effort", "low"]
+    assert res.effort.clamped is True
+
+
+def test_claude_thinking_is_unsupported_noop():
+    args, res = ClaudeProvider()._reasoning_flags(None, "detailed")
+    assert args == []                      # no flag emitted
+    assert res.thinking.supported is False and res.thinking.applied == ""
+
+
+def test_claude_percall_effort_overrides_constructor_default():
+    p = ClaudeProvider(effort="low")
+    args, _ = p._reasoning_flags("max", None)   # per-call wins
+    assert args == ["--effort", "max"]
+
+
+def test_claude_no_reasoning_means_no_args_and_none():
+    args, res = ClaudeProvider()._reasoning_flags(None, None)
+    assert args == [] and res is None
+
+
+def test_claude_build_cmd_includes_effort_via_reasoning_args():
+    p = ClaudeProvider()
+    args, _ = p._reasoning_flags("xhigh", None)
+    cmd, _sid = p._build_cmd("hi", "", "", reasoning_args=args)
+    assert "--effort" in cmd and cmd[cmd.index("--effort") + 1] == "xhigh"

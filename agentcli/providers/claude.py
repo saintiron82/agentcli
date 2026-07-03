@@ -19,6 +19,7 @@ from .base import (LLMProvider, StreamState, build_session_prompt,
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
+from ..reasoning import needs_event as _reasoning_needs_event, to_dict as _reasoning_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,9 @@ class ClaudeProvider(LLMProvider):
                  lean: bool = False,
                  debug: bool = False,
                  debug_log_path: str | None = None,
-                 partial_messages: bool = False):
+                 partial_messages: bool = False,
+                 effort: str | None = None,
+                 thinking: str | None = None):
         """
         Args:
             permission_mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` 중 하나.
@@ -114,6 +117,11 @@ class ClaudeProvider(LLMProvider):
                 내보내게 한다. ``stream_async`` 가 이를 증분 ``text``/``thinking``
                 청크로 흘려, 단일 긴 생성도 토큰이 실시간으로 나온다(기본은 메시지
                 블록 단위). invoke(비스트리밍)에는 영향 없음. 기본 False.
+            effort: 정규화 reasoning effort 기본값 (``minimal``~``max``). 호출
+                시 override 가능. None 이면 ``--effort`` 를 붙이지 않는다(기존
+                동작 불변).
+            thinking: 정규화 reasoning thinking 기본값. claude CLI 는 thinking
+                토글이 없어 항상 무플래그 no-op 로 보고된다(clamp 아님).
         """
         self._permission_mode = permission_mode
         self._allowed_tools = allowed_tools
@@ -122,6 +130,9 @@ class ClaudeProvider(LLMProvider):
         self._debug = debug
         self._debug_log_path = debug_log_path
         self._partial_messages = partial_messages
+        # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
+        self._effort = effort
+        self._thinking = thinking
 
     def _find_binary(self) -> str | None:
         executable = "claude.cmd" if platform.system() == "Windows" else "claude"
@@ -205,7 +216,8 @@ class ClaudeProvider(LLMProvider):
                    strict_mcp_config: bool = False,
                    lean: bool | None = None,
                    debug: bool | None = None,
-                   partial_messages: bool | None = None) -> tuple[list[str] | None, str]:
+                   partial_messages: bool | None = None,
+                   reasoning_args: list[str] | None = None) -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
         permission_mode/allowed_tools/disallowed_tools/mcp_config/lean 은 호출
@@ -213,7 +225,9 @@ class ClaudeProvider(LLMProvider):
         정의 — dict 면 ``{"mcpServers": ...}`` 로 감싸 JSON 직렬화, str 이면 그대로
         (파일 경로 또는 사전 직렬화 JSON) 전달한다 (#154). lean=True 면 단일
         completion 용으로 ``--safe-mode`` + ``--tools`` allowlist 만 붙이고
-        MCP/disallowed_tools 블록은 건너뛴다.
+        MCP/disallowed_tools 블록은 건너뛴다. reasoning_args 는 ``_reasoning_flags``
+        가 미리 계산한 native 플래그 args — 호출자가 넘기지 않으면(None) 아무
+        플래그도 붙지 않아 기존 동작과 동일하다.
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -242,6 +256,8 @@ class ClaudeProvider(LLMProvider):
             cmd.append("--debug")
         if model:
             cmd += ["--model", model]
+        if reasoning_args:
+            cmd += reasoning_args
         if use_lean:
             # 단일 completion 경량 모드: 커스터마이즈(CLAUDE.md/skills/plugins/
             # hooks/MCP/custom agents 등) 와 빌트인 툴을 끊어 호출당 하네스 부팅
@@ -276,6 +292,26 @@ class ClaudeProvider(LLMProvider):
             cmd += ["--session-id", used_session_id]
         return cmd, used_session_id
 
+    def _reasoning_flags(self, effort, thinking):
+        """유효 effort/thinking → (claude native 플래그 args, ReasoningResolution).
+
+        유효값 = 호출 인자(None 이 아니면) 우선, 아니면 생성자 기본값.
+        claude 는 thinking 토글이 없어 thinking 은 무플래그 no-op 로 보고된다.
+        """
+        from ..reasoning import resolve_effort, resolve_thinking
+        from ..types import ReasoningResolution
+        eff = self._effort if effort is None else effort
+        thk = self._thinking if thinking is None else thinking
+        args, er, tr = [], None, None
+        if eff:
+            er = resolve_effort(self.provider_id, eff)
+            if er.applied:
+                args += ["--effort", er.applied]
+        if thk:
+            tr = resolve_thinking(self.provider_id, thk)  # 미지원 → 무플래그
+        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        return args, res
+
     def invoke(self, messages: list[Message], *,
                model: str = "", timeout: int = 120,
                session_id: str = "",
@@ -287,15 +323,19 @@ class ClaudeProvider(LLMProvider):
                disallowed_tools: list[str] | None = None,
                lean: bool | None = None,
                debug: bool | None = None,
-               debug_log_path: str | None = None) -> LLMResponse:
+               debug_log_path: str | None = None,
+               effort: str | None = None,
+               thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd, used_sid = self._build_cmd(
             prompt, model, session_id, "json",
             permission_mode=permission_mode, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug)
+            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+            reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -323,11 +363,13 @@ class ClaudeProvider(LLMProvider):
                                    int((time.time() - start) * 1000),
                                    f"timeout after {timeout}s", used_sid,
                                    dbg_path, "invoke")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                session_id=used_sid,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id, model=model,
+                               session_id=used_sid,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         latency = int((time.time() - start) * 1000)
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
         stdout_txt = stdout_b.decode("utf-8", errors="replace")
@@ -350,23 +392,26 @@ class ClaudeProvider(LLMProvider):
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
                     lean=lean, debug=debug,
-                    debug_log_path=debug_log_path)
+                    debug_log_path=debug_log_path,
+                    effort=effort, thinking=thinking)
             err_msg = stderr_txt.strip()[:300]
             msg = err_msg or f"exit={rc}"
             logger.error("Claude 실패 (code=%d): %s", rc, msg)
-            return LLMResponse(
+            resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,
                 error=msg,
                 error_type=classify_error(msg),
                 exit_code=rc,
             )
+            resp.reasoning = reasoning
+            return resp
 
         content, tokens, err = _parse_claude_json(stdout_txt)
         tokens.payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
         tokens.prompt_tokens_reliable = False
         tokens.prompt_tokens_source = "claude_cli_reported"
-        return LLMResponse(
+        resp = LLMResponse(
             content=content if not err else "",
             provider=self.provider_id, model=model,
             tokens=tokens, latency_ms=latency,
@@ -375,6 +420,8 @@ class ClaudeProvider(LLMProvider):
             error_type=classify_error(err) if err else "",
             exit_code=rc,
         )
+        resp.reasoning = reasoning
+        return resp
 
     async def invoke_async(self, messages: list[Message], *,
                            model: str = "", timeout: int = 120,
@@ -387,15 +434,19 @@ class ClaudeProvider(LLMProvider):
                            disallowed_tools: list[str] | None = None,
                            lean: bool | None = None,
                            debug: bool | None = None,
-                           debug_log_path: str | None = None) -> LLMResponse:
+                           debug_log_path: str | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd, used_sid = self._build_cmd(
             prompt, model, session_id, "json",
             permission_mode=permission_mode, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug)
+            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+            reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -420,11 +471,13 @@ class ClaudeProvider(LLMProvider):
                                    int((time.time() - start) * 1000),
                                    stderr_b.decode("utf-8", errors="replace"),
                                    used_sid, dbg_path, "invoke_async")
-            return LLMResponse(content="", provider=self.provider_id,
-                                model=model, session_id=used_sid,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id,
+                               model=model, session_id=used_sid,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         latency = int((time.time() - start) * 1000)
         if use_debug:
             _emit_invoke_debug(cmd, rc, latency,
@@ -446,19 +499,22 @@ class ClaudeProvider(LLMProvider):
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
                     lean=lean, debug=debug,
-                    debug_log_path=debug_log_path)
+                    debug_log_path=debug_log_path,
+                    effort=effort, thinking=thinking)
             logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            return LLMResponse(
+            resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,
                 error=msg, error_type=classify_error(msg),
                 exit_code=rc)
+            resp.reasoning = reasoning
+            return resp
 
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
         content, tokens, err = _parse_claude_json(
             stdout_b.decode("utf-8", errors="replace"))
-        return LLMResponse(
+        resp = LLMResponse(
             content=content if not err else "",
             provider=self.provider_id, model=model,
             tokens=tokens, latency_ms=latency,
@@ -467,6 +523,8 @@ class ClaudeProvider(LLMProvider):
             error_type=classify_error(err) if err else "",
             exit_code=rc,
         )
+        resp.reasoning = reasoning
+        return resp
 
     async def stream_async(self, messages: list[Message], *,
                            model: str = "", timeout: int = 120,
@@ -482,7 +540,9 @@ class ClaudeProvider(LLMProvider):
                            lean: bool | None = None,
                            debug: bool | None = None,
                            debug_log_path: str | None = None,
-                           partial_messages: bool | None = None) -> AsyncIterator[StreamChunk]:
+                           partial_messages: bool | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -500,6 +560,12 @@ class ClaudeProvider(LLMProvider):
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         use_partial = (self._partial_messages if partial_messages is None
                        else partial_messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다
+        # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
+        if reasoning and _reasoning_needs_event(reasoning):
+            yield StreamChunk(type="event",
+                              data={"reasoning": _reasoning_to_dict(reasoning)})
         # 만료된 session_id 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다. 어떤 출력이든
         # caller 에 전달된 뒤에는 재시도하지 않는다.
@@ -510,7 +576,7 @@ class ClaudeProvider(LLMProvider):
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
                 strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-                partial_messages=use_partial)
+                partial_messages=use_partial, reasoning_args=reasoning_args)
             if cmd is None:
                 yield StreamChunk(type="error", content="Claude CLI not found")
                 return
