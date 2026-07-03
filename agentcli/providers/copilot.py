@@ -431,7 +431,9 @@ class CopilotProvider(LLMProvider):
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다.
         if reasoning and needs_event(reasoning):
-            yield StreamChunk(type="event", data={"reasoning": _rz_to_dict(reasoning)})
+            yield StreamChunk(type="event",
+                              data={"reasoning": _rz_to_dict(reasoning),
+                                    "provider": self.provider_id})
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,

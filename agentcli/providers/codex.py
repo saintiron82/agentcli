@@ -571,7 +571,8 @@ class CodexProvider(LLMProvider):
         # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
         if reasoning and needs_event(reasoning):
             yield StreamChunk(type="event",
-                              data={"reasoning": _rz_to_dict(reasoning)})
+                              data={"reasoning": _rz_to_dict(reasoning),
+                                    "provider": self.provider_id})
         # 만료된 thread 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다 (claude 동일 패턴).
         attempt_sid = session_id

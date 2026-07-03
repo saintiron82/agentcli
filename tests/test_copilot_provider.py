@@ -332,6 +332,7 @@ def test_stream_async_reasoning_event_before_binary_missing_error(mock_find):
     assert len(chunks) >= 2
     assert chunks[0].type == "event"
     assert "reasoning" in (chunks[0].data or {})
+    assert chunks[0].data.get("provider") == "copilot"
 
     # 두 번째 청크는 binary-missing error이어야 한다.
     assert chunks[1].type == "error"

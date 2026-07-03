@@ -857,7 +857,15 @@ class LLMClient:
                                 yield err_chunk
                             continue
 
-                        emitted_output = True
+                        # 정규화 reasoning event(clamp/미지원 알림)는 요청 해석
+                        # 결과를 알릴 뿐 실제 출력이 아니므로 fallback 판단에서
+                        # emitted_output 으로 세지 않는다 — 그래도 caller 에게는
+                        # 그대로 전달한다.
+                        is_reasoning_event = (
+                            raw_chunk.type == "event"
+                            and "reasoning" in (raw_chunk.data or {}))
+                        if not is_reasoning_event:
+                            emitted_output = True
                         if raw_chunk.type == "text":
                             text_parts.append(raw_chunk.content)
                         yield raw_chunk
