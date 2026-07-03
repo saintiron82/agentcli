@@ -123,3 +123,15 @@ def test_capability_matrix_reflects_os(monkeypatch):
     p = c._registry.get("claude")
     monkeypatch.setattr(p, "supports_sessions", False)
     assert c.capability_matrix()["claude"]["sessions"] is False
+
+
+def test_capabilities_expose_reasoning_levels():
+    from agentcli.providers.claude import ClaudeProvider
+    from agentcli.providers.codex import CodexProvider
+    caps_claude = ClaudeProvider().capabilities()
+    caps_codex = CodexProvider().capabilities()
+    assert caps_claude.effort_levels == frozenset({"low","medium","high","xhigh","max"})
+    assert caps_claude.thinking_levels == frozenset()          # claude: no toggle
+    assert caps_codex.effort_levels == frozenset({"minimal","low","medium","high"})
+    assert "effort_levels" in caps_claude.to_dict()
+    assert "thinking_levels" in caps_claude.to_dict()

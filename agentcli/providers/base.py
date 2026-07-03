@@ -238,6 +238,7 @@ class LLMProvider(ABC):
         """
         import inspect
         from ..types import ProviderCapabilities
+        from ..reasoning import effort_levels, thinking_levels
         opts: set[str] = set()
         for mname in ("invoke", "stream_async"):
             method = getattr(self, mname, None)
@@ -257,6 +258,8 @@ class LLMProvider(ABC):
             debug=self.supports_debug,
             options=frozenset(opts),
             notes=capability_notes,
+            effort_levels=effort_levels(self.provider_id),
+            thinking_levels=thinking_levels(self.provider_id),
         )
 
     @abstractmethod
