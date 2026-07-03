@@ -396,6 +396,26 @@ def test_invoke_timeout(mock_find, mock_run):
     assert resp.exit_code == 124
 
 
+def test_invoke_async_closes_stdin():
+    """claude ``invoke_async`` 도 sync 경로(run_subprocess_sync 는 stdin=DEVNULL
+    하드코딩)와 codex/copilot 의 async 경로처럼 stdin 을 DEVNULL 로 닫아야 한다
+    — 안 닫으면 부모 stdin 을 상속해 대화형 입력 대기로 행할 수 있다 (issue #34).
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    with patch("agentcli.providers.claude.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b'{"result":"ok"}', b"", 0, False))) as mock_run, \
+         patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+               return_value="/usr/bin/claude"):
+        p = ClaudeProvider()
+        resp = asyncio.run(
+            p.invoke_async([Message(role="user", content="hi")]))
+    assert resp.content == "ok"
+    assert mock_run.call_args.kwargs.get("use_stdin_devnull") is True
+
+
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value=None)
 def test_invoke_not_found(mock_find):
     p = ClaudeProvider()
