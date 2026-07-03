@@ -460,3 +460,67 @@ def test_claude_build_cmd_includes_effort_via_reasoning_args(mock_find):
     args, _ = p._reasoning_flags("xhigh", None)
     cmd, _sid = p._build_cmd("hi", "", "", reasoning_args=args)
     assert "--effort" in cmd and cmd[cmd.index("--effort") + 1] == "xhigh"
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_timeout_debug_carries_partial_stderr(mock_find, mock_run, tmp_path):
+    """invoke() timeout 브랜치는 debug=True 일 때 합성 문자열 대신 부분 stderr를
+    debug trace 에 남겨야 한다 (commit 9305b69 회귀). 사용자 계약(error="timeout after 120s")
+    은 변하지 않는다."""
+    import json as _json
+    # timed_out=True 이고 real partial stderr 를 반환
+    mock_run.return_value = (b"", b"DEBUG-MARKER partial stderr from claude", 124, True)
+    trace = tmp_path / "trace.jsonl"
+    p = ClaudeProvider(debug=True, debug_log_path=str(trace))
+    resp = p.invoke([Message(role="user", content="hi")], timeout=120)
+
+    # 사용자 계약: 타임아웃 에러는 여전히 "timeout after 120s"
+    assert resp.content == ""
+    assert resp.error == "timeout after 120s"
+    assert resp.error_type == "timeout"
+    assert resp.exit_code == 124
+
+    # debug trace 검증: partial stderr 가 그대로 들어가야 함 (합성 string 아님)
+    assert trace.exists()
+    rec = _json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["phase"] == "invoke"
+    assert rec["returncode"] == 124
+    # 부분 stderr 가 그대로 들어가 있어야 함
+    assert "DEBUG-MARKER partial stderr from claude" in rec["stderr"]
+    # "timeout after" 문자열은 debug trace 에 들어가면 안 됨
+    assert "timeout after" not in rec["stderr"]
+
+
+def test_invoke_async_timeout_debug_carries_partial_stderr(tmp_path):
+    """invoke_async() timeout 브랜치도 debug=True 일 때 부분 stderr를
+    debug trace 에 남겨야 한다 (invoke 와 동일 계약). 사용자 계약은 변하지 않는다."""
+    import asyncio
+    import json as _json
+    from unittest.mock import AsyncMock, patch
+
+    with patch("agentcli.providers.claude.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b"", b"DEBUG-MARKER async partial stderr", 124, True))) as mock_run, \
+         patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+               return_value="/usr/bin/claude"):
+        trace = tmp_path / "trace.jsonl"
+        p = ClaudeProvider(debug=True, debug_log_path=str(trace))
+        resp = asyncio.run(
+            p.invoke_async([Message(role="user", content="hi")], timeout=120))
+
+        # 사용자 계약: 타임아웃 에러는 여전히 "timeout after 120s"
+        assert resp.content == ""
+        assert resp.error == "timeout after 120s"
+        assert resp.error_type == "timeout"
+        assert resp.exit_code == 124
+
+        # debug trace 검증: partial stderr 가 그대로 들어가야 함
+        assert trace.exists()
+        rec = _json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert rec["phase"] == "invoke_async"
+        assert rec["returncode"] == 124
+        # 부분 stderr 가 그대로 들어가 있어야 함
+        assert "DEBUG-MARKER async partial stderr" in rec["stderr"]
+        # "timeout after" 문자열은 debug trace 에 들어가면 안 됨
+        assert "timeout after" not in rec["stderr"]
