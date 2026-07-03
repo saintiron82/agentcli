@@ -1,4 +1,5 @@
 from unittest.mock import patch, MagicMock
+import asyncio
 import subprocess
 from agentcli.providers.copilot import CopilotProvider, _parse_copilot_jsonl
 from agentcli.types import Message
@@ -308,3 +309,30 @@ def test_invoke_no_reasoning_means_argv_unchanged_and_none(mock_find, mock_env, 
 def test_invoke_binary_missing_leaves_reasoning_unset(mock_find):
     resp = CopilotProvider(effort="high").invoke([Message(role="user", content="hi")])
     assert resp.reasoning is None
+
+
+# ===== stream_async (reasoning event ordering) =====
+
+def _collect_stream(provider, **kwargs):
+    """Helper to run stream_async and collect all chunks."""
+    async def run():
+        return [c async for c in provider.stream_async(
+            [Message(role="user", content="hi")], **kwargs)]
+    return asyncio.run(run())
+
+
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=(None, False))
+def test_stream_async_reasoning_event_before_binary_missing_error(mock_find):
+    """reasoning event은 binary-missing error 전에 yield 되어야 한다 (claude 정규화)."""
+    # thinking="detailed"는 copilot에서 clamped되므로 needs_event가 True가 된다.
+    chunks = _collect_stream(CopilotProvider(), thinking="detailed")
+
+    # 첫 청크는 reasoning event이어야 한다.
+    assert len(chunks) >= 2
+    assert chunks[0].type == "event"
+    assert "reasoning" in (chunks[0].data or {})
+
+    # 두 번째 청크는 binary-missing error이어야 한다.
+    assert chunks[1].type == "error"
+    assert "not found" in chunks[1].content

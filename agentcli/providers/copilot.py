@@ -429,6 +429,9 @@ class CopilotProvider(LLMProvider):
         from ..reasoning import needs_event, to_dict as _rz_to_dict
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다.
+        if reasoning and needs_event(reasoning):
+            yield StreamChunk(type="event", data={"reasoning": _rz_to_dict(reasoning)})
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
@@ -436,9 +439,6 @@ class CopilotProvider(LLMProvider):
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")
             return
-        # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다.
-        if reasoning and needs_event(reasoning):
-            yield StreamChunk(type="event", data={"reasoning": _rz_to_dict(reasoning)})
         state = StreamState(
             final_session_id=session_id or alias,
             final_usage=TokenUsage(
