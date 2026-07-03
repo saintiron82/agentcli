@@ -12,10 +12,11 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from .base import (LLMProvider, StreamState, build_session_prompt,
-                   emit_invoke_debug, estimate_payload_prompt_tokens,
-                   health_from_response, run_health_command,
-                   run_subprocess_async, run_subprocess_sync)
+from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
+                   build_session_prompt, emit_invoke_debug,
+                   estimate_payload_prompt_tokens, health_from_response,
+                   run_health_command, run_subprocess_async,
+                   run_subprocess_sync)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -217,7 +218,8 @@ class ClaudeProvider(LLMProvider):
                    lean: bool | None = None,
                    debug: bool | None = None,
                    partial_messages: bool | None = None,
-                   reasoning_args: list[str] | None = None) -> tuple[list[str] | None, str]:
+                   reasoning_args: list[str] | None = None,
+                   prompt_via_stdin: bool = False) -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
         permission_mode/allowed_tools/disallowed_tools/mcp_config/lean 은 호출
@@ -227,7 +229,10 @@ class ClaudeProvider(LLMProvider):
         completion 용으로 ``--safe-mode`` + ``--tools`` allowlist 만 붙이고
         MCP/disallowed_tools 블록은 건너뛴다. reasoning_args 는 ``_reasoning_flags``
         가 미리 계산한 native 플래그 args — 호출자가 넘기지 않으면(None) 아무
-        플래그도 붙지 않아 기존 동작과 동일하다.
+        플래그도 붙지 않아 기존 동작과 동일하다. prompt_via_stdin=True 면
+        ``-p`` 뒤 위치 인자로 prompt 를 넣지 않는다(issue #30) — claude CLI 는
+        ``-p`` 뒤 인자가 없으면 stdin 에서 프롬프트를 읽으므로, 호출자가 프롬프트
+        바이트를 subprocess stdin 으로 별도 전달해야 한다. 기본 False(기존 동작).
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -242,9 +247,11 @@ class ClaudeProvider(LLMProvider):
         use_partial = (self._partial_messages if partial_messages is None
                        else partial_messages)
 
-        cmd = [bin_path, "-p", prompt,
-               "--output-format", output_format,
-               "--permission-mode", pmode]
+        cmd = [bin_path, "-p"]
+        if not prompt_via_stdin:
+            cmd.append(prompt)
+        cmd += ["--output-format", output_format,
+                "--permission-mode", pmode]
         if output_format == "stream-json":
             # stream-json은 반드시 --verbose 필요 (Claude Code 제약)
             cmd.append("--verbose")
@@ -330,12 +337,16 @@ class ClaudeProvider(LLMProvider):
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달 —
+        # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         cmd, used_sid = self._build_cmd(
             prompt, model, session_id, "json",
             permission_mode=permission_mode, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
             strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-            reasoning_args=reasoning_args)
+            reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -347,9 +358,12 @@ class ClaudeProvider(LLMProvider):
         try:
             # run_subprocess_sync: 새 프로세스 그룹 + 타임아웃/정리 시 그룹 전체
             # killpg → CLI 가 띄운 MCP/hook 손자 좀비 방지 (subprocess.run 의
-            # 직속-only kill 한계 회피).
+            # 직속-only kill 한계 회피). use_stdin 이면 프롬프트를 argv 대신
+            # stdin(PIPE)으로 write-then-close 전달(issue #30) — 아니면
+            # input_bytes=None 으로 기존과 byte-identical(stdin=DEVNULL).
             stdout_b, stderr_b, rc, timed_out = run_subprocess_sync(
-                cmd, timeout=timeout, cwd=cwd)
+                cmd, timeout=timeout, cwd=cwd,
+                input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -443,12 +457,15 @@ class ClaudeProvider(LLMProvider):
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         cmd, used_sid = self._build_cmd(
             prompt, model, session_id, "json",
             permission_mode=permission_mode, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
             strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-            reasoning_args=reasoning_args)
+            reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
         if cmd is None:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -458,8 +475,13 @@ class ClaudeProvider(LLMProvider):
 
         start = time.time()
         try:
+            # use_stdin_devnull 과 input_bytes 는 상호 배타적(run_subprocess_async
+            # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
+            # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd, use_stdin_devnull=True)
+                cmd, timeout=timeout, cwd=cwd,
+                use_stdin_devnull=not use_stdin,
+                input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
