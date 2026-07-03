@@ -77,14 +77,17 @@ class CopilotProvider(LLMProvider):
                  available_tools: list[str] | None = None,
                  allow_all_paths: bool = False,
                  add_dirs: list[str] | None = None,
-                 effort: str | None = None):
+                 effort: str | None = None,
+                 thinking: str | None = None):
         self._allow_all_tools = allow_all_tools
         self._allowed_tools = allowed_tools
         self._disallowed_tools = disallowed_tools
         self._available_tools = available_tools
         self._allow_all_paths = allow_all_paths
         self._add_dirs = add_dirs or []
+        # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
         self._effort = effort
+        self._thinking = thinking
 
     def _find_binary(self) -> tuple[str | None, bool]:
         bin_path = shutil.which("copilot")
@@ -152,8 +155,14 @@ class CopilotProvider(LLMProvider):
                    session_id: str,
                    output_format: str = "text",
                    alias: str = "",
-                   resume_by_alias: bool = True) -> tuple[list[str] | None, bool]:
-        """(cmd, use_gh) 반환. session_id 발급은 CLI가 담당, 우리는 stdout에서 파싱."""
+                   resume_by_alias: bool = True,
+                   reasoning_args: list[str] | None = None) -> tuple[list[str] | None, bool]:
+        """(cmd, use_gh) 반환. session_id 발급은 CLI가 담당, 우리는 stdout에서 파싱.
+
+        reasoning_args 는 ``_reasoning_flags`` 가 미리 계산한 native 플래그
+        args — 호출자가 넘기지 않으면(None) 아무 플래그도 붙지 않아 기존
+        동작과 동일하다.
+        """
         bin_path, use_gh = self._find_binary()
         if not bin_path:
             return None, False
@@ -184,8 +193,8 @@ class CopilotProvider(LLMProvider):
             cmd.append("--allow-all-paths")
         for d in self._add_dirs:
             cmd += ["--add-dir", d]
-        if self._effort:
-            cmd += ["--effort", self._effort]
+        if reasoning_args:
+            cmd += reasoning_args
 
         if session_id:
             cmd += [f"--resume={session_id}"]
@@ -197,6 +206,28 @@ class CopilotProvider(LLMProvider):
 
         return cmd, use_gh
 
+    def _reasoning_flags(self, effort, thinking):
+        """유효 effort/thinking → (copilot native 플래그, ReasoningResolution).
+
+        thinking 은 불리언 — concise/detailed 는 --enable-reasoning-summaries,
+        off 는 무플래그. detailed 는 불리언으로 접혀 clamped 로 보고된다.
+        """
+        from ..reasoning import resolve_effort, resolve_thinking
+        from ..types import ReasoningResolution
+        eff = self._effort if effort is None else effort
+        thk = self._thinking if thinking is None else thinking
+        args, er, tr = [], None, None
+        if eff:
+            er = resolve_effort(self.provider_id, eff)
+            if er.applied:
+                args += ["--effort", er.applied]
+        if thk:
+            tr = resolve_thinking(self.provider_id, thk)
+            if tr.applied == "on":
+                args.append("--enable-reasoning-summaries")
+        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        return args, res
+
     # ---------- 동기 ----------
 
     def invoke(self, messages: list[Message], *,
@@ -206,11 +237,15 @@ class CopilotProvider(LLMProvider):
                alias: str = "",
                resume_by_alias: bool = True,
                debug: bool = False,
-               debug_log_path: str | None = None) -> LLMResponse:
+               debug_log_path: str | None = None,
+               effort: str | None = None,
+               thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
-                                   resume_by_alias=resume_by_alias)
+                                   resume_by_alias=resume_by_alias,
+                                   reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -235,16 +270,18 @@ class CopilotProvider(LLMProvider):
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
                 logger.error("Copilot 실패 (code=%d): %s",
                              result.returncode, msg)
-                return LLMResponse(
+                resp = LLMResponse(
                     content="", provider=self.provider_id, model=model,
                     raw_stderr=result.stderr,
                     session_id=session_id or alias,
                     error=msg, error_type=classify_error(msg),
                     exit_code=result.returncode)
+                resp.reasoning = reasoning
+                return resp
 
             parsed = _parse_copilot_jsonl(result.stdout)
             err = parsed.get("error", "")
-            return LLMResponse(
+            resp = LLMResponse(
                 content=parsed["text"] if not err else "",
                 provider=self.provider_id, model=model,
                 tokens=parsed["usage"], latency_ms=latency,
@@ -254,6 +291,8 @@ class CopilotProvider(LLMProvider):
                 error_type=classify_error(err) if err else "",
                 exit_code=result.returncode,
             )
+            resp.reasoning = reasoning
+            return resp
         except subprocess.TimeoutExpired:
             logger.error("Copilot 타임아웃 (%d초)", timeout)
             if debug:
@@ -261,11 +300,13 @@ class CopilotProvider(LLMProvider):
                                   int((time.time() - start) * 1000), "",
                                   session_id=session_id or alias,
                                   path=debug_log_path)
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                session_id=session_id or alias,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id, model=model,
+                               session_id=session_id or alias,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -282,11 +323,15 @@ class CopilotProvider(LLMProvider):
                            alias: str = "",
                            resume_by_alias: bool = True,
                            debug: bool = False,
-                           debug_log_path: str | None = None) -> LLMResponse:
+                           debug_log_path: str | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
-                                   resume_by_alias=resume_by_alias)
+                                   resume_by_alias=resume_by_alias,
+                                   reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -314,11 +359,13 @@ class CopilotProvider(LLMProvider):
                                   int((time.time() - start) * 1000), "",
                                   session_id=session_id or alias,
                                   path=debug_log_path)
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                session_id=session_id or alias,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id, model=model,
+                               session_id=session_id or alias,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         latency = int((time.time() - start) * 1000)
         stdout_txt = stdout_b.decode("utf-8", errors="replace")
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
@@ -330,16 +377,18 @@ class CopilotProvider(LLMProvider):
         if rc != 0:
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             logger.error("Copilot 실패 (code=%d): %s", rc, msg)
-            return LLMResponse(
+            resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt,
                 session_id=session_id or alias,
                 error=msg, error_type=classify_error(msg),
                 exit_code=rc)
+            resp.reasoning = reasoning
+            return resp
 
         parsed = _parse_copilot_jsonl(stdout_txt)
         err = parsed.get("error", "")
-        return LLMResponse(
+        resp = LLMResponse(
             content=parsed["text"] if not err else "",
             provider=self.provider_id, model=model,
             tokens=parsed["usage"], latency_ms=latency,
@@ -349,6 +398,8 @@ class CopilotProvider(LLMProvider):
             error_type=classify_error(err) if err else "",
             exit_code=rc,
         )
+        resp.reasoning = reasoning
+        return resp
 
     # ---------- 스트리밍 ----------
 
@@ -361,7 +412,9 @@ class CopilotProvider(LLMProvider):
                            idle_timeout: int | None = None,
                            wall_timeout: int | None = None,
                            debug: bool = False,
-                           debug_log_path: str | None = None) -> AsyncIterator[StreamChunk]:
+                           debug_log_path: str | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -373,13 +426,19 @@ class CopilotProvider(LLMProvider):
           result                  → session_id 갱신
           assistant.tool_* / tool.* → tool_use
         """
+        from ..reasoning import needs_event, to_dict as _rz_to_dict
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
-                                   resume_by_alias=resume_by_alias)
+                                   resume_by_alias=resume_by_alias,
+                                   reasoning_args=reasoning_args)
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")
             return
+        # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다.
+        if reasoning and needs_event(reasoning):
+            yield StreamChunk(type="event", data={"reasoning": _rz_to_dict(reasoning)})
         state = StreamState(
             final_session_id=session_id or alias,
             final_usage=TokenUsage(
