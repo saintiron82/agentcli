@@ -27,6 +27,19 @@ def test_redact_argv_only_redacts_arg_after_dash_p():
     assert out[4] == "Read"  # -p 다음 한 인자만 redact
 
 
+def test_redact_argv_stdin_mode_no_trailing_prompt_untouched():
+    """issue #30: 큰 프롬프트는 stdin 으로 전달되어 ``-p`` 뒤에 위치 인자
+    (프롬프트)가 아예 없을 수 있다 — 이때 바로 다음 플래그(``--output-format``)
+    를 프롬프트로 오인해 redact 하면 안 된다."""
+    cmd = ["/bin/claude", "-p", "--output-format", "json", "--model", "haiku"]
+    assert redact_argv(cmd) == cmd
+
+
+def test_redact_argv_dash_p_as_last_arg_untouched():
+    cmd = ["/bin/claude", "-p"]
+    assert redact_argv(cmd) == cmd
+
+
 def test_write_debug_trace_appends_jsonl(tmp_path):
     p = tmp_path / "trace.jsonl"
     write_debug_trace(str(p), {"a": 1})

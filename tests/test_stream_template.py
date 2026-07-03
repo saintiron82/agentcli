@@ -751,7 +751,7 @@ def test_run_subprocess_async_cancellation_kills_proc(monkeypatch):
 
     proc = make_fake_proc()
 
-    async def hang():
+    async def hang(input=None):
         await asyncio.Event().wait()
 
     proc.communicate = hang
@@ -779,7 +779,7 @@ def test_run_subprocess_async_timeout_still_kills_proc(monkeypatch):
 
     proc = make_fake_proc()
 
-    async def hang():
+    async def hang(input=None):
         await asyncio.Event().wait()
 
     proc.communicate = hang

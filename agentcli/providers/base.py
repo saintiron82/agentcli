@@ -20,6 +20,15 @@ from ..utils import serialize_messages
 # 단위로 죽여야 한다. POSIX 에서만 setsid/killpg 가능 — Windows 는 직속 kill.
 _POSIX = os.name == "posix"
 
+# claude/codex 는 프롬프트를 argv 로 넘긴다(`-p <prompt>` / `-- <prompt>`).
+# Windows CreateProcess 는 명령행 전체를 32,767자로 제한하므로, 큰
+# ContextSession/fork_many seed(예: 5만 자)는 WinError 206 으로 실패한다
+# (issue #30). 이 바이트 임계치를 넘는 프롬프트는 stdin 으로 전달한다 —
+# 8000 은 나머지 argv(플래그·모델명·세션 id 등)에 여유를 남기는 보수적
+# 마진이다(32767 대비 넉넉히 작게). macOS/Linux 는 ARG_MAX 가 커서 원래도
+# 문제 없지만, 임계치는 OS 무관 공통 정책으로 적용한다.
+PROMPT_STDIN_THRESHOLD = 8000
+
 
 def _new_session_kwargs() -> dict:
     """spawn 시 새 세션(프로세스 그룹) 분리 kwargs (POSIX 만)."""
@@ -125,17 +134,23 @@ def redact_argv(cmd: list[str]) -> list[str]:
 
     Debug 로그/trace 에 50k 짜리 프롬프트 본문이나 민감 내용을 그대로 흘리지
     않도록, ``-p`` 다음 인자만 ``<prompt:N chars>`` 로 치환한다.
+
+    큰 프롬프트는 stdin 으로 전달되어 ``-p`` 뒤에 위치 인자가 아예 없을 수
+    있다(issue #30) — 이때 ``-p`` 바로 다음이 ``--output-format`` 같은 플래그면
+    프롬프트로 오인해 redact 하면 안 되므로, 다음 토큰이 ``-`` 로 시작하지
+    않을 때만 프롬프트로 간주한다.
     """
     out: list[str] = []
-    redact_next = False
-    for arg in cmd:
-        if redact_next:
-            out.append(f"<prompt:{len(arg)} chars>")
-            redact_next = False
-            continue
+    i = 0
+    n = len(cmd)
+    while i < n:
+        arg = cmd[i]
         out.append(arg)
-        if arg == "-p":
-            redact_next = True
+        if arg == "-p" and i + 1 < n and not cmd[i + 1].startswith("-"):
+            out.append(f"<prompt:{len(cmd[i + 1])} chars>")
+            i += 2
+            continue
+        i += 1
     return out
 
 
@@ -625,6 +640,7 @@ async def run_subprocess_async(
     cwd: str | None = None,
     env: dict | None = None,
     use_stdin_devnull: bool = False,
+    input_bytes: bytes | None = None,
 ) -> tuple[bytes, bytes, int, bool]:
     """Run an async subprocess with a single-shot communicate() + timeout.
 
@@ -641,6 +657,8 @@ async def run_subprocess_async(
 
     Raises:
         ``FileNotFoundError`` — 호출자가 잡아서 binary_missing 으로 정규화.
+        ``ValueError`` — ``use_stdin_devnull`` 과 ``input_bytes`` 를 동시에 쓰면
+            (stdin 을 DEVNULL 로 닫으면서 동시에 그걸로 쓰기는 모순이므로).
 
     Args:
         cmd: subprocess argv 리스트.
@@ -649,14 +667,24 @@ async def run_subprocess_async(
         env: subprocess env. ``None`` 이면 부모 환경 상속.
         use_stdin_devnull: True 면 stdin 을 ``/dev/null`` 로 닫는다 (codex/copilot
             처럼 stdin 입력 대기를 막아야 하는 CLI 용).
+        input_bytes: 지정하면 stdin 을 PIPE 로 열어 이 바이트를 write-then-close
+            로 전달한다(issue #30: 큰 프롬프트를 argv 대신 stdin 으로 넘겨
+            Windows 32,767자 명령행 한계를 우회). communicate() 가 쓰기 후 바로
+            EOF 를 닫으므로 인터랙티브 대기 위험은 없다. ``use_stdin_devnull``
+            과는 상호 배타적.
     """
+    if use_stdin_devnull and input_bytes is not None:
+        raise ValueError(
+            "use_stdin_devnull and input_bytes are mutually exclusive")
     kwargs: dict = {
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.PIPE,
         # 새 세션 분리 → 타임아웃/취소 시 손자까지 그룹 단위로 reap.
         **_new_session_kwargs(),
     }
-    if use_stdin_devnull:
+    if input_bytes is not None:
+        kwargs["stdin"] = asyncio.subprocess.PIPE
+    elif use_stdin_devnull:
         kwargs["stdin"] = asyncio.subprocess.DEVNULL
     if env is not None:
         kwargs["env"] = env
@@ -668,8 +696,11 @@ async def run_subprocess_async(
     # timeout) 은 타임아웃 시 communicate task 자체를 취소해 그때까지 버퍼링된
     # stdout/stderr 를 통째로 잃는다. asyncio.wait() 는 task 를 취소하지 않으므로
     # 타임아웃 후 그룹을 kill(파이프 닫힘)한 뒤 같은 task 를 이어서 기다려 부분
-    # 출력을 회수할 수 있다.
-    task = asyncio.ensure_future(proc.communicate())
+    # 출력을 회수할 수 있다. input_bytes 는 이 최초 communicate 호출에 넘겨야
+    # write-then-close 가 성립한다 — timeout 이어도 이미 쓰기 시도가 시작된 뒤라
+    # 재시도(위 kill 이후의 두 번째 communicate)는 input 없이 호출해도 안전하다
+    # (CPython 은 최초 호출 이후 재호출 시 input 미지정을 허용).
+    task = asyncio.ensure_future(proc.communicate(input=input_bytes))
     timed_out = False
     try:
         done, _pending = await asyncio.wait({task}, timeout=timeout)
@@ -709,6 +740,7 @@ def run_subprocess_sync(
     cmd: list[str], *, timeout: int,
     cwd: str | None = None,
     env: dict | None = None,
+    input_bytes: bytes | None = None,
 ) -> tuple[bytes, bytes, int, bool]:
     """Synchronous subprocess with process-group teardown.
 
@@ -717,19 +749,26 @@ def run_subprocess_sync(
     손자가 stdout 파이프를 물고 있으면 정리 단계의 재-communicate 가 매달릴
     수 있다. 이를 막기 위해 ``Popen(start_new_session=True)`` 로 새 그룹에
     띄우고, 타임아웃/정리 시 ``killpg`` 로 **그룹 전체**를 죽인다. stdin 은
-    DEVNULL (일회성 비대화형 호출이므로 stdin 대기 방지).
+    기본 DEVNULL (일회성 비대화형 호출이므로 stdin 대기 방지) — ``input_bytes``
+    지정 시에만 PIPE 로 열어 그 바이트를 쓴다.
 
     Returns: ``(stdout, stderr, returncode, timed_out)`` — ``run_subprocess_async``
     와 동일 계약. timeout 이면 ``returncode=124`` 이고 ``stdout``/``stderr`` 에는
     kill 전까지 자식이 쓴 부분 출력(예: claude ``--debug`` 로그)이 담긴다 —
     합성 타임아웃 문자열로 덮어쓰지 않는다 (issue #34).
 
+    Args:
+        input_bytes: 지정하면 stdin 을 PIPE 로 열어 이 바이트를 write-then-close
+            로 전달한다(issue #30: 큰 프롬프트를 argv 대신 stdin 으로 넘겨
+            Windows 32,767자 명령행 한계를 우회). ``communicate(input=...)`` 가
+            쓰기 후 바로 EOF 를 닫으므로 인터랙티브 대기 위험은 없다.
+
     Raises: ``FileNotFoundError`` — 호출자가 binary_missing 으로 정규화.
     """
     kwargs: dict = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "stdin": subprocess.DEVNULL,
+        "stdin": subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
         **_new_session_kwargs(),
     }
     if cwd is not None:
@@ -740,7 +779,8 @@ def run_subprocess_sync(
     proc = subprocess.Popen(cmd, **kwargs)
     timed_out = False
     try:
-        stdout_b, stderr_b = proc.communicate(timeout=timeout)
+        # input_bytes=None 이면 기존과 완전히 동일한 호출(byte-identical).
+        stdout_b, stderr_b = proc.communicate(input=input_bytes, timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제. kill 직후 한 번

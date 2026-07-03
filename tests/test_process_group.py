@@ -92,6 +92,80 @@ def test_run_subprocess_async_preserves_partial_stderr_on_timeout():
     assert b"MARKER_STDERR_ASYNC_9182752" in err
 
 
+def test_run_subprocess_sync_delivers_input_bytes():
+    """input_bytes 는 stdin 으로 write-then-close 전달돼야 한다 (issue #30)."""
+    script = "import sys; sys.stdout.write(sys.stdin.read())"
+    out, _err, rc, timed = run_subprocess_sync(
+        [sys.executable, "-c", script], timeout=5,
+        input_bytes=b"hello from stdin (issue #30)")
+    assert out == b"hello from stdin (issue #30)"
+    assert rc == 0
+    assert timed is False
+
+
+def test_run_subprocess_sync_input_bytes_none_keeps_stdin_devnull():
+    """input_bytes 미지정이면 기존과 동일하게 stdin 이 DEVNULL 이라 즉시 EOF."""
+    out, _err, _rc, timed = run_subprocess_sync(
+        ["sh", "-c", "cat; printf done"], timeout=5)
+    assert out == b"done"
+    assert timed is False
+
+
+def test_run_subprocess_async_delivers_input_bytes():
+    """async 경로도 동일하게 input_bytes 를 stdin 으로 전달해야 한다."""
+    script = "import sys; sys.stdout.write(sys.stdin.read())"
+
+    async def run():
+        return await run_subprocess_async(
+            [sys.executable, "-c", script], timeout=5,
+            input_bytes=b"hello async stdin (issue #30)")
+
+    out, _err, rc, timed = asyncio.run(run())
+    assert out == b"hello async stdin (issue #30)"
+    assert rc == 0
+    assert timed is False
+
+
+def test_run_subprocess_sync_input_bytes_timeout_preserves_partial_stderr():
+    """input_bytes 를 쓰는 큰 프롬프트 경로에서도 issue #34 의 timeout 부분
+    stderr 보존 계약이 유지돼야 한다 (write-then-close 후 자식이 멈춰도 kill 전
+    까지 쓴 stderr 는 합성 문자열로 덮이지 않는다)."""
+    script = (
+        "import sys, time\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('MARKER_STDIN_SYNC_9182761')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(5)\n"
+    )
+    out, err, rc, timed = run_subprocess_sync(
+        [sys.executable, "-c", script], timeout=1,
+        input_bytes=b"large prompt payload")
+    assert timed is True
+    assert rc == 124
+    assert b"MARKER_STDIN_SYNC_9182761" in err
+
+
+def test_run_subprocess_async_input_bytes_timeout_preserves_partial_stderr():
+    """async 경로도 동일 계약: input_bytes + timeout → 부분 stderr 보존."""
+    script = (
+        "import sys, time\n"
+        "sys.stdin.read()\n"
+        "sys.stderr.write('MARKER_STDIN_ASYNC_9182762')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(5)\n"
+    )
+
+    async def run():
+        return await run_subprocess_async(
+            [sys.executable, "-c", script], timeout=1,
+            input_bytes=b"large prompt payload")
+
+    out, err, rc, timed = asyncio.run(run())
+    assert timed is True
+    assert rc == 124
+    assert b"MARKER_STDIN_ASYNC_9182762" in err
+
+
 def _zombie_alive(tag: str) -> bool:
     r = subprocess.run(["pgrep", "-f", f"sleep {tag}"],
                        capture_output=True, text=True)

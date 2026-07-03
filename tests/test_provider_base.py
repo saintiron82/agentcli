@@ -1,5 +1,8 @@
+import asyncio
+
 import pytest
-from agentcli.providers.base import LLMProvider, build_session_prompt
+from agentcli.providers.base import (LLMProvider, build_session_prompt,
+                                     run_subprocess_async)
 from agentcli.types import Message, LLMResponse, TokenUsage
 
 
@@ -135,3 +138,15 @@ def test_missing_invoke_raises():
             def list_models(self): return []
             def is_available(self): return True
         Incomplete()
+
+
+def test_run_subprocess_async_rejects_devnull_and_input_bytes_together():
+    """use_stdin_devnull(stdin 닫기) 과 input_bytes(그 stdin 으로 쓰기) 는
+    모순이므로 동시 지정 시 명확히 실패해야 한다 (issue #30 설계 가드)."""
+    async def run():
+        return await run_subprocess_async(
+            ["true"], timeout=5,
+            use_stdin_devnull=True, input_bytes=b"x")
+
+    with pytest.raises(ValueError):
+        asyncio.run(run())
