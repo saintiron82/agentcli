@@ -423,6 +423,41 @@ effort 를 `high` 까지만 지원(xhigh/max 는 clamp); copilot 의 thinking �
 방출되며, 반대로 비스트리밍 `invoke`/`invoke_async` 는 CLI 가 아예 실행되지
 않았다면 `LLMResponse.reasoning` 을 설정하지 않는다.
 
+### Claude OAuth 토큰 (headless/컨테이너)
+
+`~/.claude` 가 read-only 로 마운트된 컨테이너 환경에서는 Claude 의 네이티브
+토큰 갱신이 차단되어 매일 401 인증 실패가 발생한다.
+`ClaudeProvider` 는 agentcli 가 관리하는 별도의 OAuth 토큰을 주입할 수 있다:
+
+**토큰 해석 우선순위** (첫 발견 승리):
+1. 호출 시 `oauth_token` kwarg
+2. 생성자 `oauth_token` 인자
+3. `AGENTCLI_CLAUDE_OAUTH_TOKEN` 환경 변수
+4. `~/.agentcli/claude_oauth_token` 파일 (자동 읽기 + strip)
+
+어느 소스도 토큰을 제공하지 않으면 라이브러리는 기존 CLI 인증을 사용한다
+— 완전히 하위호환이다.
+
+**사용법:**
+
+```python
+# 생성자 기본값 (모든 호출):
+provider = ClaudeProvider(oauth_token="ag-xxx...")
+
+# 호출 시 오버라이드:
+resp = await client.chat_async(
+    "...", provider="claude",
+    provider_options={"oauth_token": "ag-xxx..."})
+
+# 파일 경로 (~/.agentcli/claude_oauth_token):
+# - 권장 권한: `chmod 600`
+# - 그룹/전체 읽기 권한이 있으면 경로만 경고 (토큰 값은 로그에 안 남김)
+# - 읽기 불가/없는 파일 → 다음 소스로 자동 폴백
+```
+
+토큰은 절대 로깅되지 않으며 subprocess 환경 변수 `CLAUDE_CODE_OAUTH_TOKEN` 에만
+나타난다 — argv 나 debug trace 에는 절대 안 나타난다.
+
 ## 테스트
 
 ```bash

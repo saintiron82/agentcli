@@ -8,6 +8,7 @@ import pathlib
 import platform
 import re
 import shutil
+import stat
 import time
 import uuid
 from typing import AsyncIterator
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 # 저장된 session_id 의 네이티브 세션 파일이 삭제/만료되면 CLI 가 이 메시지와
 # 함께 즉시 실패한다 — 이때만 새 세션으로 1회 자동 복구한다.
 STALE_SESSION_MARKER = "No conversation found with session ID"
+
+# issue #36: agentcli 가 관리하는 claude OAuth 토큰 소스 — 우선순위는
+# per-call kwarg > 생성자 기본값 > 이 env var > 아래 파일 (첫 발견 승리).
+OAUTH_TOKEN_ENV_VAR = "AGENTCLI_CLAUDE_OAUTH_TOKEN"
+# ``claude setup-token`` 산출물을 headless/container 배포가 마운트 없이도
+# 쓸 수 있도록 agentcli 전용 위치에 둔다 — ``~/.claude*`` 는 절대 건드리지 않는다.
+OAUTH_TOKEN_FILE_REL = pathlib.PurePath(".agentcli") / "claude_oauth_token"
 
 CLAUDE_MODELS = [
     {"id": "", "name": "기본", "aliases": ["default"]},
@@ -87,7 +95,8 @@ class ClaudeProvider(LLMProvider):
                  debug_log_path: str | None = None,
                  partial_messages: bool = False,
                  effort: str | None = None,
-                 thinking: str | None = None):
+                 thinking: str | None = None,
+                 oauth_token: str | None = None):
         """
         Args:
             permission_mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` 중 하나.
@@ -123,6 +132,16 @@ class ClaudeProvider(LLMProvider):
                 동작 불변).
             thinking: 정규화 reasoning thinking 기본값. claude CLI 는 thinking
                 토글이 없어 항상 무플래그 no-op 로 보고된다(clamp 아님).
+            oauth_token: agentcli 가 관리하는 claude OAuth 토큰 기본값(issue #36).
+                지정하면 호출마다 subprocess env 에 ``CLAUDE_CODE_OAUTH_TOKEN``
+                으로 주입해, ``~/.claude`` 가 read-only 로 마운트된 headless/
+                container 배포에서도(네이티브 토큰 갱신이 막혀도) 인증이
+                유지된다. 소스 우선순위(첫 발견 승리): 호출 시 kwarg > 이
+                생성자 기본값 > ``AGENTCLI_CLAUDE_OAUTH_TOKEN`` env var >
+                ``~/.agentcli/claude_oauth_token`` 파일. 어느 소스도 없으면
+                (기본) subprocess env 는 그대로 부모 프로세스 env 를 상속한다
+                — 기존 동작과 완전히 동일(하위호환). ``~/.claude*`` 는 절대
+                건드리지 않는다.
         """
         self._permission_mode = permission_mode
         self._allowed_tools = allowed_tools
@@ -134,6 +153,7 @@ class ClaudeProvider(LLMProvider):
         # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
         self._effort = effort
         self._thinking = thinking
+        self._oauth_token = oauth_token
 
     def _find_binary(self) -> str | None:
         executable = "claude.cmd" if platform.system() == "Windows" else "claude"
@@ -141,6 +161,69 @@ class ClaudeProvider(LLMProvider):
 
     def is_available(self) -> bool:
         return self._find_binary() is not None
+
+    def _resolve_oauth_token(self, oauth_token: str | None) -> str | None:
+        """issue #36: 소스 우선순위(첫 발견 승리)로 claude OAuth 토큰을 resolve.
+
+        1) 호출 시 kwarg(``oauth_token``) — ``None`` 이 아니면(빈 문자열이어도)
+           생성자 기본값을 건너뛰고 이 값을 쓴다. 다른 정규화 reasoning 제어
+           (``effort``/``thinking``)와 동일한 ``self._x if per_call is None
+           else per_call`` idiom.
+        2) 생성자 기본값(``self._oauth_token``) — 위에서 kwarg 가 없을 때만.
+        3) ``AGENTCLI_CLAUDE_OAUTH_TOKEN`` env var.
+        4) ``~/.agentcli/claude_oauth_token`` 파일(읽어서 strip).
+
+        공백/빈 문자열은 그 레벨에서 "미설정"으로 간주해 다음 소스로
+        폴백한다. 어느 소스도 없으면 ``None`` — 호출부가 이를 "부모 env
+        그대로 상속(기존 동작)" 신호로 쓴다.
+        """
+        effective = self._oauth_token if oauth_token is None else oauth_token
+        if effective and effective.strip():
+            return effective.strip()
+        env_token = os.environ.get(OAUTH_TOKEN_ENV_VAR)
+        if env_token and env_token.strip():
+            return env_token.strip()
+        return self._read_oauth_token_file()
+
+    def _read_oauth_token_file(self) -> str | None:
+        """``~/.agentcli/claude_oauth_token`` 을 읽는다. 파일이 group/world-
+        readable 이면(POSIX) 경고를 남기되(경로만 언급 — 토큰 값은 절대
+        포함하지 않는다) 토큰은 그대로 사용한다. 파일이 없거나 읽기
+        실패하면(권한/IO 오류, 인코딩 오류 등) 조용히 ``None`` — 이 파일은 옵셔널
+        소스이므로 없는 게 정상 경로다."""
+        path = pathlib.Path.home() / OAUTH_TOKEN_FILE_REL
+        try:
+            if not path.is_file():
+                return None
+            if os.name == "posix":
+                mode = stat.S_IMODE(path.stat().st_mode)
+                if mode & (stat.S_IRGRP | stat.S_IROTH):
+                    logger.warning(
+                        "Claude OAuth 토큰 파일이 그룹/전체 읽기 권한을 가지고 "
+                        "있습니다: %s — chmod 600 권장 (토큰 값은 로그에 남기지 "
+                        "않음)", path)
+            text = path.read_text(encoding="utf-8").strip()
+            return text or None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _auth_env(self, oauth_token: str | None) -> dict | None:
+        """subprocess 에 넘길 env dict — issue #36.
+
+        토큰이 하나도 안 resolve 되면 ``None`` 을 반환한다: 호출부가 이를
+        ``run_subprocess_sync``/``run_subprocess_async``/``_run_stream_template``
+        에 그대로 넘기면 그 helper 들은 ``env=None`` 일 때 ``Popen``/
+        ``create_subprocess_exec`` 에 ``env=`` 자체를 넘기지 않아 부모 프로세스
+        env 를 상속한다 — 즉 기존 동작과 byte-identical(하위호환 계약).
+        토큰이 있으면 ``os.environ`` 복사본 위에 ``CLAUDE_CODE_OAUTH_TOKEN``
+        만 얹어 반환한다(원본 ``os.environ`` 은 변경하지 않음). 이 값은 절대
+        로깅하지 않는다 — env 로만 전달되고 argv/debug trace 어디에도
+        나타나지 않는다.
+        """
+        token = self._resolve_oauth_token(oauth_token)
+        if not token:
+            return None
+        return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
 
     def list_models(self) -> list[dict]:
         return list(CLAUDE_MODELS)
@@ -332,11 +415,16 @@ class ClaudeProvider(LLMProvider):
                debug: bool | None = None,
                debug_log_path: str | None = None,
                effort: str | None = None,
-               thinking: str | None = None) -> LLMResponse:
+               thinking: str | None = None,
+               oauth_token: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #36: agentcli 가 관리하는 claude OAuth 토큰 → subprocess env.
+        # None 이면 run_subprocess_sync 가 env= 자체를 안 넘겨 기존 동작(부모
+        # env 상속)과 byte-identical(하위호환 계약) — 토큰은 argv 에 안 실린다.
+        run_env = self._auth_env(oauth_token)
         # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달 —
         # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
         prompt_bytes = prompt.encode("utf-8")
@@ -362,7 +450,7 @@ class ClaudeProvider(LLMProvider):
             # stdin(PIPE)으로 write-then-close 전달(issue #30) — 아니면
             # input_bytes=None 으로 기존과 byte-identical(stdin=DEVNULL).
             stdout_b, stderr_b, rc, timed_out = run_subprocess_sync(
-                cmd, timeout=timeout, cwd=cwd,
+                cmd, timeout=timeout, cwd=cwd, env=run_env,
                 input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
             logger.error("Claude CLI를 찾을 수 없습니다")
@@ -409,7 +497,8 @@ class ClaudeProvider(LLMProvider):
                     strict_mcp_config=strict_mcp_config,
                     lean=lean, debug=debug,
                     debug_log_path=debug_log_path,
-                    effort=effort, thinking=thinking)
+                    effort=effort, thinking=thinking,
+                    oauth_token=oauth_token)
             err_msg = stderr_txt.strip()[:300]
             msg = err_msg or f"exit={rc}"
             logger.error("Claude 실패 (code=%d): %s", rc, msg)
@@ -452,11 +541,14 @@ class ClaudeProvider(LLMProvider):
                            debug: bool | None = None,
                            debug_log_path: str | None = None,
                            effort: str | None = None,
-                           thinking: str | None = None) -> LLMResponse:
+                           thinking: str | None = None,
+                           oauth_token: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #36: 위 invoke() 와 동일 계약 — None 이면 부모 env 상속 불변.
+        run_env = self._auth_env(oauth_token)
         # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
@@ -479,7 +571,7 @@ class ClaudeProvider(LLMProvider):
             # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
             # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd,
+                cmd, timeout=timeout, cwd=cwd, env=run_env,
                 use_stdin_devnull=not use_stdin,
                 input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
@@ -524,7 +616,8 @@ class ClaudeProvider(LLMProvider):
                     strict_mcp_config=strict_mcp_config,
                     lean=lean, debug=debug,
                     debug_log_path=debug_log_path,
-                    effort=effort, thinking=thinking)
+                    effort=effort, thinking=thinking,
+                    oauth_token=oauth_token)
             logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             resp = LLMResponse(
@@ -566,7 +659,8 @@ class ClaudeProvider(LLMProvider):
                            debug_log_path: str | None = None,
                            partial_messages: bool | None = None,
                            effort: str | None = None,
-                           thinking: str | None = None) -> AsyncIterator[StreamChunk]:
+                           thinking: str | None = None,
+                           oauth_token: str | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -585,6 +679,12 @@ class ClaudeProvider(LLMProvider):
         use_partial = (self._partial_messages if partial_messages is None
                        else partial_messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #36: 위 invoke()/invoke_async() 와 동일 계약 — 재시도 루프
+        # 전체에서 한 번만 resolve(세션이 바뀌어도 토큰 소스는 불변이므로
+        # 루프 안에서 매번 다시 계산할 이유가 없다). None 이면 이 값을 그대로
+        # ``_run_stream_template(env=...)`` 에 넘기고, 그 helper 는 env=None
+        # 일 때 spawn kwargs 에 "env" 자체를 넣지 않아 부모 env 상속 불변.
+        run_env = self._auth_env(oauth_token)
         # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다
         # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
         if reasoning and _reasoning_needs_event(reasoning):
@@ -619,7 +719,7 @@ class ClaudeProvider(LLMProvider):
             async for chunk in self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    debug=use_debug, debug_log_path=dbg_path):
+                    env=run_env, debug=use_debug, debug_log_path=dbg_path):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"
                         and STALE_SESSION_MARKER in (chunk.content or "")):
