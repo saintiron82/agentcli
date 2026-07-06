@@ -359,10 +359,12 @@ class ClaudeProvider(LLMProvider):
         if timed_out:
             logger.error("Claude 타임아웃 (%d초)", timeout)
             if use_debug:
+                # stderr_b 는 kill 전에 자식이 쓴 부분 출력(예: --debug 로그) 을
+                # 담고 있다 — 합성 타임아웃 문자열 대신 그대로 넘겨야 진단 가능.
                 _emit_invoke_debug(cmd, 124,
                                    int((time.time() - start) * 1000),
-                                   f"timeout after {timeout}s", used_sid,
-                                   dbg_path, "invoke")
+                                   stderr_b.decode("utf-8", errors="replace"),
+                                   used_sid, dbg_path, "invoke")
             resp = LLMResponse(content="", provider=self.provider_id, model=model,
                                session_id=used_sid,
                                error=f"timeout after {timeout}s",
@@ -457,7 +459,7 @@ class ClaudeProvider(LLMProvider):
         start = time.time()
         try:
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd)
+                cmd, timeout=timeout, cwd=cwd, use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("Claude CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,

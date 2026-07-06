@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 import time
 
 import pytest
@@ -53,6 +54,42 @@ def test_run_subprocess_async_happy_path():
             ["sh", "-c", "printf hi; exit 0"], timeout=5)
     out, _err, rc, timed = asyncio.run(run())
     assert out == b"hi" and rc == 0 and timed is False
+
+
+def test_run_subprocess_sync_preserves_partial_stderr_on_timeout():
+    """타임아웃이어도 kill 전에 자식이 쓴 stderr(예: claude ``--debug`` 로그)는
+    합성 'timeout after Ns' 문자열로 덮어쓰지 말고 그대로 보존해야 한다 —
+    그래야 느리거나 멈춘 호출을 진단할 수 있다 (issue #34)."""
+    script = (
+        "import sys, time\n"
+        "sys.stderr.write('MARKER_STDERR_SYNC_9182751')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(5)\n"
+    )
+    out, err, rc, timed = run_subprocess_sync(
+        [sys.executable, "-c", script], timeout=1)
+    assert timed is True
+    assert rc == 124
+    assert b"MARKER_STDERR_SYNC_9182751" in err
+
+
+def test_run_subprocess_async_preserves_partial_stderr_on_timeout():
+    """async 경로도 동일하게 타임아웃 시 부분 stderr 를 보존해야 한다."""
+    script = (
+        "import sys, time\n"
+        "sys.stderr.write('MARKER_STDERR_ASYNC_9182752')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(5)\n"
+    )
+
+    async def run():
+        return await run_subprocess_async(
+            [sys.executable, "-c", script], timeout=1)
+
+    out, err, rc, timed = asyncio.run(run())
+    assert timed is True
+    assert rc == 124
+    assert b"MARKER_STDERR_ASYNC_9182752" in err
 
 
 def _zombie_alive(tag: str) -> bool:

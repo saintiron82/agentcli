@@ -633,16 +633,18 @@ async def run_subprocess_async(
 
     Returns:
         ``(stdout, stderr, returncode, timed_out)``.
-        ``timed_out=True`` 면 ``stdout=b""``, ``stderr`` 는 encoded timeout
-        메시지, ``returncode=124``. 이 경우 호출자는 그대로 timeout LLMResponse
-        를 작성하면 된다.
+        ``timed_out=True`` 면 ``returncode=124`` 이고 ``stdout``/``stderr`` 에는
+        kill 전까지 자식이 쓴 부분 출력(예: claude ``--debug`` 로그)이 담긴다 —
+        합성 타임아웃 문자열로 덮어쓰지 않는다 (issue #34: 안 그러면 느리거나
+        멈춘 호출의 진단 정보가 사라진다). 호출자는 ``timed_out`` 플래그로
+        타임아웃 여부를 판단하고, 필요하면 자체 타임아웃 메시지를 구성한다.
 
     Raises:
         ``FileNotFoundError`` — 호출자가 잡아서 binary_missing 으로 정규화.
 
     Args:
         cmd: subprocess argv 리스트.
-        timeout: 초 단위 wall timeout (``asyncio.wait_for`` 에 직접 전달).
+        timeout: 초 단위 wall timeout.
         cwd: subprocess cwd.
         env: subprocess env. ``None`` 이면 부모 환경 상속.
         use_stdin_devnull: True 면 stdin 을 ``/dev/null`` 로 닫는다 (codex/copilot
@@ -662,25 +664,44 @@ async def run_subprocess_async(
         kwargs["cwd"] = cwd
 
     proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    # communicate() 를 별도 Task 로 감싼다 — asyncio.wait_for(proc.communicate(),
+    # timeout) 은 타임아웃 시 communicate task 자체를 취소해 그때까지 버퍼링된
+    # stdout/stderr 를 통째로 잃는다. asyncio.wait() 는 task 를 취소하지 않으므로
+    # 타임아웃 후 그룹을 kill(파이프 닫힘)한 뒤 같은 task 를 이어서 기다려 부분
+    # 출력을 회수할 수 있다.
+    task = asyncio.ensure_future(proc.communicate())
+    timed_out = False
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        # 타임아웃이면 직속 자식이 이미 종료했어도(손자가 파이프를 물고 행)
-        # 그룹 전체를 무조건 kill — returncode 가드로 건너뛰면 손자가 좀비로
-        # 남는다 (test_process_group 회귀).
-        _kill_process_group(proc)
-        return b"", f"timeout after {timeout}s".encode(), 124, True
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            stdout_b, stderr_b = await task
+        else:
+            timed_out = True
+            # 타임아웃이면 직속 자식이 이미 종료했어도(손자가 파이프를 물고 행)
+            # 그룹 전체를 무조건 kill — returncode 가드로 건너뛰면 손자가 좀비로
+            # 남는다 (test_process_group 회귀). 그룹 kill 로 파이프가 닫히면
+            # communicate task 가 부분 출력과 함께 정상 완료된다.
+            _kill_process_group(proc)
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(task, timeout=10)
+            except Exception:
+                # 그룹 kill 로도 안 풀리는 병적인 손자(파이프를 계속 문 채)
+                # 대비 — sync 경로의 10s reap bound 와 동일한 방어.
+                stdout_b, stderr_b = b"", b""
     finally:
         # 호출 task 취소(CancelledError)·정상완료 포함 모든 종료 경로에서 그룹
         # 전체 reap — 직속만이 아니라, 정상완료 시에도 떨어져나간 손자가 그룹에
         # 남아있을 수 있어 best-effort killpg (그룹 없으면 ProcessLookupError 가드).
+        # 타임아웃 경로에서 이미 위에서 communicate 를 마쳤다면 proc.returncode
+        # 가 채워져 있어 아래 wait() 는 스킵된다 (이중 대기 방지).
         try:
             _kill_process_group(proc)
             if proc.returncode is None:
                 await proc.wait()
         except Exception:
             pass
+    if timed_out:
+        return stdout_b or b"", stderr_b or b"", 124, True
     return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
 
 
@@ -699,7 +720,9 @@ def run_subprocess_sync(
     DEVNULL (일회성 비대화형 호출이므로 stdin 대기 방지).
 
     Returns: ``(stdout, stderr, returncode, timed_out)`` — ``run_subprocess_async``
-    와 동일 계약. timeout 이면 ``(b"", b"timeout...", 124, True)``.
+    와 동일 계약. timeout 이면 ``returncode=124`` 이고 ``stdout``/``stderr`` 에는
+    kill 전까지 자식이 쓴 부분 출력(예: claude ``--debug`` 로그)이 담긴다 —
+    합성 타임아웃 문자열로 덮어쓰지 않는다 (issue #34).
 
     Raises: ``FileNotFoundError`` — 호출자가 binary_missing 으로 정규화.
     """
@@ -715,15 +738,23 @@ def run_subprocess_sync(
         kwargs["env"] = env
 
     proc = subprocess.Popen(cmd, **kwargs)
+    timed_out = False
     try:
         stdout_b, stderr_b = proc.communicate(timeout=timeout)
-        return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
     except subprocess.TimeoutExpired:
-        # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제. 잔여 reap-communicate 는
-        # finally 가 한 번만 수행 (except+finally 이중 communicate 로 인한 최대
-        # ~20s 지연 회피).
+        timed_out = True
+        # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제. kill 직후 한 번
+        # communicate 로 부분 출력을 회수하면서 returncode 도 확정된다 — 이
+        # 호출이 성공하면 아래 finally 의 재-communicate 는 returncode 가드로
+        # 스킵되어 except+finally 이중 communicate 로 인한 최대 ~20s 지연을
+        # 그대로 회피한다. 병적인 손자가 계속 파이프를 물고 있어 이 communicate
+        # 마저 시간 초과하면 빈 바이트로 폴백(finally 의 10s reap 이 마지막
+        # 안전망으로 한 번 더 시도).
         _kill_process_group(proc)
-        return b"", f"timeout after {timeout}s".encode(), 124, True
+        try:
+            stdout_b, stderr_b = proc.communicate(timeout=10)
+        except Exception:
+            stdout_b, stderr_b = b"", b""
     finally:
         # 정상완료 포함 모든 경로에서 그룹 전체 reap — 떨어져나간 손자까지.
         try:
@@ -732,6 +763,9 @@ def run_subprocess_sync(
                 proc.communicate(timeout=10)
         except Exception:  # noqa: BLE001
             pass
+    if timed_out:
+        return stdout_b or b"", stderr_b or b"", 124, True
+    return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
 
 
 def run_health_command(cmd: list[str], *, timeout: int = 10,
