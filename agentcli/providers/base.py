@@ -16,6 +16,8 @@ from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
                      LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
 from ..utils import serialize_messages
 
+logger = logging.getLogger(__name__)
+
 # CLI 가 띄운 손자(MCP 서버·hook·node 헬퍼)까지 정리하려면 프로세스 그룹
 # 단위로 죽여야 한다. POSIX 에서만 setsid/killpg 가능 — Windows 는 직속 kill.
 _POSIX = os.name == "posix"
@@ -727,9 +729,12 @@ async def run_subprocess_async(
             _kill_process_group(proc)
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(task, timeout=10)
-            except Exception:
+            except Exception as exc:
                 # 그룹 kill 로도 안 풀리는 병적인 손자(파이프를 계속 문 채)
                 # 대비 — sync 경로의 10s reap bound 와 동일한 방어.
+                logger.warning(
+                    "post-kill communicate retry failed (%r); returning "
+                    "empty output", exc)
                 stdout_b, stderr_b = b"", b""
     finally:
         # 호출 task 취소(CancelledError)·정상완료 포함 모든 종료 경로에서 그룹
@@ -790,6 +795,7 @@ def run_subprocess_sync(
 
     proc = subprocess.Popen(cmd, **kwargs)
     timed_out = False
+    reap_attempted = False
     try:
         # input_bytes=None 이면 기존과 완전히 동일한 호출(byte-identical).
         stdout_b, stderr_b = proc.communicate(input=input_bytes, timeout=timeout)
@@ -797,21 +803,29 @@ def run_subprocess_sync(
         timed_out = True
         # 그룹 전체 SIGKILL → 손자까지 죽어 파이프 해제. kill 직후 한 번
         # communicate 로 부분 출력을 회수하면서 returncode 도 확정된다 — 이
-        # 호출이 성공하면 아래 finally 의 재-communicate 는 returncode 가드로
-        # 스킵되어 except+finally 이중 communicate 로 인한 최대 ~20s 지연을
-        # 그대로 회피한다. 병적인 손자가 계속 파이프를 물고 있어 이 communicate
-        # 마저 시간 초과하면 빈 바이트로 폴백(finally 의 10s reap 이 마지막
-        # 안전망으로 한 번 더 시도).
+        # 시도(성공/실패 불문) 후에는 아래 finally 가 재-communicate 를 걸지
+        # 않는다(reap_attempted). 병적인 손자가 계속 파이프를 물고 있어 이
+        # communicate 마저 시간 초과하면 빈 바이트로 폴백한다 — finally 에서
+        # 또 10s 를 기다리지 않으므로 단일 시도(최대 10s)로 끝난다(except+
+        # finally 이중 communicate 로 인한 최대 ~20s 지연을 commit 13dd1c8 이
+        # 없앴고, 여기서 그 보장을 다시 지킨다).
         _kill_process_group(proc)
+        reap_attempted = True
         try:
             stdout_b, stderr_b = proc.communicate(timeout=10)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "post-kill communicate retry failed (%r); returning "
+                "empty output", exc)
             stdout_b, stderr_b = b"", b""
     finally:
-        # 정상완료 포함 모든 경로에서 그룹 전체 reap — 떨어져나간 손자까지.
+        # 정상완료 포함 모든 경로에서 그룹 kill 은 무조건 수행 — 떨어져나간
+        # 손자까지. 단, communicate 재시도는 이미 위 except 블록에서 한 번
+        # 시도했다면(reap_attempted) 여기서 다시 걸지 않는다 — 그래야 실패
+        # 시 10s+10s 이중 대기가 아니라 단일 10s 대기로 끝난다.
         try:
             _kill_process_group(proc)
-            if proc.returncode is None:
+            if proc.returncode is None and not reap_attempted:
                 proc.communicate(timeout=10)
         except Exception:  # noqa: BLE001
             pass

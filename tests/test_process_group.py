@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -276,3 +278,86 @@ def test_run_stream_template_reaps_grandchild():
         assert _wait_gone(tag), "스트리밍 그룹 kill 후 좀비 손자가 남으면 안 됨"
     finally:
         _cleanup(tag)
+
+
+# ===== post-kill communicate retry: logging + single-attempt guarantee =====
+#
+# When the kill-then-retry `communicate()` itself fails (a pathological
+# grandchild still holding the pipe), the fallback to empty bytes used to be
+# silent. It should now log a warning (never including output payloads). For
+# the sync runner specifically, that failure must not trigger a *second*
+# bounded 10s wait from the `finally` block's own `communicate(timeout=10)` --
+# that would reintroduce the ~20s worst case commit 13dd1c8 removed.
+
+def test_run_subprocess_sync_double_communicate_failure_logs_and_single_attempt(
+        monkeypatch, caplog):
+    """Force TimeoutExpired on both the initial and the post-kill retry
+    communicate() calls. Must fall back to empty bytes, log a warning, and
+    call communicate() at most twice total (not a third time from finally)."""
+    fake_proc = MagicMock()
+    fake_proc.returncode = None
+    fake_proc.pid = 999001
+
+    def _always_times_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["fake"], timeout=kwargs.get("timeout"))
+
+    fake_proc.communicate.side_effect = _always_times_out
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: fake_proc)
+    monkeypatch.setattr(
+        "agentcli.providers.base._kill_process_group", lambda proc: None)
+
+    with caplog.at_level(logging.WARNING, logger="agentcli.providers.base"):
+        out, err, rc, timed_out = run_subprocess_sync(["fake"], timeout=1)
+
+    assert out == b""
+    assert err == b""
+    assert timed_out is True
+    assert rc == 124
+    # initial communicate(timeout=1) + one post-kill retry communicate(timeout=10)
+    # -- the finally block must NOT fire a third (that would double the 10s wait).
+    assert fake_proc.communicate.call_count == 2
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("post-kill communicate retry failed" in m for m in warnings)
+
+
+def test_run_subprocess_async_communicate_retry_failure_logs_empty_fallback(
+        monkeypatch, caplog):
+    """Force the bounded post-kill retry (`asyncio.wait_for(task, timeout=10)`)
+    to raise -- the pathological case where a grandchild still holds the pipe
+    after the group kill. Must fall back to empty bytes and log a warning."""
+
+    async def _hangs_forever(*args, **kwargs):
+        await asyncio.sleep(1000)
+
+    fake_proc = MagicMock()
+    fake_proc.returncode = None
+    fake_proc.pid = 999002
+    fake_proc.communicate = _hangs_forever
+    fake_proc.wait = AsyncMock(return_value=0)
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        return fake_proc
+
+    async def _fake_wait_for(_aw, timeout):
+        # Simulates the bounded post-kill retry itself timing out/failing.
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(asyncio, "wait_for", _fake_wait_for)
+    monkeypatch.setattr(
+        "agentcli.providers.base._kill_process_group", lambda proc: None)
+
+    async def run():
+        return await run_subprocess_async(["fake"], timeout=0.01)
+
+    with caplog.at_level(logging.WARNING, logger="agentcli.providers.base"):
+        out, err, rc, timed_out = asyncio.run(run())
+
+    assert out == b""
+    assert err == b""
+    assert timed_out is True
+    assert rc == 124
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("post-kill communicate retry failed" in m for m in warnings)
