@@ -1,6 +1,8 @@
 from unittest.mock import patch, MagicMock
 import asyncio
 import subprocess
+
+import pytest
 from agentcli.providers.copilot import CopilotProvider, _parse_copilot_jsonl
 from agentcli.types import Message
 
@@ -309,6 +311,21 @@ def test_invoke_no_reasoning_means_argv_unchanged_and_none(mock_find, mock_env, 
 def test_invoke_binary_missing_leaves_reasoning_unset(mock_find):
     resp = CopilotProvider(effort="high").invoke([Message(role="user", content="hi")])
     assert resp.reasoning is None
+
+
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
+def test_constructor_effort_none_raises_on_first_call(mock_find):
+    """Pins the CHANGELOG-documented break: CopilotProvider(effort=...)
+    validates lazily. Copilot's own native value is "none" (canonical
+    "minimal" maps to it) -- passing the native string "none" straight
+    through construction succeeds (no validation happens there), but the
+    first invoke() call resolves it against the canonical scale
+    (minimal/low/medium/high/xhigh/max) and "none" isn't one of those, so
+    it raises ValueError mentioning the valid levels."""
+    p = CopilotProvider(effort="none")  # construction does not validate
+    with pytest.raises(ValueError, match="minimal"):
+        p.invoke([Message(role="user", content="hi")])
 
 
 # ===== stream_async (reasoning event ordering) =====

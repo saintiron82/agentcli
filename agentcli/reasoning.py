@@ -36,6 +36,26 @@ _THINKING_MAP = {
 }
 
 
+def _assert_maps_cover_full_scale(scale, table, label) -> None:
+    """비어있지 않은 provider 항목은 scale 전체를 커버해야 한다.
+
+    부분(partial) 맵을 그대로 두면 `_resolve`의 `pmap[value]`가 호출 시점에
+    KeyError 로 터진다 — import 시점에 assert 로 걸러 "부분 맵 → 깨끗한
+    실패"를 보장한다 (호출 시 KeyError 대신)."""
+    full = set(scale)
+    for provider_id, pmap in table.items():
+        if not pmap:
+            continue  # 완전 미지원 provider (예: claude thinking) 는 허용.
+        missing = full - set(pmap)
+        assert not missing, (
+            f"{label} map for {provider_id!r} is missing levels {sorted(missing)}; "
+            f"a non-empty provider map must cover the full scale {scale}")
+
+
+_assert_maps_cover_full_scale(EFFORT, _EFFORT_MAP, "effort")
+_assert_maps_cover_full_scale(THINKING, _THINKING_MAP, "thinking")
+
+
 @dataclass(frozen=True)
 class LevelResolution:
     requested: str        # 호출자가 넘긴 canonical 값
