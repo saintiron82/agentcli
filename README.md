@@ -391,6 +391,8 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
 | `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
+| `effort` (reasoning intensity) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
+| `thinking` (visibility) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
 | claude-only options | `lean`, `partial_messages` | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a

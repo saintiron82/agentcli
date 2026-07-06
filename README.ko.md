@@ -381,6 +381,8 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
 | `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
 | `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
+| `effort` (입력 다이얼) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
+| `thinking` (출력 가시성) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
 | claude 전용 옵션 | `lean`, `partial_messages` | — | — | — |
 
 `debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
