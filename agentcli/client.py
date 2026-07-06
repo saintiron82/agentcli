@@ -1288,6 +1288,11 @@ class ContextSession:
         labels 가 없으면 인덱스를 라벨로 써 alias 가 결정적·고유해진다(공유
         카운터 race 회피). 큰 출력을 파일로 흘리려면 대신 ``fork_stream`` 을
         항목별로 쓰거나, lean 을 끄고 에이전트에게 직접 파일을 쓰게 한다.
+
+        실패 의미론: 어떤 fork 가 예외를 던지면 진행 중인 형제 fork 들은
+        **취소**되고, 원래 예외 타입이 그대로 재전파된다 (동시 다중 실패 시
+        첫 예외가 전파되며, 나머지는 ``__cause__`` 의 ExceptionGroup 에서
+        확인 가능).
         """
         prompts = list(prompts)
         if labels is None:
