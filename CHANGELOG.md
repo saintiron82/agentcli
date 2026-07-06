@@ -36,8 +36,18 @@
   Prompts over 8,000 UTF-8 bytes are passed via stdin for claude/codex's
   `invoke`/`invoke_async`, avoiding Windows' 32,767-character argv limit.
   Scope: the copilot CLI has no stdin prompt mode, so this cannot apply
-  there; `stream_async` remains argv-only for all providers — tracked in
-  issue #44.
+  there.
+- **`stream_async` now also routes large prompts through stdin (issue #44).**
+  `invoke`/`invoke_async` got the issue #30 stdin fix, but `stream_async` uses
+  a separate spawn path (`LLMProvider._run_stream_template`) that still put
+  the whole prompt on the command line — so a large `chat_stream()` seed
+  could still exceed Windows' 32,767-character argv limit even after #30/#41.
+  `_run_stream_template` gains an `input_bytes` hook (stdin opened as a pipe
+  and written by a background task that doesn't block the idle/wall-timeout
+  read loop, tolerating a child that exits without reading stdin); claude and
+  codex `stream_async` now compute the same 8,000-byte threshold as their
+  `invoke` paths and thread it through. copilot is unaffected — its CLI still
+  has no stdin prompt mode, pinned by a regression test.
 - **`ContextSession.fork_many` sibling-cancellation + race-free auto-labels
   (issue #31, ships via PR #40).** When one fork raised, the other
   still-running sibling forks used to keep running unsupervised instead of
