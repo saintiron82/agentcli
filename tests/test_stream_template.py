@@ -1212,8 +1212,13 @@ def test_run_stream_template_child_exits_without_reading_stdin_no_hang(caplog):
             model="m", timeout=10, input_bytes=big_payload)]
         # 남은 이벤트 루프 tick 을 흘려보내 방금 끝난 task 들의 정리를 유도.
         await asyncio.sleep(0)
+        # stdin writer task 만 겨냥해 필터링한다. py3.11 의 asyncio.wait_for 는
+        # 별도 래퍼 task 를 만들어(3.12+ 는 asyncio.timeout 기반이라 없음)
+        # all_tasks() 에 자기 자신이 잡히므로, "current 제외 전부" 방식은
+        # 버전에 따라 오탐한다.
         pending = [t for t in asyncio.all_tasks()
-                  if t is not asyncio.current_task()]
+                  if t is not asyncio.current_task()
+                  and "_write_stdin_payload" in repr(t)]
         return chunks, pending
 
     with caplog.at_level(logging.ERROR, logger="asyncio"):
