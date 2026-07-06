@@ -216,6 +216,30 @@ def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
         })
 
 
+async def _write_stdin_payload(stdin_stream, payload: bytes) -> None:
+    """``proc.stdin`` 에 ``payload`` 를 write-then-close 로 비동기 전달 (issue #44).
+
+    ``_run_stream_template`` 이 이 coroutine 을 별도 task 로 실행해, stdout
+    읽기 루프 및 idle/wall timeout 을 막지 않는다 — ``run_subprocess_async`` 의
+    ``communicate(input=...)`` 와 달리 스트리밍 경로는 stdout 을 계속 읽어야
+    하므로 stdin 쓰기를 그 흐름과 분리해야 한다.
+
+    자식이 stdin 을 읽기 전에 먼저 종료하는 CLI(사용 안 함/짧은 도움말 출력
+    등)라면 write/drain/close 어디서든 BrokenPipeError/ConnectionResetError/
+    OSError 가 날 수 있다 — 스트림 자체를 죽이거나 hang 시키면 안 되므로
+    조용히 삼킨다(호출자는 이미 stdout/rc 로 정상적으로 완료·에러 처리한다).
+    """
+    try:
+        stdin_stream.write(payload)
+        await stdin_stream.drain()
+        stdin_stream.close()
+        wait_closed = getattr(stdin_stream, "wait_closed", None)
+        if wait_closed is not None:
+            await wait_closed()
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+
+
 async def _drain_stderr(stream, sink: list[str], logger, provider_id: str) -> None:
     """Concurrently drain a subprocess stderr pipe into ``sink``.
 
@@ -359,6 +383,7 @@ class LLMProvider(ABC):
             env: dict | None = None,
             debug: bool = False,
             debug_log_path: str | None = None,
+            input_bytes: bytes | None = None,
             ) -> AsyncIterator[StreamChunk]:
         """3-provider 공통 스트리밍 골격.
 
@@ -370,6 +395,19 @@ class LLMProvider(ABC):
         ``timeout`` 은 wall-clock deadline 이 아니라 **마지막 청크 이후 idle
         한도** — thinking/tool_use 같은 진행 청크가 들어오면 매번 last_activity
         갱신. ``wall_timeout`` 이 명시되면 절대 deadline 도 함께 적용.
+
+        ``input_bytes`` (issue #44): 지정하면 stdin 을 PIPE 로 열고, spawn 직후
+        별도 task 로 이 바이트를 write-then-close 전달한다 — ``invoke``/
+        ``invoke_async`` 의 ``run_subprocess_*(input_bytes=...)`` 와 동일하게
+        8000 UTF-8 바이트 초과 프롬프트를 argv 대신 stdin 으로 넘겨 Windows
+        32,767자 명령행 한계를 우회한다(issue #30 의 stream_async 잔여
+        스코프). 별도 task 로 실행하는 이유: 스트리밍은 stdout readline 루프가
+        진행 중인 동안 stdin 쓰기를 마쳐야 하므로, invoke 의 단발
+        ``communicate(input=...)`` 처럼 쓰기 완료를 기다렸다 읽기 시작할 수
+        없다 — 쓰기를 인라인으로 ``await`` 하면 그 사이 idle/wall timeout 판정이
+        멈추고, CLI 가 stdin 을 다 받아야 첫 이벤트를 낸다면 교착 위험도 있다.
+        ``None`` (기본) 이면 기존과 완전히 동일하게 spawn(``stdin=DEVNULL``,
+        추가 task 없음) — byte-identical 하위호환.
         """
         logger = logging.getLogger(self.__class__.__module__)
         start = time.time()
@@ -380,6 +418,7 @@ class LLMProvider(ABC):
         debug_chunks: list[dict] = []
         debug_stderr: list[str] = []
         stderr_task = None
+        stdin_task = None
         reached_done = False   # clean done 도달 여부 (debug trace truncated 판정)
         idle_limit = idle_timeout if idle_timeout is not None else timeout
         # issue #9: ``wall_timeout=0`` 도 의미 있는 입력 (즉시 만료) 이므로
@@ -390,7 +429,10 @@ class LLMProvider(ABC):
         kwargs: dict = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
-            "stdin": asyncio.subprocess.DEVNULL,
+            # input_bytes 지정 시에만 PIPE 로 열어 아래에서 별도 task 로 쓴다 —
+            # 그 외(기본 None)에는 기존과 byte-identical 하게 DEVNULL.
+            "stdin": (asyncio.subprocess.PIPE if input_bytes is not None
+                     else asyncio.subprocess.DEVNULL),
             # 새 세션으로 분리 → 아래 cleanup 이 손자까지 그룹 단위로 죽인다.
             **_new_session_kwargs(),
         }
@@ -406,6 +448,13 @@ class LLMProvider(ABC):
         try:
             proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
             assert proc.stdout
+            if input_bytes is not None:
+                assert proc.stdin
+                # 쓰기 완료를 기다리지 않고 바로 아래 readline 루프로 진행 —
+                # 자식이 stdin 을 다 읽어야 출력을 시작하는 경우에도 여기서
+                # block 하지 않아야 idle/wall timeout 이 계속 정확히 작동한다.
+                stdin_task = asyncio.create_task(
+                    _write_stdin_payload(proc.stdin, input_bytes))
             if debug:
                 logger.info("[debug] %s spawn: %s",
                             self.provider_id, redact_argv(cmd))
@@ -533,6 +582,23 @@ class LLMProvider(ABC):
             logger.exception("%s stream 예외", self.provider_id)
             yield StreamChunk(type="error", content=str(exc))
         finally:
+            # issue #44: stdin writer task 는 정상 종료/timeout/GeneratorExit
+            # 등 *모든* 경로에서 회수한다 — 안 그러면 "Task was destroyed but
+            # it is pending!" 경고가 새거나(pending 인 채 GC), 자식이 이미
+            # 죽어 helper 내부에서 잡은 BrokenPipeError 의 결과를 아무도
+            # await 하지 않아 예외가 조용히 유실된다. 아직 안 끝났으면
+            # cancel 후 회수 — 실패해도(취소 자체의 CancelledError 등)
+            # 스트림 결과에는 영향 없다(best-effort).
+            if stdin_task is not None:
+                if not stdin_task.done():
+                    stdin_task.cancel()
+                try:
+                    await stdin_task
+                # asyncio.CancelledError 는 3.8+ 에서 BaseException 상속이라
+                # ``except Exception`` 만으로는 우리가 방금 요청한 취소의
+                # 결과조차 못 잡는다 — 명시적으로 함께 삼킨다.
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                    pass
             # issue #10: GeneratorExit 포함 모든 종료 경로에서 proc 정리.
             # 직속만이 아니라 그룹 전체를 죽여 MCP/hook 손자까지 reap. 정상완료
             # (returncode set) 경로에서도 떨어져나간 손자가 그룹에 남아있을 수

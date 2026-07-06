@@ -685,6 +685,12 @@ class ClaudeProvider(LLMProvider):
         # ``_run_stream_template(env=...)`` 에 넘기고, 그 helper 는 env=None
         # 일 때 spawn kwargs 에 "env" 자체를 넣지 않아 부모 env 상속 불변.
         run_env = self._auth_env(oauth_token)
+        # issue #44: invoke/invoke_async 와 동일 임계치 판정 — stream_async 는
+        # 별도 spawn 경로(_run_stream_template)라 #30 의 stdin 라우팅이
+        # 적용되지 않았다. 재시도 루프 전체에서 한 번만 계산(프롬프트는
+        # attempt 간 불변이므로 매 attempt 마다 다시 잴 이유가 없다).
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다
         # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
         if reasoning and _reasoning_needs_event(reasoning):
@@ -701,7 +707,8 @@ class ClaudeProvider(LLMProvider):
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
                 strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-                partial_messages=use_partial, reasoning_args=reasoning_args)
+                partial_messages=use_partial, reasoning_args=reasoning_args,
+                prompt_via_stdin=use_stdin)
             if cmd is None:
                 yield StreamChunk(type="error", content="Claude CLI not found")
                 return
@@ -719,7 +726,8 @@ class ClaudeProvider(LLMProvider):
             async for chunk in self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=run_env, debug=use_debug, debug_log_path=dbg_path):
+                    env=run_env, debug=use_debug, debug_log_path=dbg_path,
+                    input_bytes=prompt_bytes if use_stdin else None):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"
                         and STALE_SESSION_MARKER in (chunk.content or "")):

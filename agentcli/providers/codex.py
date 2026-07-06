@@ -619,6 +619,12 @@ class CodexProvider(LLMProvider):
         from ..reasoning import needs_event, to_dict as _rz_to_dict
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #44: invoke/invoke_async 와 동일 임계치 판정 — stream_async 는
+        # 별도 spawn 경로(_run_stream_template)라 #30 의 stdin 라우팅이
+        # 적용되지 않았다. 재시도 루프 전체에서 한 번만 계산(프롬프트는
+        # attempt 간 불변) 하고 루프의 매 ``_build_cmd`` 호출에 그대로 넘긴다.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다
         # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
         if reasoning and needs_event(reasoning):
@@ -633,7 +639,8 @@ class CodexProvider(LLMProvider):
                                   sandbox_mode=sandbox_mode,
                                   approval_policy=approval_policy,
                                   mcp_config=mcp_config,
-                                  reasoning_args=reasoning_args)
+                                  reasoning_args=reasoning_args,
+                                  prompt_via_stdin=use_stdin)
             if cmd is None:
                 yield StreamChunk(type="error", content="codex CLI not found")
                 return
@@ -648,7 +655,8 @@ class CodexProvider(LLMProvider):
             async for chunk in self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=build_env(), debug=debug, debug_log_path=debug_log_path):
+                    env=build_env(), debug=debug, debug_log_path=debug_log_path,
+                    input_bytes=prompt_bytes if use_stdin else None):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"
                         and _is_codex_stale(chunk.content)):
