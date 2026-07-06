@@ -1,4 +1,5 @@
 from unittest.mock import patch, MagicMock
+import asyncio
 import subprocess
 from agentcli.providers.copilot import CopilotProvider, _parse_copilot_jsonl
 from agentcli.types import Message
@@ -225,3 +226,114 @@ def test_invoke_timeout(mock_find, mock_env, mock_run):
     assert resp.content == ""
     assert resp.error_type == "timeout"
     assert resp.exit_code == 124
+
+
+# ===== reasoning (effort/thinking) =====
+
+def test_copilot_effort_flag():
+    args, res = CopilotProvider()._reasoning_flags("medium", None)
+    assert args == ["--effort", "medium"] and res.effort.applied == "medium"
+
+
+def test_copilot_effort_minimal_renames_to_none_not_clamped():
+    args, res = CopilotProvider()._reasoning_flags("minimal", None)
+    assert args == ["--effort", "none"] and res.effort.clamped is False
+
+
+def test_copilot_thinking_concise_enables_summaries():
+    args, res = CopilotProvider()._reasoning_flags(None, "concise")
+    assert args == ["--enable-reasoning-summaries"]
+    assert res.thinking.applied == "on" and res.thinking.clamped is False
+
+
+def test_copilot_thinking_detailed_clamps_to_boolean():
+    args, res = CopilotProvider()._reasoning_flags(None, "detailed")
+    assert args == ["--enable-reasoning-summaries"]
+    assert res.thinking.clamped is True
+
+
+def test_copilot_thinking_off_emits_no_flag():
+    args, res = CopilotProvider()._reasoning_flags(None, "off")
+    assert args == [] and res.thinking.applied == ""
+
+
+def test_copilot_no_reasoning_means_no_args_and_none():
+    args, res = CopilotProvider()._reasoning_flags(None, None)
+    assert args == [] and res is None
+
+
+def test_copilot_percall_effort_overrides_constructor_default():
+    p = CopilotProvider(effort="low")
+    args, _ = p._reasoning_flags("max", None)   # per-call wins
+    assert args == ["--effort", "max"]
+
+
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
+def test_copilot_build_cmd_includes_reasoning_args(mock_find):
+    p = CopilotProvider()
+    args, _ = p._reasoning_flags("high", "concise")
+    cmd, _use_gh = p._build_cmd("hi", "", "", reasoning_args=args)
+    assert "--effort" in cmd and cmd[cmd.index("--effort") + 1] == "high"
+    assert "--enable-reasoning-summaries" in cmd
+
+
+@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
+def test_invoke_constructor_effort_still_emits_flag(mock_find, mock_env, mock_run):
+    """생성자 effort 기본값 → _reasoning_flags 경유로도 기존과 동일한 플래그가 붙는다."""
+    mock_run.return_value = MagicMock(returncode=0, stdout=_SAMPLE_STDOUT, stderr="")
+    p = CopilotProvider(effort="medium")
+    resp = p.invoke([Message(role="user", content="hi")])
+    cmd = mock_run.call_args[0][0]
+    assert "--effort" in cmd and "medium" in cmd
+    assert resp.reasoning is not None and resp.reasoning.effort.applied == "medium"
+
+
+@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=("/usr/bin/copilot", False))
+def test_invoke_no_reasoning_means_argv_unchanged_and_none(mock_find, mock_env, mock_run):
+    mock_run.return_value = MagicMock(returncode=0, stdout=_SAMPLE_STDOUT, stderr="")
+    resp = CopilotProvider().invoke([Message(role="user", content="hi")])
+    cmd = mock_run.call_args[0][0]
+    assert "--effort" not in cmd and "--enable-reasoning-summaries" not in cmd
+    assert resp.reasoning is None
+
+
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=(None, False))
+def test_invoke_binary_missing_leaves_reasoning_unset(mock_find):
+    resp = CopilotProvider(effort="high").invoke([Message(role="user", content="hi")])
+    assert resp.reasoning is None
+
+
+# ===== stream_async (reasoning event ordering) =====
+
+def _collect_stream(provider, **kwargs):
+    """Helper to run stream_async and collect all chunks."""
+    async def run():
+        return [c async for c in provider.stream_async(
+            [Message(role="user", content="hi")], **kwargs)]
+    return asyncio.run(run())
+
+
+@patch("agentcli.providers.copilot.CopilotProvider._find_binary",
+       return_value=(None, False))
+def test_stream_async_reasoning_event_before_binary_missing_error(mock_find):
+    """reasoning event은 binary-missing error 전에 yield 되어야 한다 (claude 정규화)."""
+    # thinking="detailed"는 copilot에서 clamped되므로 needs_event가 True가 된다.
+    chunks = _collect_stream(CopilotProvider(), thinking="detailed")
+
+    # 첫 청크는 reasoning event이어야 한다.
+    assert len(chunks) >= 2
+    assert chunks[0].type == "event"
+    assert "reasoning" in (chunks[0].data or {})
+    assert chunks[0].data.get("provider") == "copilot"
+
+    # 두 번째 청크는 binary-missing error이어야 한다.
+    assert chunks[1].type == "error"
+    assert "not found" in chunks[1].content

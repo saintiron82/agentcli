@@ -399,6 +399,28 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 `ClaudeProvider`는 macOS/Linux에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). Windows에서는 `-p`와 `--resume` 조합이 인터랙티브 입력 대기로 빠질 수 있어(issue #4) 무상태로 동작합니다.
 
+### Reasoning 제어
+
+호출마다, 또는 provider 기본값으로 지정할 수 있는 두 개의 독립된 정규화 제어:
+
+- `effort` — 모델이 얼마나 세게 추론하는지: `minimal · low · medium · high · xhigh · max`.
+- `thinking` — 추론 결과의 노출 정도: `off · concise · detailed`.
+
+```python
+resp = await client.chat_async("…", provider="codex",
+                               effort="high", thinking="concise")
+print(resp.reasoning.effort.applied)   # 실제 적용된 native 레벨
+```
+
+지원하지 않는 레벨은 가장 가까운 값으로 clamp 되고 그 사실이 보고된다
+(`resp.reasoning`, 그리고 스트리밍 `event` 청크). Provider 별 특이사항: codex 는
+effort 를 `high` 까지만 지원(xhigh/max 는 clamp); copilot 의 thinking 은
+불리언(`concise`/`detailed` 모두 summaries 를 켠다); claude 는 thinking 토글이
+없다(미지원으로 보고). 스트리밍 reasoning `event` 는 요청이 실행되었는지가 아니라
+*어떻게 해석되었는지*를 보고하므로 provider 바이너리를 찾지 못한 경우에도 그대로
+방출되며, 반대로 비스트리밍 `invoke`/`invoke_async` 는 CLI 가 아예 실행되지
+않았다면 `LLMResponse.reasoning` 을 설정하지 않는다.
+
 ## 테스트
 
 ```bash

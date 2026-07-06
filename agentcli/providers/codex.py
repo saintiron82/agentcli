@@ -119,7 +119,9 @@ class CodexProvider(LLMProvider):
                  sandbox_mode: str = "danger-full-access",
                  approval_policy: str | None = None,
                  full_auto: bool = True,
-                 skip_git_repo_check: bool = True):
+                 skip_git_repo_check: bool = True,
+                 effort: str | None = None,
+                 thinking: str | None = None):
         """
         Args:
             sandbox_mode: `read-only` | `workspace-write` | `danger-full-access`.
@@ -128,11 +130,19 @@ class CodexProvider(LLMProvider):
             approval_policy: `-a` 옵션. None이면 생략. resume 시 무시.
             full_auto: `--full-auto` 플래그 사용 여부 (both exec & resume).
             skip_git_repo_check: `--skip-git-repo-check` — git 리포 외부에서도 실행 허용.
+            effort: 정규화 reasoning effort 기본값 (``minimal``~``max``). 호출
+                시 override 가능. None 이면 config override 를 붙이지 않는다
+                (기존 동작 불변).
+            thinking: 정규화 reasoning thinking 기본값. codex 는
+                `model_reasoning_summary` config override 로 표현한다.
         """
         self._sandbox_mode = sandbox_mode
         self._approval_policy = approval_policy
         self._full_auto = full_auto
         self._skip_git = skip_git_repo_check
+        # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
+        self._effort = effort
+        self._thinking = thinking
 
     def is_available(self) -> bool:
         return shutil.which("codex") is not None
@@ -209,7 +219,8 @@ class CodexProvider(LLMProvider):
                    session_id: str, *,
                    sandbox_mode: str | None = None,
                    approval_policy: str | None = None,
-                   mcp_config: dict | None = None) -> list[str] | None:
+                   mcp_config: dict | None = None,
+                   reasoning_args: list[str] | None = None) -> list[str] | None:
         """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
 
         바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
@@ -225,6 +236,10 @@ class CodexProvider(LLMProvider):
         per-call 주입한다. HTTP 는 ``{url, bearer_token_env_var?}``, stdio 는
         ``{command, args?, env?}`` (#154 follow-up). 토큰은 inline 헤더가 아니라
         ``bearer_token_env_var`` (환경변수명) 로 전달한다.
+
+        reasoning_args 는 ``_reasoning_flags`` 가 미리 계산한 `-c` config
+        override args — 호출자가 넘기지 않으면(None) 아무 플래그도 붙지 않아
+        기존 동작과 동일하다.
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -245,6 +260,8 @@ class CodexProvider(LLMProvider):
             if model:
                 cmd += ["-m", model]
             cmd += mcp_args
+            if reasoning_args:
+                cmd += reasoning_args
             # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
             # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
             cmd += ["--", session_id, prompt]
@@ -264,10 +281,35 @@ class CodexProvider(LLMProvider):
         if model:
             cmd += ["-m", model]
         cmd += mcp_args
+        if reasoning_args:
+            cmd += reasoning_args
         # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
         # 해석되지 않는다 (untrusted 입력 주입 방지).
         cmd += ["--", prompt]
         return cmd
+
+    def _reasoning_flags(self, effort, thinking):
+        """유효 effort/thinking → (codex `-c` config args, ReasoningResolution).
+
+        codex 는 --effort 플래그가 없어 config override 로 전달한다:
+        `-c model_reasoning_effort=<native>` / `-c model_reasoning_summary=<native>`.
+        xhigh/max 는 codex 상한(high)으로 clamp 되어 보고된다.
+        """
+        from ..reasoning import resolve_effort, resolve_thinking
+        from ..types import ReasoningResolution
+        eff = self._effort if effort is None else effort
+        thk = self._thinking if thinking is None else thinking
+        args, er, tr = [], None, None
+        if eff:
+            er = resolve_effort(self.provider_id, eff)
+            if er.applied:
+                args += ["-c", f"model_reasoning_effort={_toml_inline(er.applied)}"]
+        if thk:
+            tr = resolve_thinking(self.provider_id, thk)
+            if tr.applied:
+                args += ["-c", f"model_reasoning_summary={_toml_inline(tr.applied)}"]
+        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        return args, res
 
     # ---------- 동기 ----------
 
@@ -279,13 +321,17 @@ class CodexProvider(LLMProvider):
                approval_policy: str | None = None,
                mcp_config: dict | None = None,
                debug: bool = False,
-               debug_log_path: str | None = None) -> LLMResponse:
+               debug_log_path: str | None = None,
+               effort: str | None = None,
+               thinking: str | None = None) -> LLMResponse:
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
                               approval_policy=approval_policy,
-                              mcp_config=mcp_config)
+                              mcp_config=mcp_config,
+                              reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -314,16 +360,19 @@ class CodexProvider(LLMProvider):
                         messages, model=model, timeout=timeout,
                         session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
                         approval_policy=approval_policy, mcp_config=mcp_config,
-                        debug=debug, debug_log_path=debug_log_path)
+                        debug=debug, debug_log_path=debug_log_path,
+                        effort=effort, thinking=thinking)
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
                 logger.error("Codex 실패 (code=%d): %s",
                              result.returncode, msg)
-                return LLMResponse(
+                resp = LLMResponse(
                     content="", provider=self.provider_id, model=model,
                     raw_stderr=result.stderr,
                     session_id=session_id,
                     error=msg, error_type=classify_error(msg),
                     exit_code=result.returncode)
+                resp.reasoning = reasoning
+                return resp
 
             parsed = _parse_jsonl_events(result.stdout)
             parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
@@ -335,7 +384,8 @@ class CodexProvider(LLMProvider):
                     self._build_cmd(prompt, model, cwd, first_thread_id,
                                     sandbox_mode=sandbox_mode,
                                     approval_policy=approval_policy,
-                                    mcp_config=mcp_config),
+                                    mcp_config=mcp_config,
+                                    reasoning_args=reasoning_args),
                     capture_output=True, text=True, timeout=timeout,
                     stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
                 latency = int((time.time() - start) * 1000)
@@ -344,12 +394,14 @@ class CodexProvider(LLMProvider):
                            or f"exit={retry_result.returncode}")
                     logger.error("Codex greeting retry 실패 (code=%d): %s",
                                  retry_result.returncode, msg)
-                    return LLMResponse(
+                    resp = LLMResponse(
                         content="", provider=self.provider_id, model=model,
                         raw_stderr=retry_result.stderr,
                         session_id=parsed["thread_id"],
                         error=msg, error_type=classify_error(msg),
                         exit_code=retry_result.returncode)
+                    resp.reasoning = reasoning
+                    return resp
                 parsed = _parse_jsonl_events(retry_result.stdout)
                 parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
                 parsed["usage"].prompt_tokens_reliable = False
@@ -358,7 +410,7 @@ class CodexProvider(LLMProvider):
                     parsed["thread_id"] = first_thread_id
                 result = retry_result
             err = parsed.get("error", "")
-            return LLMResponse(
+            resp = LLMResponse(
                 content=parsed["text"] if not err else "",
                 provider=self.provider_id, model=model,
                 tokens=parsed["usage"], latency_ms=latency,
@@ -368,16 +420,20 @@ class CodexProvider(LLMProvider):
                 error_type=classify_error(err) if err else "",
                 exit_code=result.returncode,
             )
+            resp.reasoning = reasoning
+            return resp
         except subprocess.TimeoutExpired:
             logger.error("Codex 타임아웃 (%d초)", timeout)
             if debug:
                 emit_invoke_debug("codex", cmd, 124,
                                   int((time.time() - start) * 1000), "",
                                   session_id=session_id, path=debug_log_path)
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id, model=model,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         except FileNotFoundError:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -395,12 +451,16 @@ class CodexProvider(LLMProvider):
                            approval_policy: str | None = None,
                            mcp_config: dict | None = None,
                            debug: bool = False,
-                           debug_log_path: str | None = None) -> LLMResponse:
+                           debug_log_path: str | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
                               approval_policy=approval_policy,
-                              mcp_config=mcp_config)
+                              mcp_config=mcp_config,
+                              reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -427,11 +487,13 @@ class CodexProvider(LLMProvider):
                 emit_invoke_debug("codex", cmd, 124,
                                   int((time.time() - start) * 1000), "",
                                   session_id=session_id, path=debug_log_path)
-            return LLMResponse(content="", provider=self.provider_id,
-                                model=model, session_id=session_id,
-                                error=f"timeout after {timeout}s",
-                                error_type="timeout",
-                                exit_code=124)
+            resp = LLMResponse(content="", provider=self.provider_id,
+                               model=model, session_id=session_id,
+                               error=f"timeout after {timeout}s",
+                               error_type="timeout",
+                               exit_code=124)
+            resp.reasoning = reasoning
+            return resp
         latency = int((time.time() - start) * 1000)
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
         if debug:
@@ -446,19 +508,22 @@ class CodexProvider(LLMProvider):
                     messages, model=model, timeout=timeout,
                     session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
                     approval_policy=approval_policy, mcp_config=mcp_config,
-                    debug=debug, debug_log_path=debug_log_path)
+                    debug=debug, debug_log_path=debug_log_path,
+                    effort=effort, thinking=thinking)
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             logger.error("Codex 실패 (code=%d): %s", rc, msg)
-            return LLMResponse(
+            resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=session_id,
                 error=msg, error_type=classify_error(msg),
                 exit_code=rc)
+            resp.reasoning = reasoning
+            return resp
 
         stdout_txt = stdout_b.decode("utf-8", errors="replace")
         parsed = _parse_jsonl_events(stdout_txt)
         err = parsed.get("error", "")
-        return LLMResponse(
+        resp = LLMResponse(
             content=parsed["text"] if not err else "",
             provider=self.provider_id, model=model,
             tokens=parsed["usage"], latency_ms=latency,
@@ -468,6 +533,8 @@ class CodexProvider(LLMProvider):
             error_type=classify_error(err) if err else "",
             exit_code=rc,
         )
+        resp.reasoning = reasoning
+        return resp
 
     # ---------- 스트리밍 ----------
 
@@ -481,7 +548,9 @@ class CodexProvider(LLMProvider):
                            approval_policy: str | None = None,
                            mcp_config: dict | None = None,
                            debug: bool = False,
-                           debug_log_path: str | None = None) -> AsyncIterator[StreamChunk]:
+                           debug_log_path: str | None = None,
+                           effort: str | None = None,
+                           thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         """Codex exec --json JSONL 이벤트 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -495,7 +564,15 @@ class CodexProvider(LLMProvider):
           turn.completed                              → (usage 저장)
           error / turn.failed                         → error
         """
+        from ..reasoning import needs_event, to_dict as _rz_to_dict
         prompt = build_session_prompt(messages)
+        reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # clamp/미지원이 있으면 subprocess 시작 전에 event 청크로 먼저 알린다
+        # (재시도해도 한 번만 — 루프 진입 전에 계산·방출).
+        if reasoning and needs_event(reasoning):
+            yield StreamChunk(type="event",
+                              data={"reasoning": _rz_to_dict(reasoning),
+                                    "provider": self.provider_id})
         # 만료된 thread 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다 (claude 동일 패턴).
         attempt_sid = session_id
@@ -503,7 +580,8 @@ class CodexProvider(LLMProvider):
             cmd = self._build_cmd(prompt, model, cwd, attempt_sid,
                                   sandbox_mode=sandbox_mode,
                                   approval_policy=approval_policy,
-                                  mcp_config=mcp_config)
+                                  mcp_config=mcp_config,
+                                  reasoning_args=reasoning_args)
             if cmd is None:
                 yield StreamChunk(type="error", content="codex CLI not found")
                 return

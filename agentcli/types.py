@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .reasoning import ReasoningResolution
+
 
 @dataclass
 class TokenUsage:
@@ -49,6 +51,8 @@ class LLMResponse:
     exit_code: int | None = None
     recoverable: bool = False
     suggested_action: str = ""
+    # 정규화 reasoning 제어(effort/thinking)의 요청/적용 결과. 둘 다 미사용이면 None.
+    reasoning: "ReasoningResolution | None" = None
 
     def __post_init__(self) -> None:
         if self.error and not self.error_type:
@@ -213,6 +217,8 @@ class ProviderCapabilities:
     options: frozenset        # 받는 per-call provider_options 키
     notes: str = ""           # OS 등 단서
     debug: bool = False        # debug 계측(청크 타임라인/trace) 지원
+    effort_levels: frozenset = frozenset()     # 지원하는 canonical effort 레벨
+    thinking_levels: frozenset = frozenset()   # 지원하는 canonical thinking 레벨
 
     def to_dict(self) -> dict:
         return {
@@ -225,6 +231,8 @@ class ProviderCapabilities:
             "debug": self.debug,
             "options": sorted(self.options),
             "notes": self.notes,
+            "effort_levels": sorted(self.effort_levels),
+            "thinking_levels": sorted(self.thinking_levels),
         }
 
     def supports(self, feature: str) -> bool:

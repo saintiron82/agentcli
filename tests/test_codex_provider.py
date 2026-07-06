@@ -452,3 +452,25 @@ def test_build_cmd_resume_has_dashdash_before_sid_and_prompt():
     dd = cmd.index("--")
     assert cmd[dd + 1] == "-malicious-sid"
     assert cmd[dd + 2] == "-p"
+
+
+# ===== 정규화 reasoning 제어 (effort/thinking) =====
+
+def test_codex_effort_via_config_flag():
+    args, res = CodexProvider()._reasoning_flags("high", None)
+    assert args == ["-c", 'model_reasoning_effort="high"']
+    assert res.effort.applied == "high"
+
+def test_codex_effort_max_clamps_to_high():
+    args, res = CodexProvider()._reasoning_flags("max", None)
+    assert args == ["-c", 'model_reasoning_effort="high"']
+    assert res.effort.clamped is True
+
+def test_codex_thinking_detailed_via_config():
+    args, res = CodexProvider()._reasoning_flags(None, "detailed")
+    assert args == ["-c", 'model_reasoning_summary="detailed"']
+    assert res.thinking.applied == "detailed"
+
+def test_codex_thinking_off_maps_to_none():
+    args, _ = CodexProvider()._reasoning_flags(None, "off")
+    assert args == ["-c", 'model_reasoning_summary="none"']
