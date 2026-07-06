@@ -189,7 +189,7 @@ class ClaudeProvider(LLMProvider):
         """``~/.agentcli/claude_oauth_token`` 을 읽는다. 파일이 group/world-
         readable 이면(POSIX) 경고를 남기되(경로만 언급 — 토큰 값은 절대
         포함하지 않는다) 토큰은 그대로 사용한다. 파일이 없거나 읽기
-        실패하면(권한/IO 오류 등) 조용히 ``None`` — 이 파일은 옵셔널
+        실패하면(권한/IO 오류, 인코딩 오류 등) 조용히 ``None`` — 이 파일은 옵셔널
         소스이므로 없는 게 정상 경로다."""
         path = pathlib.Path.home() / OAUTH_TOKEN_FILE_REL
         try:
@@ -204,7 +204,7 @@ class ClaudeProvider(LLMProvider):
                         "않음)", path)
             text = path.read_text(encoding="utf-8").strip()
             return text or None
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return None
 
     def _auth_env(self, oauth_token: str | None) -> dict | None:

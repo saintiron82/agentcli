@@ -360,3 +360,38 @@ def test_oauth_token_not_in_debug_trace(mock_find, mock_run, tmp_path):
     p.invoke([Message(role="user", content="hi")])
     assert trace.exists()
     assert "super-secret-tok" not in trace.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# issue #36 — non-UTF-8 token file 는 조용히 None 으로 취급 (UnicodeDecodeError 처리)
+# ---------------------------------------------------------------------------
+
+def test_non_utf8_token_file_returns_none(monkeypatch, tmp_path):
+    """토큰 파일이 non-UTF-8 바이트(또는 손상된 UTF-8)를 담고 있으면 UnicodeDecodeError
+    가 발생하는데, 이를 OSError 와 같이 조용히 처리해서 None 을 반환해야 한다.
+    issue #36 regression: UnicodeDecodeError 가 try/except OSError 블럭 밖으로
+    튈 수 있었음."""
+    monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / ".agentcli").mkdir()
+    token_path = tmp_path / ".agentcli" / "claude_oauth_token"
+    # 명시적으로 non-UTF-8 바이트 시퀀스 기록 (UTF-16 BOM + 잘못된 데이터)
+    token_path.write_bytes(b"\xff\xfe\x00bad-token-bytes")
+    token_path.chmod(0o600)
+    p = ClaudeProvider()
+    # UnicodeDecodeError 를 무시하고 None 반환해야 함
+    assert p._read_oauth_token_file() is None
+
+
+def test_non_utf8_token_file_resolve_returns_none(monkeypatch, tmp_path):
+    """비슷하게, _resolve_oauth_token 이 non-UTF-8 파일을 만나면 None 을 반환해야 한다
+    (다른 소스가 없을 때)."""
+    monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / ".agentcli").mkdir()
+    token_path = tmp_path / ".agentcli" / "claude_oauth_token"
+    token_path.write_bytes(b"\xff\xfe\x00bad-token-bytes")
+    token_path.chmod(0o600)
+    p = ClaudeProvider()
+    # _resolve_oauth_token 도 None 반환해야 함
+    assert p._resolve_oauth_token(None) is None
