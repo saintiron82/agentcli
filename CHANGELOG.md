@@ -18,6 +18,26 @@
   raises `ValueError` for a non-canonical string — including copilot's own
   native `"none"`; pass canonical `"minimal"`, which maps to native `none`.
 
+### Fixed
+- **Subprocess timeout no longer discards collected partial stdout/stderr
+  (issue #34).** A timeout used to drop whatever output had already been
+  captured, which made `--debug` traces useless for diagnosing what a
+  timed-out call was doing. The partial bytes collected before the timeout
+  are now preserved and surfaced in the debug trace; `invoke_async` also
+  closes stdin like the sync path already did.
+- **Large prompts now route through stdin instead of argv (issue #30).**
+  Prompts over 8,000 UTF-8 bytes are passed via stdin for claude/codex's
+  `invoke`/`invoke_async`, avoiding Windows' 32,767-character argv limit.
+  Scope: the copilot CLI has no stdin prompt mode, so this cannot apply
+  there; `stream_async` remains argv-only for all providers — tracked in
+  issue #44.
+- **`ContextSession.fork_many` sibling-cancellation + race-free auto-labels
+  (issue #31, ships via PR #40).** When one fork raised, the other
+  still-running sibling forks used to keep running unsupervised instead of
+  being cancelled. A raising fork now cancels its still-running siblings, and
+  auto-generated fork labels (used when `labels` isn't passed) are now
+  race-free.
+
 ## 0.6.4 — 2026-06-29
 
 ### Added

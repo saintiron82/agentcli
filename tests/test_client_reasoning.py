@@ -12,6 +12,60 @@ def test_double_specify_effort_raises():
         c.chat("hi", provider="claude", effort="high",
                provider_options={"effort": "low"})
 
+
+# ===== eager reasoning-level validation (merge-gate Fix A) =====
+#
+# An invalid effort/thinking string used to raise a bare ValueError from deep
+# inside provider.invoke (agentcli.reasoning._resolve) -- AFTER _prepare()
+# had already created a conversation record. That left a residual
+# conversation permanently in the store even though the call never
+# succeeded. Validation must now happen eagerly, before any store/prepare
+# work, in chat/chat_async/chat_stream alike.
+
+def test_chat_invalid_effort_raises_and_leaves_no_residual_conversation():
+    store = MemoryStore()
+    c = LLMClient(store=store)
+    before = len(store._conversations)
+    with pytest.raises(ValueError, match="unknown level"):
+        c.chat("hi", provider="claude", effort="hi")
+    assert len(store._conversations) == before
+
+
+def test_chat_invalid_thinking_raises_and_leaves_no_residual_conversation():
+    store = MemoryStore()
+    c = LLMClient(store=store)
+    before = len(store._conversations)
+    with pytest.raises(ValueError, match="unknown level"):
+        c.chat("hi", provider="codex", thinking="hi")
+    assert len(store._conversations) == before
+
+
+def test_chat_async_invalid_effort_raises_and_leaves_no_residual_conversation():
+    store = MemoryStore()
+    c = LLMClient(store=store)
+    before = len(store._conversations)
+
+    async def call():
+        await c.chat_async("hi", provider="claude", effort="hi")
+
+    with pytest.raises(ValueError, match="unknown level"):
+        asyncio.run(call())
+    assert len(store._conversations) == before
+
+
+def test_chat_stream_invalid_effort_raises_on_iteration():
+    store = MemoryStore()
+    client = LLMClient(store=store)
+    before = len(store._conversations)
+
+    async def collect():
+        return [chunk async for chunk in
+                client.chat_stream("hi", provider="claude", effort="hi")]
+
+    with pytest.raises(ValueError, match="unknown level"):
+        asyncio.run(collect())
+    assert len(store._conversations) == before
+
 def test_effort_threads_into_supported_kwargs():
     # _supported_kwargs must keep 'effort' for a provider that accepts it
     from agentcli.client import _supported_kwargs

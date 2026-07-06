@@ -136,6 +136,22 @@ def _reject_reasoning_conflict(effort, thinking, provider_options):
                 f"pass it once")
 
 
+def _validate_reasoning_levels(effort, thinking):
+    """effort/thinking 값이 유효한지 store/prepare 작업 전에 즉시 검증.
+
+    provider.invoke 안쪽(agentcli.reasoning._resolve)에서도 같은 검사를
+    하지만, 그 시점엔 이미 _prepare()가 conversation 레코드를 만든 뒤라
+    잘못된 값이 예외와 함께 잔여 conversation 을 store 에 남긴다. 여기서
+    먼저 걸러 chat/chat_async/chat_stream 이 어떤 store 작업도 하기 전에
+    실패하도록 한다 (provider 쪽 검증은 defense in depth 로 유지)."""
+    from .reasoning import EFFORT, THINKING
+    for name, val, scale in (("effort", effort, EFFORT),
+                             ("thinking", thinking, THINKING)):
+        if val is not None and val not in scale:
+            raise ValueError(
+                f"unknown level {val!r}; valid: {', '.join(scale)}")
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
                        effort=None, thinking=None,
@@ -505,6 +521,7 @@ class LLMClient:
              provider_options: dict | None = None,
              ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
+        _validate_reasoning_levels(effort, thinking)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -640,6 +657,7 @@ class LLMClient:
                          provider_options: dict | None = None,
                          ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
+        _validate_reasoning_levels(effort, thinking)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -775,6 +793,7 @@ class LLMClient:
         text/tool/event 등 어떤 출력이라도 나간 뒤 실패하면 provider를 바꾸지 않는다.
         """
         _reject_reasoning_conflict(effort, thinking, provider_options)
+        _validate_reasoning_levels(effort, thinking)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model, created_conversation, resolved_alias, alias_to_set,

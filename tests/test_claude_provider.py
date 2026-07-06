@@ -1,5 +1,6 @@
 from unittest.mock import patch, MagicMock
 import subprocess
+from agentcli.providers.base import PROMPT_STDIN_THRESHOLD
 from agentcli.providers.claude import ClaudeProvider
 from agentcli.types import Message
 
@@ -524,3 +525,110 @@ def test_invoke_async_timeout_debug_carries_partial_stderr(tmp_path):
         assert "DEBUG-MARKER async partial stderr" in rec["stderr"]
         # "timeout after" 문자열은 debug trace 에 들어가면 안 됨
         assert "timeout after" not in rec["stderr"]
+
+
+# ===== issue #30: 큰 프롬프트 stdin 전달 (Windows 32,767자 argv 한계 우회) =====
+
+def _big_prompt() -> str:
+    """PROMPT_STDIN_THRESHOLD 를 넘는 ascii 프롬프트 (1 byte/char)."""
+    return "x" * (PROMPT_STDIN_THRESHOLD + 1)
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_prompt_exactly_at_threshold_stays_argv_mode(mock_find, mock_run):
+    """경계값: 정확히 PROMPT_STDIN_THRESHOLD 바이트인 프롬프트는 (엄격한
+    ``>`` 비교이므로) 여전히 ARGV 모드 — stdin 으로 넘어가지 않는다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    exact = "x" * PROMPT_STDIN_THRESHOLD
+    p = ClaudeProvider()
+    p.invoke([Message(role="user", content=exact)])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert cmd[cmd.index("-p") + 1] == exact
+    assert kwargs.get("input_bytes") is None
+
+
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_build_cmd_prompt_via_stdin_omits_positional_prompt(mock_find):
+    p = ClaudeProvider()
+    cmd, _sid = p._build_cmd("giant prompt body", "", "", "json",
+                             prompt_via_stdin=True)
+    assert "-p" in cmd
+    assert "giant prompt body" not in cmd
+    # -p 바로 다음은 프롬프트가 아니라 다음 플래그여야 한다.
+    assert cmd[cmd.index("-p") + 1] == "--output-format"
+
+
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_build_cmd_default_still_inlines_prompt(mock_find):
+    """prompt_via_stdin 미지정(기본 False) 은 기존과 byte-identical."""
+    p = ClaudeProvider()
+    cmd, _sid = p._build_cmd("small prompt", "", "", "json")
+    assert cmd[cmd.index("-p") + 1] == "small prompt"
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_large_prompt_routes_via_stdin(mock_find, mock_run):
+    """8000바이트 초과 프롬프트는 argv 가 아니라 input_bytes 로 전달돼야 한다."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    big = _big_prompt()
+    p = ClaudeProvider()
+    p.invoke([Message(role="user", content=big)])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert big not in cmd, "큰 프롬프트가 argv 에 그대로 남으면 안 된다"
+    assert "-p" in cmd and cmd[cmd.index("-p") + 1] == "--output-format"
+    assert kwargs.get("input_bytes") == big.encode("utf-8")
+
+
+@patch("agentcli.providers.claude.run_subprocess_sync")
+@patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
+def test_invoke_small_prompt_stdin_untouched(mock_find, mock_run):
+    """임계치 이하 프롬프트는 기존과 동일하게 argv 로, input_bytes 는 None."""
+    mock_run.return_value = _sync(stdout='{"result":"ok"}')
+    p = ClaudeProvider()
+    p.invoke([Message(role="user", content="small prompt")])
+    cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args[1]
+    assert cmd[cmd.index("-p") + 1] == "small prompt"
+    assert kwargs.get("input_bytes") is None
+
+
+def test_invoke_async_large_prompt_routes_via_input_bytes():
+    """invoke_async 도 큰 프롬프트는 use_stdin_devnull 대신 input_bytes 를
+    써야 한다 (run_subprocess_async 의 상호 배타 가드와 정합)."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    big = _big_prompt()
+    with patch("agentcli.providers.claude.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b'{"result":"ok"}', b"", 0, False))) as mock_run, \
+         patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+               return_value="/usr/bin/claude"):
+        p = ClaudeProvider()
+        resp = asyncio.run(
+            p.invoke_async([Message(role="user", content=big)]))
+    assert resp.content == "ok"
+    cmd = mock_run.call_args.args[0]
+    assert big not in cmd
+    assert mock_run.call_args.kwargs.get("use_stdin_devnull") is False
+    assert mock_run.call_args.kwargs.get("input_bytes") == big.encode("utf-8")
+
+
+def test_invoke_async_small_prompt_still_closes_stdin_devnull():
+    """작은 프롬프트는 여전히 use_stdin_devnull=True, input_bytes 없음(불변)."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    with patch("agentcli.providers.claude.run_subprocess_async",
+               new=AsyncMock(
+                   return_value=(b'{"result":"ok"}', b"", 0, False))) as mock_run, \
+         patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+               return_value="/usr/bin/claude"):
+        p = ClaudeProvider()
+        asyncio.run(p.invoke_async([Message(role="user", content="hi")]))
+    assert mock_run.call_args.kwargs.get("use_stdin_devnull") is True
+    assert mock_run.call_args.kwargs.get("input_bytes") is None

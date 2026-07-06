@@ -55,3 +55,27 @@ def test_llmresponse_has_reasoning_field_defaulting_none():
     from agentcli.types import LLMResponse
     r = LLMResponse(content="hi", provider="claude", model="sonnet")
     assert r.reasoning is None
+
+
+# ===== map completeness guard (merge-gate Fix E) =====
+#
+# A partial (non-empty but not-full-scale) provider map would make
+# `_resolve`'s `pmap[value]` raise a bare KeyError at call time instead of
+# failing loudly at import time. `_assert_maps_cover_full_scale` guards
+# against that for the shipped maps (called at module load) -- this test
+# re-runs the same guard against a deliberately partial copy to prove it
+# actually raises.
+
+def test_shipped_maps_pass_the_completeness_guard():
+    from agentcli.reasoning import (
+        _EFFORT_MAP, _THINKING_MAP, _assert_maps_cover_full_scale)
+    # Must not raise for the maps actually shipped.
+    _assert_maps_cover_full_scale(EFFORT, _EFFORT_MAP, "effort")
+    _assert_maps_cover_full_scale(THINKING, _THINKING_MAP, "thinking")
+
+
+def test_partial_map_fails_the_completeness_guard():
+    from agentcli.reasoning import _assert_maps_cover_full_scale
+    partial = {"claude": {"minimal": ("low", True), "low": ("low", False)}}
+    with pytest.raises(AssertionError, match="missing levels"):
+        _assert_maps_cover_full_scale(EFFORT, partial, "effort")

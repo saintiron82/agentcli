@@ -21,9 +21,10 @@ import subprocess
 import time
 from typing import AsyncIterator
 
-from .base import (LLMProvider, StreamState, build_session_prompt,
-                   emit_invoke_debug, estimate_payload_prompt_tokens,
-                   health_from_response, run_health_command, run_subprocess_async)
+from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
+                   build_session_prompt, emit_invoke_debug,
+                   estimate_payload_prompt_tokens, health_from_response,
+                   run_health_command, run_subprocess_async)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -103,6 +104,37 @@ def _toml_inline(value) -> str:
         return "{" + ", ".join(
             f"{k} = {_toml_inline(v)}" for k, v in value.items()) + "}"
     return json.dumps(str(value))
+
+
+def _codex_run_kwargs(prompt: str, use_stdin: bool, *,
+                      timeout: int, cwd: str | None) -> dict:
+    """codex 동기 ``subprocess.run`` 호출용 kwargs 조립 (issue #30).
+
+    ``subprocess.run`` 은 ``stdin=``·``input=`` 을 동시에 받을 수 없어(모순:
+    닫으면서 동시에 쓰기) 상호 배타적으로 분기한다. ``use_stdin=False`` 면
+    기존과 byte-identical(stdin=DEVNULL) — 큰 프롬프트만 ``input=prompt`` 로
+    write-then-close 전달한다(codex sync invoke 는 ``text=True`` 라 str 그대로
+    넘긴다; base.py 의 bytes 계약과 달리 codex 는 이 헬퍼가 자체 subprocess.run
+    을 쓰므로 인코딩 불일치 없음).
+
+    ``encoding=`` 을 명시하지 않으면 ``text=True`` 는 stdin 인코딩과 stdout/
+    stderr 디코딩 모두에 ``locale.getpreferredencoding(False)`` 를 쓴다 —
+    이는 3.11~3.14 에서 OS/로케일에 따라 UTF-8 이 아닐 수 있어(PEP 686 UTF-8
+    기본값 이전), non-ASCII 대용량 프롬프트가 non-UTF-8 로케일 Windows 환경
+    (이 기능의 타깃)에서 UnicodeEncodeError 나 mojibake 를 낼 수 있다.
+    ``encoding="utf-8"`` 을 강제해 입출력 모두 결정적으로 만든다. codex 비동기
+    경로(``invoke_async``)가 ``.decode("utf-8", errors="replace")`` 로 stdout/
+    stderr 를 디코딩하는 기존 관례와 맞추기 위해 ``errors="replace"`` 도 함께
+    지정한다(동기 경로만 다른 동작을 하지 않도록).
+    """
+    kwargs: dict = dict(capture_output=True, text=True, timeout=timeout,
+                        env=build_env(), cwd=cwd,
+                        encoding="utf-8", errors="replace")
+    if use_stdin:
+        kwargs["input"] = prompt
+    else:
+        kwargs["stdin"] = subprocess.DEVNULL
+    return kwargs
 
 
 class CodexProvider(LLMProvider):
@@ -220,7 +252,8 @@ class CodexProvider(LLMProvider):
                    sandbox_mode: str | None = None,
                    approval_policy: str | None = None,
                    mcp_config: dict | None = None,
-                   reasoning_args: list[str] | None = None) -> list[str] | None:
+                   reasoning_args: list[str] | None = None,
+                   prompt_via_stdin: bool = False) -> list[str] | None:
         """세션 상태에 따라 `codex exec` 또는 `codex exec resume`를 조립.
 
         바이너리 없으면 None 반환 (3-provider 정규화 계약: 호출자가 즉시
@@ -239,7 +272,11 @@ class CodexProvider(LLMProvider):
 
         reasoning_args 는 ``_reasoning_flags`` 가 미리 계산한 `-c` config
         override args — 호출자가 넘기지 않으면(None) 아무 플래그도 붙지 않아
-        기존 동작과 동일하다.
+        기존 동작과 동일하다. prompt_via_stdin=True 면 `--` 뒤 위치 인자로
+        prompt 문자열 대신 `-` (stdin sentinel) 를 넣는다(issue #30) — codex
+        exec 는 `[PROMPT]` 인자가 `-` 이거나 생략되면 stdin 에서 읽으므로,
+        호출자가 프롬프트 바이트를 subprocess stdin 으로 별도 전달해야 한다.
+        resume/신규 세션 두 분기 모두 적용. 기본 False(기존 동작).
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -250,6 +287,7 @@ class CodexProvider(LLMProvider):
         mcp_args: list[str] = []
         for name, cfg in (mcp_config or {}).items():
             mcp_args += ["-c", f"mcp_servers.{name}={_toml_inline(cfg)}"]
+        prompt_arg = "-" if prompt_via_stdin else prompt
         cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
@@ -264,7 +302,7 @@ class CodexProvider(LLMProvider):
                 cmd += reasoning_args
             # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
             # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
-            cmd += ["--", session_id, prompt]
+            cmd += ["--", session_id, prompt_arg]
             return cmd
         # 신규 세션
         cmd.append("--json")
@@ -285,7 +323,7 @@ class CodexProvider(LLMProvider):
             cmd += reasoning_args
         # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
         # 해석되지 않는다 (untrusted 입력 주입 방지).
-        cmd += ["--", prompt]
+        cmd += ["--", prompt_arg]
         return cmd
 
     def _reasoning_flags(self, effort, thinking):
@@ -327,11 +365,16 @@ class CodexProvider(LLMProvider):
         # 세션이 히스토리 소유 — system 지시와 최신 user 요청만 전달
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달 —
+        # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
                               approval_policy=approval_policy,
                               mcp_config=mcp_config,
-                              reasoning_args=reasoning_args)
+                              reasoning_args=reasoning_args,
+                              prompt_via_stdin=use_stdin)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -344,8 +387,8 @@ class CodexProvider(LLMProvider):
         start = time.time()
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
-                stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
+                cmd, **_codex_run_kwargs(prompt, use_stdin,
+                                         timeout=timeout, cwd=cwd))
             latency = int((time.time() - start) * 1000)
             if debug:
                 emit_invoke_debug("codex", cmd, result.returncode, latency,
@@ -385,9 +428,10 @@ class CodexProvider(LLMProvider):
                                     sandbox_mode=sandbox_mode,
                                     approval_policy=approval_policy,
                                     mcp_config=mcp_config,
-                                    reasoning_args=reasoning_args),
-                    capture_output=True, text=True, timeout=timeout,
-                    stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
+                                    reasoning_args=reasoning_args,
+                                    prompt_via_stdin=use_stdin),
+                    **_codex_run_kwargs(prompt, use_stdin,
+                                        timeout=timeout, cwd=cwd))
                 latency = int((time.time() - start) * 1000)
                 if retry_result.returncode != 0:
                     msg = ((retry_result.stderr or "").strip()[:300]
@@ -456,11 +500,15 @@ class CodexProvider(LLMProvider):
                            thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
+        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
         cmd = self._build_cmd(prompt, model, cwd, session_id,
                               sandbox_mode=sandbox_mode,
                               approval_policy=approval_policy,
                               mcp_config=mcp_config,
-                              reasoning_args=reasoning_args)
+                              reasoning_args=reasoning_args,
+                              prompt_via_stdin=use_stdin)
         if cmd is None:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(
@@ -472,9 +520,13 @@ class CodexProvider(LLMProvider):
 
         start = time.time()
         try:
+            # use_stdin_devnull/input_bytes 는 상호 배타적(run_subprocess_async
+            # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
+            # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd,
-                env=build_env(), use_stdin_devnull=True)
+                cmd, timeout=timeout, cwd=cwd, env=build_env(),
+                use_stdin_devnull=not use_stdin,
+                input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
             logger.error("codex CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
