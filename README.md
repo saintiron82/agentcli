@@ -438,6 +438,40 @@ whether it executed, so it is still emitted when the provider binary turns
 out to be missing — whereas non-streaming `invoke`/`invoke_async` leave
 `LLMResponse.reasoning` unset when the CLI never ran.
 
+### Claude OAuth token (headless/containers)
+
+In containerized or read-only environments where `~/.claude` is mounted
+read-only, Claude's native token refresh is blocked, causing daily 401 auth failures.
+`ClaudeProvider` can inject a separate OAuth token managed by agentcli:
+
+**Token resolution** (first match wins):
+1. Per-call `oauth_token` kwarg
+2. Constructor `oauth_token` argument
+3. `AGENTCLI_CLAUDE_OAUTH_TOKEN` environment variable
+4. `~/.agentcli/claude_oauth_token` file (auto-read and stripped)
+
+If no source provides a token, the library uses ambient CLI credentials — fully backward compatible.
+
+**Usage:**
+
+```python
+# Constructor default (all calls):
+provider = ClaudeProvider(oauth_token="ag-xxx...")
+
+# Or per-call override:
+resp = await client.chat_async(
+    "...", provider="claude",
+    provider_options={"oauth_token": "ag-xxx..."})
+
+# File path (~/.agentcli/claude_oauth_token):
+# - Recommended permissions: `chmod 600`
+# - Group/world-readable files trigger a path-only warning (token value not logged)
+# - Unreadable/missing file → silent fallback to next source
+```
+
+The token is never logged and appears only in the subprocess environment
+variable `CLAUDE_CODE_OAUTH_TOKEN` — never in argv or debug traces.
+
 ## Security notes
 
 Each provider exposes its permission flags. **Defaults are permissive for dev convenience** — tighten them when embedding into multi-tenant or untrusted contexts.

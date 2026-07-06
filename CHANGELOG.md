@@ -9,6 +9,13 @@
   + a streaming `event` chunk). `capability_matrix()` gains `effort_levels` /
   `thinking_levels`. claude has no thinking toggle (reported unsupported); kiro
   out of scope.
+- **Claude OAuth token injection (#36).** `ClaudeProvider` resolves a separate
+  OAuth token (per-call kwarg > constructor default > `AGENTCLI_CLAUDE_OAUTH_TOKEN`
+  env var > `~/.agentcli/claude_oauth_token` file) and injects it as
+  `CLAUDE_CODE_OAUTH_TOKEN` into the subprocess env — enabling headless/container
+  deployments with read-only `~/.claude` mounts to bypass daily 401s. Token never
+  appears in argv or debug traces. Backward compatible: no source → behavior
+  identical to before.
 
 ### Changed
 - **`CopilotProvider(effort=...)` now validates against the canonical scale.**
