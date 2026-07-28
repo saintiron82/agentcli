@@ -360,8 +360,8 @@ results = await ctx.fork_many(
 
 ## Provider 기능 비교
 
-기능은 **provider 마다, 그리고 OS 마다** 다르다(예: claude 는 Windows 에서 세션
-없음). 추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
+기능은 provider 마다 다르고, provider 가 OS 별로 다른 값을 선언할 수도 있다.
+추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
 여기서 되나?"의 단일 진실 소스다:
 
 ```python
@@ -399,7 +399,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 `KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
 
-`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 경로로 spawn하든 CLI가 stdin에서 즉시 EOF를 봅니다 — 일반 프롬프트는 `stdin=DEVNULL`, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30). 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
+`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 spawn 경로도 CLI가 읽을 수 있는 stdin을 열어두지 않습니다 — 서브프로세스 헬퍼가 `stdin=DEVNULL`을 설정하거나, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30)입니다. 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
 
 ### Reasoning 제어
 
@@ -465,7 +465,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 668개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 793개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 

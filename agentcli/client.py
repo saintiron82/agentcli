@@ -481,8 +481,8 @@ class LLMClient:
                     SESSION_KEY_FMT.format(provider=response.provider),
                     response.session_id)
         else:
-            # CLI provider 가 비세션 모드로 동작해도 (예: Windows 의 claude)
-            # 히스토리는 CLI 가 소유 — 대화 내용을 저장하지 않는다.
+            # CLI provider 가 비세션 모드로 동작해도 히스토리는 CLI 가 소유
+            # — 대화 내용을 저장하지 않는다.
             if p is not None and not getattr(p, "stores_history", True):
                 return
             now = datetime.now()
@@ -1044,17 +1044,16 @@ class LLMClient:
     # ---------- capability 제어기 (어느 기능이 어느 provider 에서 되나) ----------
 
     def capabilities(self, provider: str) -> ProviderCapabilities:
-        """provider 가 현재 OS 에서 제공하는 기능 선언. 호출 전 질의용.
+        """provider 가 현재 환경에서 제공하는 기능 선언. 호출 전 질의용.
 
-        OS 의존: 예컨대 claude 세션은 Windows 에서 ``sessions=False`` (issue #4).
+        provider 가 OS 별로 다른 값을 선언하면 그대로 반영된다. 현재 등록된
+        네 provider 는 모두 전 플랫폼 동일 (claude 의 Windows 전용 stateless
+        가드는 issue #27 에서 제거됐다).
         """
         p = self._registry.get(provider)
         if p is None:
             raise ValueError(f"unknown provider: {provider}")
-        notes = ""
-        if p.provider_id == "claude" and not p.supports_sessions:
-            notes = "Windows: stateless — `-p`+`--resume` 데드락 회피 (issue #4)"
-        return p.capabilities(capability_notes=notes)
+        return p.capabilities()
 
     def supports(self, provider: str, feature: str) -> bool:
         """기능/옵션 지원 여부 (예: supports('codex','lean') → False)."""

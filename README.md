@@ -370,8 +370,8 @@ use: durable session handles and usage logs, not conversation history.
 
 ## Provider capabilities
 
-Capabilities differ per provider **and per OS** (e.g. claude has no sessions on
-Windows). Query them before calling instead of guessing — the controller is the
+Capabilities differ per provider, and a provider may declare different values
+per OS. Query them before calling instead of guessing — the controller is the
 source of truth for "does this feature work on this provider here?":
 
 ```python
@@ -413,10 +413,10 @@ version and `call_id`). kiro (ACP) has no debug instrumentation.
 the first call mints a fresh `--session-id`, the library stores it, and later
 calls on the same conversation pass `--resume <sid>`. The resumed session keeps
 the same ID (verified against Claude Code 2.1.x). The earlier Windows hang
-(issue #4) was caused by an interactive **stdin** wait; agentcli hands the CLI
-an immediate EOF on every spawn path — `stdin=DEVNULL` for normal prompts, and
-write-then-close `stdin=PIPE` for prompts over 8,000 UTF-8 bytes (issue #30) —
-so that wait cannot happen. The Windows guard was removed in issue #27 and
+(issue #4) was caused by an interactive **stdin** wait. No spawn path leaves
+stdin open for the CLI to read from: the subprocess helpers set `stdin=DEVNULL`,
+or `stdin=PIPE` written and closed immediately for prompts over 8,000 UTF-8
+bytes (issue #30). So that wait cannot happen. The Windows guard was removed in issue #27 and
 verified end-to-end on Windows 11 / Claude Code 2.1.220 (plain, >8KB-via-stdin,
 and MCP-on resume all keep session continuity without hanging). No conversation
 content is persisted by the library.
@@ -687,7 +687,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-668 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+793 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
@@ -697,7 +697,7 @@ pytest
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
 - Runtime deps: **none**.
-- Tested on macOS. Linux should work (same CLI invocation path); Windows partial (only via `gh copilot` wrapper).
+- Tested on macOS and Windows 11; Linux should work (same CLI invocation path). CI runs ubuntu/macOS. copilot on Windows requires the `gh copilot` wrapper.
 
 ## Documentation
 

@@ -6,15 +6,25 @@ original fix disabled sessions there wholesale
 an interactive **stdin wait**, and agentcli hands the CLI an immediate EOF on
 every spawn path, so the guard was stale and is now removed.
 
-The guard removal only stays correct while that stdin premise holds. It has
-already been dented once: issue #30 moved prompts over 8,000 UTF-8 bytes off
-argv and onto ``stdin=PIPE``, which is a *different* stdin shape than the
-``DEVNULL`` the #27 analysis rested on. It is still safe (write-then-close ⇒
-EOF), but nothing was pinning that down. These tests pin both halves:
+The guard removal only stays correct while that stdin premise holds, and the
+premise was not actually structural when this fix was first written:
 
-1. ``--resume`` is emitted on every platform when a session id is stored.
-2. Neither spawn path ever leaves stdin open for the CLI to read from — the
-   small-prompt path closes it, the large-prompt path writes and closes it.
+- issue #30 moved prompts over 8,000 UTF-8 bytes off argv and onto
+  ``stdin=PIPE``, a *different* stdin shape than the ``DEVNULL`` the analysis
+  rested on (still safe — write-then-close ⇒ EOF — but unpinned), and
+- ``run_subprocess_async`` used to leave ``stdin`` unset when given neither
+  ``input_bytes`` nor ``use_stdin_devnull``, so the child **inherited the
+  parent's stdin**. Measured against a live parent stdin, that reproduced #4
+  exactly: ``timed_out=True, rc=124``. Safety was caller discipline, not an
+  invariant. The helper now always closes stdin it does not write to.
+
+These tests pin all three halves:
+
+1. ``--resume`` is emitted on every platform when a session id is stored —
+   asserted against a **simulated Windows** provider, not merely the host
+   platform, so the check has teeth on a POSIX-only CI matrix.
+2. No spawn path — sync or async — ever leaves stdin open for the CLI to read.
+3. claude's own async call site keeps closing stdin while resuming.
 
 Verified end-to-end on Windows 11 / Claude Code 2.1.220 before merge: plain
 resume, >8KB-via-stdin resume, and MCP-on resume all keep session continuity
@@ -23,14 +33,56 @@ and finish in under 30s.
 Reference: https://github.com/saintiron82/agentcli/issues/27
 """
 
+import asyncio
+import importlib
 import sys
 from unittest.mock import patch
+
+import pytest
 
 from agentcli.providers import base
 from agentcli.providers.base import PROMPT_STDIN_THRESHOLD
 from agentcli.providers.claude import ClaudeProvider
 
 SID = "11111111-2222-3333-4444-555555555555"
+
+
+def _provider_as_if_on(system: str) -> type:
+    """``platform.system()`` 이 *system* 을 보고하는 환경에서의 ClaudeProvider.
+
+    ``supports_sessions`` 는 클래스 정의 시점에 평가되므로 모듈을 reload 해야
+    한다. 이 우회가 없으면 "현재 플랫폼에서의 값"만 단언하게 되는데, 제거된
+    가드는 ``platform.system() != "Windows"`` 였으므로 POSIX 에서는 수정 전
+    코드도 ``True`` 로 평가된다 — 즉 CI(ubuntu/macos)에서 가드를 되돌려도
+    통과해버려 회귀 방어력이 0 이 된다.
+    """
+    import agentcli.providers.claude as claude_mod
+    with patch("platform.system", return_value=system):
+        reloaded = importlib.reload(claude_mod)
+        cls = reloaded.ClaudeProvider
+    importlib.reload(claude_mod)          # 전역 상태 원복
+    return cls
+
+
+@pytest.mark.parametrize("system", ["Windows", "Linux", "Darwin"])
+def test_sessions_enabled_on_every_platform(system):
+    """어느 플랫폼을 보고하든 세션이 켜져 있어야 한다 (#27).
+
+    수정 전 코드에서는 system="Windows" 일 때 False 라 이 테스트가 실패한다 —
+    POSIX 전용 CI 에서도 가드 회귀를 잡아내는 것이 요점이다.
+    """
+    assert _provider_as_if_on(system).supports_sessions is True
+
+
+def test_resume_emitted_on_simulated_windows():
+    """시뮬레이션된 Windows 에서도 ``--resume`` 이 실제로 붙는다."""
+    cls = _provider_as_if_on("Windows")
+    with patch.object(cls, "_find_binary", return_value="/usr/bin/claude"):
+        cmd, used_sid = cls()._build_cmd(
+            prompt="hello", model="", session_id=SID, output_format="json")
+    assert cmd is not None
+    assert "--resume" in cmd and cmd[cmd.index("--resume") + 1] == SID
+    assert used_sid == SID
 
 
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary",
@@ -121,3 +173,87 @@ def test_stdin_devnull_path_reaches_eof_immediately():
     assert not timed_out
     assert rc == 0
     assert stdout.decode() == "read:0"
+
+
+# ---- async 경로: 회귀가 실제로 가능한 쪽 ----
+
+@pytest.mark.parametrize("kwargs,expected", [
+    ({}, "DEVNULL"),                          # 기본값 — 예전엔 부모 stdin 상속
+    ({"use_stdin_devnull": True}, "DEVNULL"),
+    ({"input_bytes": b"payload"}, "PIPE"),
+])
+def test_async_spawn_never_inherits_stdin(kwargs, expected):
+    """``run_subprocess_async`` 는 어떤 인자 조합에서도 stdin 을 상속하지 않는다.
+
+    예전 기본값은 ``stdin`` 키를 아예 설정하지 않아 부모 stdin 을 물려줬고,
+    부모 stdin 이 살아 있으면 자식이 거기서 대기했다(#4 의 hang 조건).
+    """
+    captured = {}
+
+    async def fake_exec(*cmd, **kw):
+        captured.update(kw)
+        raise FileNotFoundError("stop here — kwargs 만 확인한다")
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            with pytest.raises(FileNotFoundError):
+                await base.run_subprocess_async(["x"], timeout=5, **kwargs)
+
+    asyncio.run(run())
+    want = getattr(asyncio.subprocess, expected)
+    assert captured.get("stdin") == want, (
+        f"stdin={captured.get('stdin')!r} — 상속(미설정)은 #4 를 되살린다")
+
+
+def test_async_default_child_reaches_eof():
+    """기본 인자로도 stdin 을 읽는 실제 자식이 EOF 를 보고 정상 종료한다."""
+    async def run():
+        return await base.run_subprocess_async(
+            [sys.executable, "-c", _READ_STDIN], timeout=30)
+
+    stdout, _stderr, rc, timed_out = asyncio.run(run())
+    assert not timed_out, "stdin 이 열린 채라 자식이 EOF 를 못 봤다 (#4 재발)"
+    assert rc == 0
+    assert stdout.decode() == "read:0"
+
+
+def test_claude_async_call_site_closes_stdin_while_resuming():
+    """claude 의 ``invoke_async`` 도 resume 하면서 stdin 을 닫는다.
+
+    #27 의 안전 논거는 claude 의 *모든* spawn 경로에 걸린다. sync 만 고정하면
+    async 호출부가 플래그를 빠뜨리는 회귀를 놓친다.
+    """
+    from agentcli.types import Message
+    payload = ('{"type":"result","subtype":"success","result":"ok",'
+               '"session_id":"' + SID + '"}')
+
+    async def fake_run(cmd, **kw):
+        fake_run.cmd, fake_run.kw = cmd, kw
+        return payload.encode(), b"", 0, False
+
+    async def run():
+        with patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+                   return_value="/usr/bin/claude"), \
+             patch("agentcli.providers.claude.run_subprocess_async", fake_run):
+            await ClaudeProvider().invoke_async(
+                [Message(role="user", content="hi")], session_id=SID)
+
+    asyncio.run(run())
+    assert "--resume" in fake_run.cmd
+    assert fake_run.kw.get("use_stdin_devnull") is True
+    assert fake_run.kw.get("input_bytes") is None
+
+    # 대형 프롬프트 async 경로: stdin=PIPE(write-then-close) + resume 유지.
+    big = "x" * (PROMPT_STDIN_THRESHOLD + 1000)
+
+    async def run_big():
+        with patch("agentcli.providers.claude.ClaudeProvider._find_binary",
+                   return_value="/usr/bin/claude"), \
+             patch("agentcli.providers.claude.run_subprocess_async", fake_run):
+            await ClaudeProvider().invoke_async(
+                [Message(role="user", content=big)], session_id=SID)
+
+    asyncio.run(run_big())
+    assert "--resume" in fake_run.cmd
+    assert fake_run.kw.get("use_stdin_devnull") is False
+    assert big.encode("utf-8") in fake_run.kw.get("input_bytes")

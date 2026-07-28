@@ -21,9 +21,12 @@
 - **Claude session resume now works on Windows too (issue #27).** The Windows
   `supports_sessions=False` guard (added for the issue #4 `-p` + `--resume`
   5-minute hang) is removed. Root cause of #4 was an interactive **stdin** wait;
-  every claude spawn closes or EOF-terminates stdin (`DEVNULL` for normal
-  prompts, write-then-close `PIPE` for prompts over 8,000 UTF-8 bytes since
-  issue #30), so the hang can't occur. `ClaudeProvider.supports_sessions` is now
+  no spawn path leaves stdin open for the CLI to read from — the subprocess
+  helpers set `DEVNULL`, or `PIPE` written and closed for prompts over 8,000
+  UTF-8 bytes (issue #30) — so the hang can't occur. `run_subprocess_async`
+  used to inherit the parent's stdin when given neither, which reproduced the
+  #4 hang against a live parent stdin (`timed_out=True, rc=124`); it now
+  always closes stdin it does not write to, matching the sync helper. `ClaudeProvider.supports_sessions` is now
   `True` on every platform, so `owner`+`alias` session reuse (and `ContextSession`
   pin-then-`refine`) works on Windows — no more re-sending the context every
   call. Stale sessions still fall back to a fresh session via the
