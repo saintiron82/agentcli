@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 — unreleased
+## 0.7.0 — 2026-07-28
 
 ### Added
 - **Normalized reasoning controls.** First-class `effort` (minimal…max) and
