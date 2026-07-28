@@ -1,6 +1,7 @@
-"""issue #48 상주(warm) 워커 단위 테스트 — 실제 claude CLI 없이 도는 hermetic 테스트.
+"""issue #48 상주(warm) 모드 — 실제 claude CLI 없이 도는 hermetic 테스트.
 
-실측으로 확인한 계약을 고정한다. 각 단언 옆의 근거는 모듈 docstring 참고.
+지원 범위는 "상주 모드로 열고 session_id 를 넘겨준다" 이다. 실측으로 확인한
+계약과 그 범위 경계를 고정한다.
 """
 
 import asyncio
@@ -10,8 +11,8 @@ from unittest.mock import patch
 import pytest
 
 from agentcli.providers import warm
-from agentcli.providers.warm import (CLEAR_COMMAND, TurnResult, WarmSession,
-                                     WarmSessionError, build_warm_cmd)
+from agentcli.providers.warm import (WarmSession, WarmSessionError,
+                                     build_warm_cmd, open_warm)
 
 
 # ---- 가짜 claude 프로세스 ----
@@ -56,14 +57,17 @@ class _FakeProc:
     def __init__(self, turns):
         self.returncode = None
         self.pid = 4242
-        self._written: list[dict] = []
+        self.written: list[dict] = []
         self.stdout = _FakeStream(turns)
         self.stderr = _FakeStream([])
-        self.stdin = _FakeStdin(self._written)
+        self.stdin = _FakeStdin(self.written)
+        original = self.stdin.write
 
-    @property
-    def written(self):
-        return self._written
+        def write_and_arm(data):
+            original(data)
+            self.stdout.feed_next_turn()     # 쓰기에 대한 응답을 준비
+
+        self.stdin.write = write_and_arm
 
     async def wait(self):
         self.returncode = 0
@@ -73,10 +77,11 @@ class _FakeProc:
         self.returncode = -9
 
 
-def _result(sid, *, duration_ms=1500, duration_api_ms=9999, is_error=False):
-    return {"type": "result", "subtype": "success", "session_id": sid,
-            "duration_ms": duration_ms, "duration_api_ms": duration_api_ms,
-            "is_error": is_error}
+def _result(sid, **kw):
+    evt = {"type": "result", "subtype": "success", "session_id": sid,
+           "duration_ms": 1500}
+    evt.update(kw)
+    return evt
 
 
 def _delta(text):
@@ -86,21 +91,13 @@ def _delta(text):
 
 
 def _session_with(turns, **kw):
-    """가짜 프로세스를 물린 WarmSession 와 그 프로세스를 함께 돌려준다."""
     proc = _FakeProc(turns)
 
     async def fake_exec(*cmd, **kwargs):
         return proc
 
-    w = WarmSession(binary="/usr/bin/claude", **kw)
-    original_write = proc.stdin.write
-
-    def write_and_arm(data):
-        original_write(data)
-        proc.stdout.feed_next_turn()      # 쓰기에 대한 응답을 준비
-
-    proc.stdin.write = write_and_arm
-    return w, proc, fake_exec
+    s = WarmSession(cmd=["/usr/bin/claude", "--print"], **kw)
+    return s, proc, fake_exec
 
 
 # ---- 기동 argv ----
@@ -109,13 +106,13 @@ def test_stream_json_requires_verbose():
     """``--output-format stream-json`` 은 ``--verbose`` 없이는 CLI 가 거부한다.
 
     실측: "When using --print, --output-format=stream-json requires --verbose".
-    플래그를 빼면 프로세스가 즉시 죽으므로 argv 에서 고정한다.
+    빠지면 프로세스가 즉시 죽으므로 argv 에서 고정한다.
     """
     cmd = build_warm_cmd(binary="claude")
     assert "--verbose" in cmd
     assert cmd[cmd.index("--output-format") + 1] == "stream-json"
     assert cmd[cmd.index("--input-format") + 1] == "stream-json"
-    assert "--print" in cmd
+    assert "--print" in cmd and "--include-partial-messages" in cmd
 
 
 def test_lean_is_the_default():
@@ -126,8 +123,8 @@ def test_lean_is_the_default():
     assert "--safe-mode" not in build_warm_cmd(binary="claude", lean=False)
 
 
-def test_append_system_prompt_and_resume_are_wired():
-    """고정 컨텍스트는 ``--append-system-prompt`` 자리(=``/clear`` 생존)에 간다."""
+def test_fixed_context_and_resume_are_wired():
+    """고정 컨텍스트는 ``--append-system-prompt``(``/clear`` 생존) 자리로 간다."""
     cmd = build_warm_cmd(binary="claude", append_system_prompt="RULES",
                          resume_session_id="sid-1", model="claude-sonnet-4-6")
     assert cmd[cmd.index("--append-system-prompt") + 1] == "RULES"
@@ -135,80 +132,77 @@ def test_append_system_prompt_and_resume_are_wired():
     assert cmd[cmd.index("--model") + 1] == "claude-sonnet-4-6"
 
 
-# ---- 턴 ----
+def test_open_warm_requires_a_binary():
+    with patch.object(warm, "_find_claude", return_value=None):
+        with pytest.raises(WarmSessionError, match="not found"):
+            asyncio.run(open_warm())
 
-def test_ask_collects_deltas_and_result():
-    w, proc, fake_exec = _session_with([
+
+# ---- 주고받기 ----
+
+def test_send_returns_text_and_writes_stream_json_user_message():
+    s, proc, fake_exec = _session_with([
         [{"type": "system", "subtype": "init", "session_id": "s1"},
-         _delta("ZEBRA-"), _delta("4417"),
-         _result("s1", duration_ms=1234)],
+         _delta("ZEBRA-"), _delta("4417"), _result("s1")],
     ])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            return await w.ask("What is the password?")
+            return await s.send("What is the password?")
 
-    r: TurnResult = asyncio.run(run())
-    assert r.text == "ZEBRA-4417"
-    assert r.session_id == "s1"
-    assert r.is_error is False
-    # stdin 으로 나간 것은 stream-json user 메시지 한 줄.
+    assert asyncio.run(run()) == "ZEBRA-4417"
     assert proc.written == [
         {"type": "user", "message": {"role": "user",
                                      "content": "What is the password?"}}]
 
 
-def test_turn_cost_uses_duration_ms_not_cumulative_api_ms():
-    """턴 비용은 ``duration_ms``(턴별) — ``duration_api_ms`` 는 누적이라 못 쓴다.
+def test_stream_yields_project_standard_chunks():
+    """상주 경로가 별도 청크 계약을 만들지 않는다 — 기존 정규화를 재사용한다."""
+    from agentcli.types import STREAM_CHUNK_TYPES
 
-    실측에서 첫 턴 ``duration_api_ms`` 가 부팅 중 API 호출을 흡수해 2턴째 델타가
-    벽시계를 넘겼다(2701 vs duration_ms 1663).
-    """
-    w, _proc, fake_exec = _session_with([
-        [_delta("a"), _result("s1", duration_ms=1663, duration_api_ms=2701)],
-        [_delta("b"), _result("s1", duration_ms=2687, duration_api_ms=5383)],
+    s, _proc, fake_exec = _session_with([
+        [_delta("hi "), _delta("there"), _result("s1")],
     ])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            return await w.ask("q1"), await w.ask("q2")
+            return [c async for c in s.stream("q")]
 
-    r1, r2 = asyncio.run(run())
-    assert r1.turn_ms == 1663
-    assert r2.turn_ms == 2687, "누적 api_ms 델타(2682)가 아니라 턴별 duration_ms"
+    chunks = asyncio.run(run())
+    assert all(c.type in STREAM_CHUNK_TYPES for c in chunks)
+    assert "".join(c.content for c in chunks if c.type == "text") == "hi there"
+    done = chunks[-1]
+    assert done.type == "done" and done.session_id == "s1"
 
 
-def test_boot_cost_is_first_turn_wall_minus_duration_ms():
-    w, _proc, fake_exec = _session_with([
-        [_delta("ok"), _result("s1", duration_ms=0)],
-    ])
+def test_stream_reports_failure_as_error_chunk():
+    """스트림 도중 세션이 죽으면 예외가 아니라 error 청크로 알린다."""
+    s, _proc, fake_exec = _session_with([])       # 응답 없음 → 즉시 EOF
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("q")
+            return [c async for c in s.stream("q")]
 
-    asyncio.run(run())
-    assert w.boot_seconds is not None and w.boot_seconds >= 0
-    assert w.turns == 1
+    chunks = asyncio.run(run())
+    assert chunks[-1].type == "error" and "EOF" in chunks[-1].content
 
 
 def test_dead_process_raises_instead_of_hanging():
-    """stdout EOF = 프로세스 사망. 조용히 매달리지 말고 즉시 에러."""
-    w, _proc, fake_exec = _session_with([])      # 응답 없음 → 즉시 EOF
+    s, _proc, fake_exec = _session_with([])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("q")
+            await s.send("q")
 
     with pytest.raises(WarmSessionError, match="EOF"):
         asyncio.run(run())
 
 
 def test_turn_timeout_is_bounded():
-    """상주 경로는 stdin 을 열어두므로 #4 류 무한 대기의 상한이 필요하다."""
+    """상주 모드는 stdin 을 열어두는 유일한 경로 — #4 류 무한 대기의 상한이 필요하다."""
     proc = _FakeProc([])
 
-    async def never(*a, **k):          # 응답이 영원히 안 오는 stdout
+    async def never(*a, **k):
         await asyncio.sleep(3600)
 
     proc.stdout.readline = never
@@ -216,148 +210,97 @@ def test_turn_timeout_is_bounded():
     async def fake_exec(*cmd, **kwargs):
         return proc
 
-    w = WarmSession(binary="/usr/bin/claude", boot_timeout=0.3)
+    s = WarmSession(cmd=["/usr/bin/claude"], turn_timeout=0.3)
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("q")
+            await s.send("q")
 
     with pytest.raises(WarmSessionError, match="타임아웃"):
         asyncio.run(run())
 
 
-# ---- 격리 (/clear) ----
-
-def test_clear_succeeds_when_session_id_changes():
-    """``/clear`` 성공 판정은 session_id 변화 — 본문으로는 알 수 없다."""
-    w, proc, fake_exec = _session_with([
-        [_delta("hi"), _result("s1")],
-        [_result("s2", duration_ms=0)],        # /clear 턴: 본문 없음, 새 sid
-    ])
-
-    async def run():
-        with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("seed")
-            return await w.clear()
-
-    assert asyncio.run(run()) is True
-    assert w.session_id == "s2"
-    assert proc.written[-1]["message"]["content"] == CLEAR_COMMAND
-
-
-def test_clear_fails_when_session_id_unchanged():
-    """sid 가 그대로면 컨텍스트가 남았을 수 있다 — 재사용 금지 신호(False)."""
-    w, _proc, fake_exec = _session_with([
-        [_delta("hi"), _result("s1")],
-        [_result("s1", duration_ms=0)],        # sid 그대로
-    ])
-
-    async def run():
-        with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("seed")
-            return await w.clear()
-
-    assert asyncio.run(run()) is False, (
-        "sid 미변화를 성공으로 보면 이전 질의 컨텍스트가 다음 질의로 샌다")
-
-
-def test_clear_reports_failure_instead_of_raising():
-    """워커가 죽어 있어도 clear() 는 False 를 돌려 호출자가 폐기하게 한다."""
-    w, _proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]])
-
-    async def run():
-        with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("seed")
-            return await w.clear()       # 다음 턴 응답 없음 → EOF
-
-    assert asyncio.run(run()) is False
-
-
-# ---- 직렬화 ----
-
 def test_turns_are_serialized():
-    """상주 1개 = 직렬. 겹쳐 부르면 이전 턴의 result 까지 기다린다."""
-    w, proc, fake_exec = _session_with([
+    """상주 세션 하나는 직렬 — 겹쳐 부르면 이전 턴의 result 까지 기다린다."""
+    s, proc, fake_exec = _session_with([
         [_delta("1"), _result("s1")],
         [_delta("2"), _result("s1")],
     ])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            return await asyncio.gather(w.ask("a"), w.ask("b"))
+            return await asyncio.gather(s.send("a"), s.send("b"))
 
     r1, r2 = asyncio.run(run())
-    assert {r1.text, r2.text} == {"1", "2"}
+    assert {r1, r2} == {"1", "2"}
     assert [m["message"]["content"] for m in proc.written] == ["a", "b"]
 
 
-def test_missing_binary_raises_clearly():
-    with patch.object(warm, "_find_claude", return_value=None):
-        w = WarmSession()
+# ---- session_id: 라이브러리가 넘겨주는 유일한 것 ----
 
-        async def run():
-            await w.start()
-
-        with pytest.raises(WarmSessionError, match="not found"):
-            asyncio.run(run())
-
-
-# ---- 소비자에게 넘기는 관측 사실 (프로세스 제어는 라이브러리 밖) ----
-
-def test_handle_exposes_facts_for_consumer_owned_persistence():
-    """라이브러리는 핸들을 노출만 하고 저장하지 않는다.
-
-    재기동 후 잔여 워커 탐색·종료는 배포·감독 영역이라 소비자 몫이다. 라이브러리가
-    전역 파일·DB 를 갖거나 남의 프로세스를 조회·종료하면 안 된다.
-    """
-    w, proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]],
-                                      cwd="/tmp/work")
-
-    async def run():
-        with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("q")
-            return w.handle
-
-    h = asyncio.run(run())
-    assert h.session_id == "s1"
-    assert h.cwd == "/tmp/work"
-    assert h.argv[0] == "/usr/bin/claude" and "--verbose" in h.argv
-    assert h.spawned_at is not None
-    assert h.pid == proc.pid
-
-
-def test_handle_session_id_follows_clear():
-    """``/clear`` 로 sid 가 바뀌면 핸들도 새 값을 낸다 — 소비자는 갱신 저장해야 한다."""
-    w, _proc, fake_exec = _session_with([
+def test_session_id_is_exposed_and_follows_clear():
+    """``/clear`` 는 정책이 아니라 그냥 보내는 메시지 — sid 가 바뀌는 걸로 확인한다."""
+    s, proc, fake_exec = _session_with([
         [_delta("hi"), _result("s1")],
-        [_result("s2", duration_ms=0)],
+        [_result("s2", duration_ms=0)],       # /clear 턴: 본문 없음, 새 sid
     ])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
-            await w.ask("seed")
-            before = w.handle.session_id
-            await w.clear()
-            return before, w.handle.session_id
+            await s.send("seed")
+            before = s.session_id
+            await s.send("/clear")
+            return before, s.session_id
 
     before, after = asyncio.run(run())
-    assert (before, after) == ("s1", "s2")
+    assert (before, after) == ("s1", "s2"), (
+        "sid 가 안 바뀌면 이전 질의 컨텍스트가 다음 질의로 샐 수 있다")
+    assert proc.written[-1]["message"]["content"] == "/clear"
 
 
-def test_library_exposes_no_process_control_surface():
-    """라이브러리가 프로세스를 조회·종료하는 공개 수단을 갖지 않는다.
+def test_close_is_idempotent():
+    s, proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]])
 
-    "직접 제어는 하지 않는다"는 경계를 회귀로 고정한다. 자기가 띄운 워커를 닫는
-    ``close()`` 는 자기 자원 정리라 예외다.
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            await s.send("q")
+            assert s.alive()
+            await s.close()
+            await s.close()
+
+    asyncio.run(run())
+    assert not s.alive()
+    assert proc.stdin.closed
+
+
+def test_async_context_manager_closes():
+    s, proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]])
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            async with s:
+                await s.send("q")
+
+    asyncio.run(run())
+    assert not s.alive()
+
+
+# ---- 범위 경계 ----
+
+def test_library_does_not_manage_processes_or_pools():
+    """지원 범위는 상주 모드로 열고 session_id 를 넘겨주는 것까지다.
+
+    운용(풀링·동시성 배분·감독·재기동 후 잔여 프로세스 정리)은 서비스의 일이고,
+    라이브러리가 전역 파일·DB 를 갖거나 남의 프로세스를 조회·종료해서도 안 된다.
+    편의를 이유로 이 표면이 다시 생기면 여기서 걸린다.
     """
     banned = {
         # 프로세스 직접 제어
         "terminate", "kill_residual", "sweep", "process_matches",
         "registry", "WarmRegistry", "adopt", "reattach",
-        # 풀링·동시성·감독 — 어떻게 쓸지는 서비스의 일
+        # 풀링·동시성·감독
         "WarmPool", "Pool", "acquire", "release", "supervise",
         "Supervisor", "restart_dead", "scale",
     }
-    assert banned.isdisjoint(dir(warm)), (
-        "상주 세션 하나의 제어만 지원한다 — 풀링·감독·잔여 프로세스 정리는 "
-        "소비자(서비스) 책임이다")
+    assert banned.isdisjoint(dir(warm))
+    assert banned.isdisjoint(dir(WarmSession))
