@@ -10,8 +10,8 @@ from unittest.mock import patch
 import pytest
 
 from agentcli.providers import warm
-from agentcli.providers.warm import (CLEAR_COMMAND, TurnResult, WarmWorker,
-                                     WarmWorkerError, build_warm_cmd)
+from agentcli.providers.warm import (CLEAR_COMMAND, TurnResult, WarmSession,
+                                     WarmSessionError, build_warm_cmd)
 
 
 # ---- 가짜 claude 프로세스 ----
@@ -85,14 +85,14 @@ def _delta(text):
                       "delta": {"type": "text_delta", "text": text}}}
 
 
-def _worker_with(turns, **kw):
-    """가짜 프로세스를 물린 WarmWorker 와 그 프로세스를 함께 돌려준다."""
+def _session_with(turns, **kw):
+    """가짜 프로세스를 물린 WarmSession 와 그 프로세스를 함께 돌려준다."""
     proc = _FakeProc(turns)
 
     async def fake_exec(*cmd, **kwargs):
         return proc
 
-    w = WarmWorker(binary="/usr/bin/claude", **kw)
+    w = WarmSession(binary="/usr/bin/claude", **kw)
     original_write = proc.stdin.write
 
     def write_and_arm(data):
@@ -138,7 +138,7 @@ def test_append_system_prompt_and_resume_are_wired():
 # ---- 턴 ----
 
 def test_ask_collects_deltas_and_result():
-    w, proc, fake_exec = _worker_with([
+    w, proc, fake_exec = _session_with([
         [{"type": "system", "subtype": "init", "session_id": "s1"},
          _delta("ZEBRA-"), _delta("4417"),
          _result("s1", duration_ms=1234)],
@@ -164,7 +164,7 @@ def test_turn_cost_uses_duration_ms_not_cumulative_api_ms():
     실측에서 첫 턴 ``duration_api_ms`` 가 부팅 중 API 호출을 흡수해 2턴째 델타가
     벽시계를 넘겼다(2701 vs duration_ms 1663).
     """
-    w, _proc, fake_exec = _worker_with([
+    w, _proc, fake_exec = _session_with([
         [_delta("a"), _result("s1", duration_ms=1663, duration_api_ms=2701)],
         [_delta("b"), _result("s1", duration_ms=2687, duration_api_ms=5383)],
     ])
@@ -179,7 +179,7 @@ def test_turn_cost_uses_duration_ms_not_cumulative_api_ms():
 
 
 def test_boot_cost_is_first_turn_wall_minus_duration_ms():
-    w, _proc, fake_exec = _worker_with([
+    w, _proc, fake_exec = _session_with([
         [_delta("ok"), _result("s1", duration_ms=0)],
     ])
 
@@ -194,13 +194,13 @@ def test_boot_cost_is_first_turn_wall_minus_duration_ms():
 
 def test_dead_process_raises_instead_of_hanging():
     """stdout EOF = 프로세스 사망. 조용히 매달리지 말고 즉시 에러."""
-    w, _proc, fake_exec = _worker_with([])      # 응답 없음 → 즉시 EOF
+    w, _proc, fake_exec = _session_with([])      # 응답 없음 → 즉시 EOF
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
             await w.ask("q")
 
-    with pytest.raises(WarmWorkerError, match="EOF"):
+    with pytest.raises(WarmSessionError, match="EOF"):
         asyncio.run(run())
 
 
@@ -216,13 +216,13 @@ def test_turn_timeout_is_bounded():
     async def fake_exec(*cmd, **kwargs):
         return proc
 
-    w = WarmWorker(binary="/usr/bin/claude", boot_timeout=0.3)
+    w = WarmSession(binary="/usr/bin/claude", boot_timeout=0.3)
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
             await w.ask("q")
 
-    with pytest.raises(WarmWorkerError, match="타임아웃"):
+    with pytest.raises(WarmSessionError, match="타임아웃"):
         asyncio.run(run())
 
 
@@ -230,7 +230,7 @@ def test_turn_timeout_is_bounded():
 
 def test_clear_succeeds_when_session_id_changes():
     """``/clear`` 성공 판정은 session_id 변화 — 본문으로는 알 수 없다."""
-    w, proc, fake_exec = _worker_with([
+    w, proc, fake_exec = _session_with([
         [_delta("hi"), _result("s1")],
         [_result("s2", duration_ms=0)],        # /clear 턴: 본문 없음, 새 sid
     ])
@@ -247,7 +247,7 @@ def test_clear_succeeds_when_session_id_changes():
 
 def test_clear_fails_when_session_id_unchanged():
     """sid 가 그대로면 컨텍스트가 남았을 수 있다 — 재사용 금지 신호(False)."""
-    w, _proc, fake_exec = _worker_with([
+    w, _proc, fake_exec = _session_with([
         [_delta("hi"), _result("s1")],
         [_result("s1", duration_ms=0)],        # sid 그대로
     ])
@@ -263,7 +263,7 @@ def test_clear_fails_when_session_id_unchanged():
 
 def test_clear_reports_failure_instead_of_raising():
     """워커가 죽어 있어도 clear() 는 False 를 돌려 호출자가 폐기하게 한다."""
-    w, _proc, fake_exec = _worker_with([[_delta("hi"), _result("s1")]])
+    w, _proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]])
 
     async def run():
         with patch("asyncio.create_subprocess_exec", fake_exec):
@@ -277,7 +277,7 @@ def test_clear_reports_failure_instead_of_raising():
 
 def test_turns_are_serialized():
     """상주 1개 = 직렬. 겹쳐 부르면 이전 턴의 result 까지 기다린다."""
-    w, proc, fake_exec = _worker_with([
+    w, proc, fake_exec = _session_with([
         [_delta("1"), _result("s1")],
         [_delta("2"), _result("s1")],
     ])
@@ -293,12 +293,12 @@ def test_turns_are_serialized():
 
 def test_missing_binary_raises_clearly():
     with patch.object(warm, "_find_claude", return_value=None):
-        w = WarmWorker()
+        w = WarmSession()
 
         async def run():
             await w.start()
 
-        with pytest.raises(WarmWorkerError, match="not found"):
+        with pytest.raises(WarmSessionError, match="not found"):
             asyncio.run(run())
 
 
@@ -310,7 +310,7 @@ def test_handle_exposes_facts_for_consumer_owned_persistence():
     재기동 후 잔여 워커 탐색·종료는 배포·감독 영역이라 소비자 몫이다. 라이브러리가
     전역 파일·DB 를 갖거나 남의 프로세스를 조회·종료하면 안 된다.
     """
-    w, proc, fake_exec = _worker_with([[_delta("hi"), _result("s1")]],
+    w, proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]],
                                       cwd="/tmp/work")
 
     async def run():
@@ -328,7 +328,7 @@ def test_handle_exposes_facts_for_consumer_owned_persistence():
 
 def test_handle_session_id_follows_clear():
     """``/clear`` 로 sid 가 바뀌면 핸들도 새 값을 낸다 — 소비자는 갱신 저장해야 한다."""
-    w, _proc, fake_exec = _worker_with([
+    w, _proc, fake_exec = _session_with([
         [_delta("hi"), _result("s1")],
         [_result("s2", duration_ms=0)],
     ])
@@ -350,7 +350,14 @@ def test_library_exposes_no_process_control_surface():
     "직접 제어는 하지 않는다"는 경계를 회귀로 고정한다. 자기가 띄운 워커를 닫는
     ``close()`` 는 자기 자원 정리라 예외다.
     """
-    banned = {"terminate", "kill_residual", "sweep", "process_matches",
-              "registry", "WarmRegistry", "adopt", "reattach"}
+    banned = {
+        # 프로세스 직접 제어
+        "terminate", "kill_residual", "sweep", "process_matches",
+        "registry", "WarmRegistry", "adopt", "reattach",
+        # 풀링·동시성·감독 — 어떻게 쓸지는 서비스의 일
+        "WarmPool", "Pool", "acquire", "release", "supervise",
+        "Supervisor", "restart_dead", "scale",
+    }
     assert banned.isdisjoint(dir(warm)), (
-        "잔여 프로세스 탐색·종료는 소비자(서비스) 책임이다")
+        "상주 세션 하나의 제어만 지원한다 — 풀링·감독·잔여 프로세스 정리는 "
+        "소비자(서비스) 책임이다")

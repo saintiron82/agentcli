@@ -26,20 +26,37 @@ issue #48. ``claude -p`` 는 호출마다 하네스를 새로 부팅해, 최소 
   (2701 vs duration_ms 1663). 턴 계측에는 쓰지 않는다.
 - ``/clear`` 는 재부팅 없이 컨텍스트를 지우지만 **새 session_id 를 발급**한다.
   응답 본문이 비어 있어 성공 여부를 내용으로 판정할 수 없으므로, 이 모듈은
-  **session_id 가 바뀌었는지**로 판정한다 (바뀌지 않으면 워커를 폐기한다 —
-  풀 워커가 질의 사이에 컨텍스트를 흘리면 교차 질의 유출이다).
+  **session_id 가 바뀌었는지**로 판정한다 (바뀌지 않으면 세션을 폐기한다 —
+  여러 질의를 오가는 세션가 질의 사이에 컨텍스트를 흘리면 교차 질의 유출이다).
 - ``--append-system-prompt`` 로 넣은 고정 컨텍스트는 ``/clear`` 를 살아남는다.
   따라서 "시스템 + 고정 컨텍스트는 유지, 직전 Q&A 는 미상속"이 한 프로세스
   안에서 성립한다.
 - tools 를 켜두면 ``/clear`` 이후 모델이 툴로 헤매 턴당 지연이 3~9배로 뛴다.
-  그래서 상주 워커는 lean(``--safe-mode --tools ""``) 을 기본값으로 쓴다.
+  그래서 상주 세션는 lean(``--safe-mode --tools ""``) 을 기본값으로 쓴다.
+
+## 범위 — 이 모듈이 하는 일과 하지 않는 일
+
+이 모듈이 지원하는 것은 **상주 세션 하나의 제어**뿐이다: 기동 · 턴 주고받기 ·
+``/clear`` 격리 · 종료 · 관측 사실(:class:`WarmHandle`) 노출.
+
+그것을 어떻게 쓸지는 서비스의 일이다. 아래는 의도적으로 넣지 않는다.
+
+- 세션 풀링 · 동시성 배분 · 오버플로 정책 (상주 세션 하나는 직렬이다 — 병렬이
+  필요하면 서비스가 여러 개를 띄우고 배분한다)
+- liveness 감시 · 자동 재기동 · 감독자
+- 재기동 후 잔여 프로세스 탐색 · 종료 · 이어받기
+- 그 무엇을 위한 전역 파일이나 DB (agentcli 는 저장소를 스스로 고르지 않는다)
+
+라이브러리가 프로세스 수명을 통제하면 배포·감독 계층(오케스트레이터·서비스
+매니저)과 이중으로 겹치고, 전역 상태를 갖는 순간 서로 다른 소비자가 상대의
+프로세스를 건드릴 수 있다.
 
 ## stdin 계약 주의 (issue #27 과의 관계)
 
 #27 의 안전 논거는 "어느 spawn 경로도 CLI 가 읽을 stdin 을 열어두지 않는다"
 였고, ``run_subprocess_async`` 기본값까지 그렇게 바꿔 구조적 불변식으로 만들었다.
 **상주 모드는 그 불변식을 의도적으로 깨는 유일한 경로**다 — stdin 을 열어둔 채
-JSON 메시지를 계속 쓰는 것이 이 기능의 본질이기 때문이다. 그래서 상주 워커는
+JSON 메시지를 계속 쓰는 것이 이 기능의 본질이기 때문이다. 그래서 상주 세션는
 공용 헬퍼를 쓰지 않고 여기서 직접 spawn 하며, issue #4 류 hang 은 이 경로에서
 독립적으로 확인해야 한다(턴별 ``turn_timeout`` 이 상한 역할을 한다).
 """
@@ -66,12 +83,12 @@ _LEAN_FLAGS = ("--safe-mode", "--tools", "")
 CLEAR_COMMAND = "/clear"
 
 
-class WarmWorkerError(RuntimeError):
-    """상주 워커가 더 이상 신뢰할 수 없는 상태 — 호출자는 폐기 후 재기동한다."""
+class WarmSessionError(RuntimeError):
+    """상주 세션가 더 이상 신뢰할 수 없는 상태 — 호출자는 폐기 후 재기동한다."""
 
 
 @dataclass(frozen=True)
-class WorkerHandle:
+class WarmHandle:
     """이 워커에 대해 라이브러리가 **관측한 사실**. 순수 데이터다.
 
     프로세스 수명 통제(재기동 후 잔여 워커 탐색·종료·이어받기)는 배포·감독
@@ -153,11 +170,12 @@ def build_warm_cmd(*, binary: str,
     return cmd
 
 
-class WarmWorker:
+class WarmSession:
     """상주 claude 프로세스 하나. **직렬** — 한 번에 한 턴만 처리한다.
 
-    다음 stdin 쓰기는 이전 턴의 ``result`` 이벤트까지 기다린다. 동시성이 필요하면
-    :class:`WarmPool` 로 워커를 여러 개 둔다.
+    다음 stdin 쓰기는 이전 턴의 ``result`` 이벤트까지 기다린다. 병렬이 필요하면
+    **서비스가** 이 객체를 여러 개 띄우고 배분한다 — 풀·오버플로·감독은 이
+    라이브러리의 범위가 아니다(모듈 docstring 의 "범위" 참고).
     """
 
     def __init__(self, *, lean: bool = True,
@@ -208,13 +226,13 @@ class WarmWorker:
         return self._boot_s
 
     @property
-    def handle(self) -> WorkerHandle:
-        """소비자가 자기 저장소에 넣을 수 있는 관측 사실 (:class:`WorkerHandle`).
+    def handle(self) -> WarmHandle:
+        """소비자가 자기 저장소에 넣을 수 있는 관측 사실 (:class:`WarmHandle`).
 
         이 라이브러리는 이 값을 어디에도 저장하지 않는다 — 영속화·재기동 후
         정리 정책은 전적으로 소비자 몫이다.
         """
-        return WorkerHandle(
+        return WarmHandle(
             pid=self._proc.pid if self._proc is not None else None,
             session_id=self._session_id,
             argv=tuple(self._cmd),
@@ -228,7 +246,7 @@ class WarmWorker:
         if self._proc is not None:
             return
         if not self._binary:
-            raise WarmWorkerError("claude CLI not found on PATH")
+            raise WarmSessionError("claude CLI not found on PATH")
         kwargs: dict = {
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
@@ -299,23 +317,23 @@ class WarmWorker:
                 proc.stdin.write(payload.encode("utf-8") + b"\n")
                 await proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as exc:
-                raise WarmWorkerError(f"상주 워커 stdin 쓰기 실패: {exc}") from exc
+                raise WarmSessionError(f"상주 세션 stdin 쓰기 실패: {exc}") from exc
 
             deadline = t0 + limit
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise WarmWorkerError(
-                        f"상주 워커 턴 타임아웃 ({limit}s) — stderr: "
+                    raise WarmSessionError(
+                        f"상주 세션 턴 타임아웃 ({limit}s) — stderr: "
                         f"{''.join(self._stderr_tail[-5:])[:400]}")
                 try:
                     line = await asyncio.wait_for(
                         proc.stdout.readline(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    raise WarmWorkerError(f"상주 워커 턴 타임아웃 ({limit}s)")
+                    raise WarmSessionError(f"상주 세션 턴 타임아웃 ({limit}s)")
                 if not line:
-                    raise WarmWorkerError(
-                        "상주 워커 stdout 이 EOF — 프로세스가 죽었다. stderr: "
+                    raise WarmSessionError(
+                        "상주 세션 stdout 이 EOF — 프로세스가 죽었다. stderr: "
                         f"{''.join(self._stderr_tail[-5:])[:400]}")
                 text = line.decode("utf-8", "replace").strip()
                 if not text:
@@ -387,7 +405,7 @@ class WarmWorker:
         before = self._session_id
         try:
             await self.ask(CLEAR_COMMAND, timeout=timeout)
-        except WarmWorkerError:
+        except WarmSessionError:
             return False
         after = self._session_id
         return bool(after) and after != before
