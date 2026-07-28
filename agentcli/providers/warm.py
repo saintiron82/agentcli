@@ -70,6 +70,36 @@ class WarmWorkerError(RuntimeError):
     """상주 워커가 더 이상 신뢰할 수 없는 상태 — 호출자는 폐기 후 재기동한다."""
 
 
+@dataclass(frozen=True)
+class WorkerHandle:
+    """이 워커에 대해 라이브러리가 **관측한 사실**. 순수 데이터다.
+
+    프로세스 수명 통제(재기동 후 잔여 워커 탐색·종료·이어받기)는 배포·감독
+    영역이므로 이 라이브러리의 책임이 아니다. agentcli 는 저장소를 스스로 고르지
+    않고(전역 파일·DB 없음), 다른 프로세스를 조회하거나 죽이지도 않는다. 대신
+    소비자가 자기 저장소에 그대로 넣을 수 있는 이 핸들을 노출한다.
+
+    소비자가 재기동 후 할 수 있는 것:
+
+    - ``pid`` 로 잔여 프로세스를 찾는다. **PID 재사용을 반드시 자기 쪽에서
+      배제하라** — ``spawned_at`` 은 이 라이브러리의 시계로 찍은 값이지 OS 가
+      보고하는 프로세스 생성시각이 아니다. 정확한 판별이 필요하면 소비자가
+      OS 에 직접 물어야 한다.
+    - ``session_id`` 로 **대화를 이어받는다**. 살아 있는 워커의 stdin/stdout 에
+      다시 붙는 것은 OS 수준에서 불가능하다 — 파이프는 그것을 띄운 부모가
+      소유하고 부모와 함께 죽는다. 대신 잔여 프로세스를 소비자가 정리한 뒤
+      ``resume_session_id=<sid>`` 로 새 워커를 띄우면 대화가 이어진다
+      (상주 모드에서 ``--resume`` 동작·sid 유지 실측 확인).
+
+    ``session_id`` 는 ``/clear`` 때마다 바뀐다 — 저장했다면 갱신해야 한다.
+    """
+    pid: int | None
+    session_id: str
+    argv: tuple[str, ...]
+    cwd: str | None
+    spawned_at: float | None      # 라이브러리 시계 (OS 생성시각 아님)
+
+
 @dataclass
 class TurnResult:
     """한 턴의 결과.
@@ -156,6 +186,7 @@ class WarmWorker:
         self._turns = 0
         self._stderr_tail: list[str] = []
         self._boot_s: float | None = None
+        self._spawned_at: float | None = None
 
     # ---- 수명 ----
 
@@ -176,6 +207,20 @@ class WarmWorker:
         """첫 턴에서 관측된 부팅 비용(첫 턴 벽시계 − 그 턴 ``duration_ms``)."""
         return self._boot_s
 
+    @property
+    def handle(self) -> WorkerHandle:
+        """소비자가 자기 저장소에 넣을 수 있는 관측 사실 (:class:`WorkerHandle`).
+
+        이 라이브러리는 이 값을 어디에도 저장하지 않는다 — 영속화·재기동 후
+        정리 정책은 전적으로 소비자 몫이다.
+        """
+        return WorkerHandle(
+            pid=self._proc.pid if self._proc is not None else None,
+            session_id=self._session_id,
+            argv=tuple(self._cmd),
+            cwd=self._cwd,
+            spawned_at=self._spawned_at)
+
     def alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
@@ -194,6 +239,7 @@ class WarmWorker:
         if self._env is not None:
             kwargs["env"] = self._env
         self._proc = await asyncio.create_subprocess_exec(*self._cmd, **kwargs)
+        self._spawned_at = time.time()
         asyncio.ensure_future(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:

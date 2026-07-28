@@ -55,6 +55,7 @@ class _FakeStream:
 class _FakeProc:
     def __init__(self, turns):
         self.returncode = None
+        self.pid = 4242
         self._written: list[dict] = []
         self.stdout = _FakeStream(turns)
         self.stderr = _FakeStream([])
@@ -299,3 +300,57 @@ def test_missing_binary_raises_clearly():
 
         with pytest.raises(WarmWorkerError, match="not found"):
             asyncio.run(run())
+
+
+# ---- 소비자에게 넘기는 관측 사실 (프로세스 제어는 라이브러리 밖) ----
+
+def test_handle_exposes_facts_for_consumer_owned_persistence():
+    """라이브러리는 핸들을 노출만 하고 저장하지 않는다.
+
+    재기동 후 잔여 워커 탐색·종료는 배포·감독 영역이라 소비자 몫이다. 라이브러리가
+    전역 파일·DB 를 갖거나 남의 프로세스를 조회·종료하면 안 된다.
+    """
+    w, proc, fake_exec = _worker_with([[_delta("hi"), _result("s1")]],
+                                      cwd="/tmp/work")
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            await w.ask("q")
+            return w.handle
+
+    h = asyncio.run(run())
+    assert h.session_id == "s1"
+    assert h.cwd == "/tmp/work"
+    assert h.argv[0] == "/usr/bin/claude" and "--verbose" in h.argv
+    assert h.spawned_at is not None
+    assert h.pid == proc.pid
+
+
+def test_handle_session_id_follows_clear():
+    """``/clear`` 로 sid 가 바뀌면 핸들도 새 값을 낸다 — 소비자는 갱신 저장해야 한다."""
+    w, _proc, fake_exec = _worker_with([
+        [_delta("hi"), _result("s1")],
+        [_result("s2", duration_ms=0)],
+    ])
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            await w.ask("seed")
+            before = w.handle.session_id
+            await w.clear()
+            return before, w.handle.session_id
+
+    before, after = asyncio.run(run())
+    assert (before, after) == ("s1", "s2")
+
+
+def test_library_exposes_no_process_control_surface():
+    """라이브러리가 프로세스를 조회·종료하는 공개 수단을 갖지 않는다.
+
+    "직접 제어는 하지 않는다"는 경계를 회귀로 고정한다. 자기가 띄운 워커를 닫는
+    ``close()`` 는 자기 자원 정리라 예외다.
+    """
+    banned = {"terminate", "kill_residual", "sweep", "process_matches",
+              "registry", "WarmRegistry", "adopt", "reattach"}
+    assert banned.isdisjoint(dir(warm)), (
+        "잔여 프로세스 탐색·종료는 소비자(서비스) 책임이다")
