@@ -57,11 +57,11 @@ def test_list_models():
 
 
 def test_provider_id():
-    import platform
     p = ClaudeProvider()
     assert p.provider_id == "claude"
-    # macOS/Linux: 네이티브 resume 지원. Windows: issue #4 hang 회피로 stateless.
-    assert p.supports_sessions is (platform.system() != "Windows")
+    # 전 플랫폼 네이티브 resume 지원 — Windows 전용 stateless 가드는 제거됐다
+    # (issue #27: #4 의 인터랙티브 stdin 대기 전제가 해소되어 stale 이었음).
+    assert p.supports_sessions is True
     # 어느 모드든 히스토리는 CLI 소유 — 라이브러리는 내용을 저장하지 않는다.
     assert p.stores_history is False
 

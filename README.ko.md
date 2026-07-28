@@ -58,7 +58,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 
 **대화 히스토리의 single source of truth는 provider CLI 세션입니다.** 라이브러리는 provider별 `session_id`만 저장하고 이전 대화를 prompt에 다시 주입하지 않습니다. 이 원칙 때문에 토큰 중복, 히스토리 중복 저장, 예측하기 어려운 context 증가를 피할 수 있습니다.
 
-- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다(전 플랫폼). Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(macOS/Linux는 Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지). 과거 Windows hang(issue #4)은 `stdin=DEVNULL` spawn으로 전제가 해소되어 Windows resume 가드를 제거했습니다(issue #27, Windows 검증 진행 예정).
+- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다(전 플랫폼). Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지). 과거 Windows hang(issue #4)은 stdin이 항상 EOF가 되도록 spawn하면서 전제가 해소되어 Windows resume 가드를 제거했습니다(issue #27, Windows 11에서 검증 완료).
 - `Conversation.metadata["session_id:<provider>"]`만 저장합니다.
 - `system_prompt`와 `AgentProfile.instructions`는 해당 지시문 hash를 세션이 아직 보지 않았거나 변경되었을 때만 주입합니다.
 - 세션이 없는 custom provider를 추가할 경우에만 라이브러리가 이전 messages를 직렬화할 수 있습니다.
@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -399,7 +399,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 `KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
 
-`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(macOS/Linux는 Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 모든 호출을 `stdin=DEVNULL`로 spawn하므로 Windows에서도 resume이 될 것으로 보입니다 — issue #27이 Windows 11에서 CLI 레벨 동작을 재현했고, 가드 제거의 end-to-end Windows 검증은 진행 예정입니다.
+`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 경로로 spawn하든 CLI가 stdin에서 즉시 EOF를 봅니다 — 일반 프롬프트는 `stdin=DEVNULL`, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30). 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
 
 ### Reasoning 제어
 
@@ -469,8 +469,8 @@ pytest
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.4`
-- 릴리즈 노트: [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
+- 현재 릴리즈: `0.7.0`
+- 릴리즈 노트: [docs/releases/v0.7.0.ko.md](docs/releases/v0.7.0.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 - Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 

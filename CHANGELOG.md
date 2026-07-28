@@ -27,7 +27,13 @@
   `True` on every platform, so `owner`+`alias` session reuse (and `ContextSession`
   pin-then-`refine`) works on Windows — no more re-sending the context every
   call. Stale sessions still fall back to a fresh session via the
-  `STALE_SESSION_MARKER` auto-recovery path.
+  `STALE_SESSION_MARKER` auto-recovery path. **Behavior change on Windows:**
+  repeated calls with the same `owner`+`alias` now continue one conversation
+  instead of starting a fresh one each time — code that relied on the old
+  stateless behavior should pass `new_session=True` (or use a new alias).
+  Verified end-to-end on Windows 11 / Claude Code 2.1.220: plain resume,
+  >8KB-via-stdin resume, and MCP-on resume all keep session continuity without
+  hanging.
 - **`CopilotProvider(effort=...)` now validates against the canonical scale.**
   Previously (since v0.2.0) any string was passed straight through to the
   CLI's `--effort` flag. It now resolves through the same canonical scale as

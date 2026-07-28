@@ -75,9 +75,12 @@ class ClaudeProvider(LLMProvider):
     # session_id 가 유지된다 (Claude Code 2.1.x 검증). 전 플랫폼 동일.
     #
     # issue #4 (Windows 에서 `-p` + `--resume` 가 5분+ hang) 은 인터랙티브 stdin
-    # 대기가 원인이었는데, 지금은 모든 spawn 이 stdin=DEVNULL 이라(base.py:
-    # _run_stream_template / run_subprocess_sync) 그 대기가 발생할 수 없다. 따라서
-    # Windows 전용 stateless 가드는 불필요 → 제거 (issue #27). 만료 세션은
+    # 대기가 원인이었는데, 지금은 어느 경로로 spawn 하든 CLI 가 stdin 에서
+    # EOF 를 즉시 보므로 그 대기가 발생할 수 없다 (base.py):
+    #   - 일반 프롬프트: stdin=DEVNULL
+    #   - 8,000 UTF-8 바이트 초과 프롬프트: stdin=PIPE 로 write 후 즉시 close
+    #     (issue #30) — 열린 채 대기하지 않는다
+    # 따라서 Windows 전용 stateless 가드는 불필요 → 제거 (issue #27). 만료 세션은
     # STALE_SESSION_MARKER 자동복구로 새 세션 graceful fallback.
     supports_sessions = True
     supports_streaming = True
@@ -373,8 +376,8 @@ class ClaudeProvider(LLMProvider):
                 if strict_mcp_config:
                     cmd.append("--strict-mcp-config")
 
-        # 저장된 session_id 가 있으면 `--resume` 으로 재개 (전 플랫폼; stdin=DEVNULL
-        # 이라 #4 데드락 없음 — issue #27). 없으면 새 식별자를 부여한다.
+        # 저장된 session_id 가 있으면 `--resume` 으로 재개 (전 플랫폼; stdin 이 항상
+        # EOF 라 #4 데드락 없음 — issue #27). 없으면 새 식별자를 부여한다.
         if session_id and self.supports_sessions:
             cmd += ["--resume", session_id]
             used_session_id = session_id

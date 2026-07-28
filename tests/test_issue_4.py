@@ -4,12 +4,13 @@ Issue #4: attaching ``--resume <sid>`` to a ``-p`` (print-mode) invocation
 fell back to waiting for interactive input and hung for 5+ minutes on Windows.
 The original fix forced ``supports_sessions=False`` on Windows.
 
-Issue #27: the real trigger was the interactive **stdin wait**; agentcli now
-spawns every claude call with ``stdin=DEVNULL`` (base.py), so that wait can't
-happen — #27 reproduces the CLI behavior on Windows 11
-(``claude -p --resume <sid> < /dev/null`` resumes cleanly). The Windows guard
-was removed and ``supports_sessions`` is now ``True`` on every platform
-(end-to-end Windows verification of the change is pending).
+Issue #27: the real trigger was the interactive **stdin wait**. Every claude
+spawn now hands the CLI an immediate EOF on stdin — ``DEVNULL`` for normal
+prompts, write-then-close ``PIPE`` for prompts over 8,000 UTF-8 bytes (issue
+#30) — so that wait cannot happen. The Windows guard was removed and
+``supports_sessions`` is ``True`` on every platform, verified end-to-end on
+Windows 11 / Claude Code 2.1.220 (plain, >8KB-stdin, and MCP-on resume all
+complete in under 30s with session continuity). See ``test_issue_27.py``.
 
 These tests keep covering the *conditional* ``_build_cmd`` behavior: when
 ``supports_sessions`` is forced False (legacy/opt-in stateless mode) no
@@ -37,7 +38,7 @@ def test_issue_27_supports_sessions_true_on_all_platforms():
     """#27: 플랫폼 가드 제거 — 클래스 기본값이 Windows 포함 항상 True."""
     assert ClaudeProvider.supports_sessions is True
     assert ClaudeProvider().supports_sessions is True, (
-        f"on {platform.system()}: stdin=DEVNULL 로 #4 데드락이 없으므로 "
+        f"on {platform.system()}: stdin 이 항상 EOF 라 #4 데드락이 없으므로 "
         "Windows 에서도 세션 resume 이 허용되어야 한다 (#27)")
 
 

@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -412,12 +412,14 @@ version and `call_id`). kiro (ACP) has no debug instrumentation.
 `ClaudeProvider` runs `claude -p` with native session resume on every platform:
 the first call mints a fresh `--session-id`, the library stores it, and later
 calls on the same conversation pass `--resume <sid>`. The resumed session keeps
-the same ID (verified against Claude Code 2.1.x on macOS/Linux). The earlier
-Windows hang (issue #4) was caused by an interactive **stdin** wait; agentcli
-now spawns every call with `stdin=DEVNULL`, so resume should work on Windows too
-— issue #27 reproduces the CLI-level behavior on Windows 11, and the guard
-removal is pending end-to-end Windows verification. No conversation content is
-persisted by the library.
+the same ID (verified against Claude Code 2.1.x). The earlier Windows hang
+(issue #4) was caused by an interactive **stdin** wait; agentcli hands the CLI
+an immediate EOF on every spawn path — `stdin=DEVNULL` for normal prompts, and
+write-then-close `stdin=PIPE` for prompts over 8,000 UTF-8 bytes (issue #30) —
+so that wait cannot happen. The Windows guard was removed in issue #27 and
+verified end-to-end on Windows 11 / Claude Code 2.1.220 (plain, >8KB-via-stdin,
+and MCP-on resume all keep session continuity without hanging). No conversation
+content is persisted by the library.
 
 ### Reasoning controls
 
@@ -702,7 +704,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.6.4 release note: [docs/releases/v0.6.4.md](docs/releases/v0.6.4.md) / [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
+- v0.7.0 release note: [docs/releases/v0.7.0.md](docs/releases/v0.7.0.md) / [docs/releases/v0.7.0.ko.md](docs/releases/v0.7.0.ko.md)
 - Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)
 
 ## License
