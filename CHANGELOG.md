@@ -18,6 +18,25 @@
   identical to before.
 
 ### Changed
+- **Claude session resume now works on Windows too (issue #27).** The Windows
+  `supports_sessions=False` guard (added for the issue #4 `-p` + `--resume`
+  5-minute hang) is removed. Root cause of #4 was an interactive **stdin** wait;
+  no spawn path leaves stdin open for the CLI to read from — the subprocess
+  helpers set `DEVNULL`, or `PIPE` written and closed for prompts over 8,000
+  UTF-8 bytes (issue #30) — so the hang can't occur. `run_subprocess_async`
+  used to inherit the parent's stdin when given neither, which reproduced the
+  #4 hang against a live parent stdin (`timed_out=True, rc=124`); it now
+  always closes stdin it does not write to, matching the sync helper. `ClaudeProvider.supports_sessions` is now
+  `True` on every platform, so `owner`+`alias` session reuse (and `ContextSession`
+  pin-then-`refine`) works on Windows — no more re-sending the context every
+  call. Stale sessions still fall back to a fresh session via the
+  `STALE_SESSION_MARKER` auto-recovery path. **Behavior change on Windows:**
+  repeated calls with the same `owner`+`alias` now continue one conversation
+  instead of starting a fresh one each time — code that relied on the old
+  stateless behavior should pass `new_session=True` (or use a new alias).
+  Verified end-to-end on Windows 11 / Claude Code 2.1.220: plain resume,
+  >8KB-via-stdin resume, and MCP-on resume all keep session continuity without
+  hanging.
 - **`CopilotProvider(effort=...)` now validates against the canonical scale.**
   Previously (since v0.2.0) any string was passed straight through to the
   CLI's `--effort` flag. It now resolves through the same canonical scale as
