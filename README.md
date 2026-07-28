@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -421,6 +421,33 @@ verified end-to-end on Windows 11 / Claude Code 2.1.220 (plain, >8KB-via-stdin,
 and MCP-on resume all keep session continuity without hanging). No conversation
 content is persisted by the library.
 
+### Warm (persistent) claude sessions
+
+`claude -p` boots the whole harness per call. For latency-sensitive callers,
+`agentcli.providers.warm` opens the process once and keeps feeding it prompts
+over stdin — measured TTFT drops from 6.3–11.1s per call to 0.8–1.7s.
+
+```python
+from agentcli.providers.warm import open_warm
+
+s = await open_warm(append_system_prompt=COMPANY_RULES)
+async for chunk in s.stream("Which rule covers carryover?"):
+    if chunk.type == "text":
+        print(chunk.content, end="")
+
+await s.send("/clear")     # drop the previous turns; session_id changes
+print(s.session_id)        # hand this to your service to resume later
+await s.close()
+```
+
+Scope is deliberately narrow: **open warm mode and hand over its `session_id`.**
+Pooling, concurrency, liveness supervision, and cleaning up residual processes
+after a restart belong to the consuming service — agentcli never picks its own
+storage and never touches processes it does not own. One warm session is serial;
+open several for parallelism. See
+[docs/releases/v0.7.1.md](docs/releases/v0.7.1.md).
+
+
 ### Reasoning controls
 
 Two independent, normalized controls, per call or as provider defaults:
@@ -704,7 +731,7 @@ pytest
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.7.0 release note: [docs/releases/v0.7.0.md](docs/releases/v0.7.0.md) / [docs/releases/v0.7.0.ko.md](docs/releases/v0.7.0.ko.md)
+- v0.7.1 release note: [docs/releases/v0.7.1.md](docs/releases/v0.7.1.md) / [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
 - Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)
 
 ## License

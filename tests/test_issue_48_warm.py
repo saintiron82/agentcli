@@ -304,3 +304,106 @@ def test_library_does_not_manage_processes_or_pools():
     }
     assert banned.isdisjoint(dir(warm))
     assert banned.isdisjoint(dir(WarmSession))
+
+
+# ---- merge-gate 에서 잡힌 결함의 회귀 ----
+
+def test_concurrent_first_turns_spawn_one_process():
+    """첫 턴 동시 호출이 프로세스를 두 번 띄우면 안 된다.
+
+    spawn 이 락 밖에 있으면 둘 다 ``_proc is None`` 을 보고 각자 띄우고, 그중
+    하나는 ``self._proc`` 에 남지 않아 ``close()`` 로도 닫을 수 없는 잔여
+    프로세스가 된다 (수정 전 실측: spawn 2회).
+    """
+    spawned = []
+
+    async def fake_exec(*cmd, **kwargs):
+        await asyncio.sleep(0)          # 실제 spawn 처럼 suspend
+        proc = _FakeProc([[_delta("1"), _result("s1")],
+                          [_delta("2"), _result("s1")]])
+        spawned.append(proc)
+        return proc
+
+    s = WarmSession(cmd=["/usr/bin/claude"])
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            return await asyncio.gather(s.send("a"), s.send("b"))
+
+    assert set(asyncio.run(run())) == {"1", "2"}
+    assert len(spawned) == 1, "첫 턴 동시 호출에서 프로세스가 새어나갔다"
+
+
+def _abandon_then_next(abandon):
+    """턴1 을 중도 포기한 뒤 턴2 를 돌려 (응답, sid) 를 돌려준다."""
+    s = WarmSession(cmd=["/usr/bin/claude"])
+    proc = _FakeProc([
+        [_delta("AAA"), _delta("BBB"), _result("s1")],   # 턴1: 3 이벤트
+        [_delta("ZZZ"), _result("s2")],                  # 턴2
+    ])
+
+    async def fake_exec(*cmd, **kwargs):
+        return proc
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            await abandon(s)
+            return await s.send("q2"), s.session_id
+
+    return asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_abandoned_turn_does_not_corrupt_the_next_one():
+    """턴을 끝까지 안 읽고 닫아도 다음 턴이 잔여 이벤트를 자기 것으로 읽지 않는다.
+
+    수정 전에는 턴2 가 턴1 의 잔여 델타('BBB')를 응답으로 받고 ``session_id`` 도
+    낡은 값('s1')에 고착했다. 스트리밍 취소는 실시간 챗봇에서 정상 동작이고,
+    session_id 는 이 모듈이 넘겨주기로 한 유일한 값이라 조용한 오염은 치명적이다.
+    """
+    async def abandon(s):
+        agen = s.stream_events("q1")
+        await agen.__anext__()
+        await agen.aclose()
+
+    assert _abandon_then_next(abandon) == ("ZZZ", "s2")
+
+
+def test_abandoned_turn_via_bare_break_does_not_corrupt_the_next_one():
+    """``async for`` 에서 그냥 ``break`` 해도 마찬가지다 (aclose 를 안 불러도)."""
+    async def abandon(s):
+        async for _chunk in s.stream("q1"):
+            break
+
+    assert _abandon_then_next(abandon) == ("ZZZ", "s2")
+
+
+def test_send_after_close_raises_instead_of_respawning():
+    """닫힌 세션에 보내면 조용히 새 프로세스를 띄우지 않고 실패한다."""
+    s, _proc, fake_exec = _session_with([[_delta("hi"), _result("s1")]])
+
+    async def run():
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            await s.send("q")
+            await s.close()
+            await s.send("q2")
+
+    with pytest.raises(WarmSessionError, match="닫힌"):
+        asyncio.run(run())
+
+
+def test_partial_flag_is_derived_from_argv():
+    """``partial`` 상태를 하드코딩하지 않고 argv 한 근원에서 파생한다.
+
+    어긋나면 토큰 델타가 이중 계산되거나 통째로 누락된다.
+    """
+    import inspect
+    src = inspect.getsource(WarmSession.stream)
+    assert '"--include-partial-messages" in self._cmd' in src
+    assert "--include-partial-messages" in build_warm_cmd(binary="claude")
+
+
+def test_normalization_reuses_claude_provider_dispatch():
+    """상주 경로가 별도 이벤트 파서를 만들지 않는다 — 결합 지점을 고정한다."""
+    from agentcli.providers.claude import ClaudeProvider
+    assert hasattr(ClaudeProvider, "_dispatch_stream_event"), (
+        "warm.stream() 이 이 메서드에 의존한다 — 이름이 바뀌면 함께 고쳐야 한다")

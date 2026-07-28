@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -401,6 +401,32 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 `ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 spawn 경로도 CLI가 읽을 수 있는 stdin을 열어두지 않습니다 — 서브프로세스 헬퍼가 `stdin=DEVNULL`을 설정하거나, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30)입니다. 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
 
+### 상주(warm) claude 세션
+
+`claude -p` 는 호출마다 하네스 전체를 부팅한다. 지연에 민감한 호출자를 위해
+`agentcli.providers.warm` 은 프로세스를 한 번만 열고 stdin 으로 프롬프트를 계속
+먹인다 — 실측 TTFT 가 호출당 6.3~11.1s 에서 0.8~1.7s 로 떨어진다.
+
+```python
+from agentcli.providers.warm import open_warm
+
+s = await open_warm(append_system_prompt=COMPANY_RULES)
+async for chunk in s.stream("연차 이월은 어느 규정인가?"):
+    if chunk.type == "text":
+        print(chunk.content, end="")
+
+await s.send("/clear")     # 이전 턴들을 버린다 — session_id 가 바뀐다
+print(s.session_id)        # 서비스에 넘겨 나중에 이어받는다
+await s.close()
+```
+
+범위는 의도적으로 좁다: **상주 모드를 열고 그 `session_id` 를 넘겨주는 것**까지다.
+풀링·동시성·liveness 감시·재기동 후 잔여 프로세스 정리는 소비하는 서비스의 일이다 —
+agentcli 는 저장소를 스스로 고르지 않고 자기 소유가 아닌 프로세스를 건드리지 않는다.
+상주 세션 하나는 직렬이므로 병렬이 필요하면 여러 개를 연다. 자세한 내용은
+[docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md).
+
+
 ### Reasoning 제어
 
 호출마다, 또는 provider 기본값으로 지정할 수 있는 두 개의 독립된 정규화 제어:
@@ -469,8 +495,8 @@ pytest
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.7.0`
-- 릴리즈 노트: [docs/releases/v0.7.0.ko.md](docs/releases/v0.7.0.ko.md)
+- 현재 릴리즈: `0.7.1`
+- 릴리즈 노트: [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 - Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 

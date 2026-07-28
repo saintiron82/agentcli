@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.1 — 2026-07-28
+
+### Added
+- **Warm (persistent) claude sessions (#48).** `agentcli.providers.warm` opens a
+  claude process once with `--input-format stream-json` and keeps feeding it
+  prompts over stdin, so the harness boots one time instead of per call.
+  Measured on Windows 11 / Claude Code 2.1.220 (lean): first turn 6.40s of which
+  ~4.7s is boot, then 2.69s / 1.61s / 1.65s — after boot, wall clock ≈ the
+  CLI-reported turn time, so harness overhead is effectively zero. TTFT
+  0.8–1.7s against 6.3–11.1s for the cold `-p` path.
+
+      s = await open_warm(append_system_prompt=RULES)
+      s.session_id                       # the one thing handed to the caller
+      async for chunk in s.stream("..."):   # standard StreamChunk contract
+          ...
+      await s.send("/clear")             # just a message; session_id changes
+      await s.close()
+
+  **Scope is deliberately narrow: open warm mode and hand over its
+  `session_id`.** Pooling, concurrency, overflow, liveness supervision,
+  restart-time residual-process discovery or termination, and any global file or
+  database for them are the consuming service's job — agentcli never picks its
+  own storage and never inspects or kills processes it does not own. A single
+  warm session is serial; open several if you need parallelism. Reattaching to a
+  live warm process from another process is impossible (pipes die with the
+  parent) — carry the conversation instead via `resume_session_id`.
+
+  claude-only, and outside the shared provider contract: warm mode is a separate
+  module, not a `provider_options` key or a `ProviderCapabilities` field, so the
+  three-provider normalization contract is untouched.
+
 ## 0.7.0 — 2026-07-28
 
 ### Added

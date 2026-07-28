@@ -133,6 +133,9 @@ class WarmSession:
         self._lock = asyncio.Lock()
         self._session_id = ""
         self._stderr_tail: list[str] = []
+        self._turn_open = False      # 진행 중인 턴이 result 를 못 본 상태
+        self._dirty = False          # 스트림 위치를 신뢰할 수 없음
+        self._closed = False
 
     # ---- 노출하는 것 ----
 
@@ -189,6 +192,7 @@ class WarmSession:
 
     async def close(self) -> None:
         """stdin 을 닫아 프로세스를 끝낸다. 안 끝나면 kill."""
+        self._closed = True
         proc, self._proc = self._proc, None
         if proc is None:
             return
@@ -220,12 +224,25 @@ class WarmSession:
         마지막에 ``result`` 이벤트까지 내보내고 끝난다. 정규화된 청크가 필요하면
         :meth:`stream` 을 쓴다.
         """
-        if self._proc is None:
-            await self._start()
-        proc = self._proc
-        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        if self._closed:
+            raise WarmSessionError(
+                "닫힌 상주 세션 — 다시 쓰려면 open_warm() 으로 새로 연다")
+        if self._dirty:
+            raise WarmSessionError(
+                "이전 턴이 끝나지 않은 채 버려져 스트림 위치를 신뢰할 수 없다 "
+                "— 닫고 새로 연다")
 
         async with self._lock:
+            # spawn 은 반드시 락 안에서. 밖에 두면 첫 턴 동시 호출 때 둘 다
+            # `_proc is None` 을 보고 각자 프로세스를 띄우고, 그중 하나는
+            # `self._proc` 에 남지 않아 close() 로도 닫을 수 없는 잔여
+            # 프로세스가 된다 (실측: spawn 2회).
+            if self._proc is None:
+                await self._start()
+            proc = self._proc
+            if proc is None or proc.stdin is None or proc.stdout is None:
+                raise WarmSessionError("상주 세션 파이프가 없다")
+
             payload = json.dumps(
                 {"type": "user", "message": {"role": "user", "content": prompt}},
                 ensure_ascii=False)
@@ -238,7 +255,23 @@ class WarmSession:
             limit = timeout or self._turn_timeout
             loop = asyncio.get_running_loop()
             deadline = loop.time() + limit
-            while True:
+            self._turn_open = True
+            try:
+                async for evt in self._read_turn(proc, deadline, limit):
+                    yield evt
+            finally:
+                # 소비자가 턴을 끝까지 안 읽고 빠져나가면(스트리밍 취소 등) 남은
+                # 이벤트가 stdout 에 그대로 남아 **다음 턴이 그것을 자기 응답으로
+                # 읽는다** (실측: 턴2 가 턴1 의 잔여 델타를 받고 session_id 도
+                # 낡은 값에 고착). 여기서 result 까지 배수해 스트림 위치를 맞춘다.
+                if self._turn_open:
+                    await self._drain_open_turn(proc, deadline, limit)
+
+    async def _read_turn(self, proc, deadline: float,
+                         limit: float) -> AsyncIterator[dict]:
+        """``result`` 까지 한 턴의 이벤트를 읽어 흘린다."""
+        loop = asyncio.get_running_loop()
+        while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise WarmSessionError(self._timeout_msg(limit))
@@ -262,7 +295,25 @@ class WarmSession:
                     self._session_id = evt["session_id"]
                 yield evt
                 if evt.get("type") == "result":
+                    self._turn_open = False
                     return
+
+    async def _drain_open_turn(self, proc, deadline: float,
+                               limit: float) -> None:
+        """버려진 턴의 남은 이벤트를 ``result`` 까지 읽어 버린다 (best-effort).
+
+        배수에 실패하면 스트림 위치를 더는 신뢰할 수 없으므로 세션을 오염으로
+        표시한다 — 이후 턴은 조용히 잘못된 응답을 주는 대신 명시적으로 실패한다.
+        """
+        try:
+            async for _ in self._read_turn(proc, deadline, limit):
+                pass
+        except (WarmSessionError, asyncio.CancelledError, OSError):
+            self._dirty = True
+        finally:
+            if self._turn_open:
+                self._dirty = True
+            self._turn_open = False
 
     def _timeout_msg(self, limit: float) -> str:
         return (f"상주 세션 턴 타임아웃 ({limit}s) — stderr: "
@@ -281,7 +332,9 @@ class WarmSession:
 
         provider = ClaudeProvider()
         state = StreamState()
-        state.extra["partial"] = True     # --include-partial-messages 로 띄운다
+        # argv 한 근원에서 파생 — 하드코딩하면 build_warm_cmd 가 바뀔 때
+        # 델타가 이중 계산되거나 누락된다.
+        state.extra["partial"] = "--include-partial-messages" in self._cmd
         try:
             async for evt in self.stream_events(prompt, timeout=timeout):
                 async for chunk in provider._dispatch_stream_event(evt, state):
