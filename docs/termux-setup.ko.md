@@ -101,7 +101,7 @@ copilot login         # 또는 위의 gh auth login 으로 이미 됨
 ## 4. agentcli 설치
 
 ```bash
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
 ```
 
 > 런타임 의존성 0개라 pip 단계는 가볍다. import 이름은 `agentcli`다.
@@ -212,7 +212,7 @@ curl -s localhost:8765 -d '{"prompt":"say hi","provider":"claude"}'
 1. Termux는 **F-Droid/GitHub**에서.
 2. **쓸 프로바이더 CLI만** 설치 — claude(JS, 안정) / copilot(gh extension, device-flow) 우선, **codex는 arm64 빌드 이슈로 깨질 수 있음**.
 3. 각 CLI **구독 로그인**(agentcli는 자격증명 없음).
-4. `pip install ...@v0.6.4` 로 agentcli(의존성 0).
+4. `pip install ...@v0.7.0` 로 agentcli(의존성 0).
 5. health check → 한 줄 호출로 검증.
 6. 서버는 stdlib로 직접 얹고, 외부 노출은 Tailscale.
 7. 지연·배터리·백그라운드 종료가 실사용의 진짜 적 → lean 모드 + wakelock.
