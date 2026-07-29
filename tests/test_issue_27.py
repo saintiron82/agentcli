@@ -61,6 +61,14 @@ def _provider_as_if_on(system: str) -> type:
         reloaded = importlib.reload(claude_mod)
         cls = reloaded.ClaudeProvider
     importlib.reload(claude_mod)          # 전역 상태 원복
+    # reload 는 모듈 dict 를 재사용하지만 클래스 "객체"는 매번 새로 만든다 —
+    # 그대로 두면 collection 시점에 각 테스트 모듈이 import 해 둔 (원본) 클래스와
+    # ``agentcli.providers.claude.ClaudeProvider`` 가 서로 다른 객체가 되어,
+    # 이후 실행되는 문자열 경로 ``@patch("...ClaudeProvider._find_binary")`` 가
+    # 전부 빗나간다. 로컬처럼 claude 바이너리가 있으면 우연히 통과하지만
+    # 바이너리 없는 CI 러너에서는 invoke 가 조기 반환해 일괄 실패한다.
+    # 원본 클래스 객체를 모듈에 되돌려 patch 대상과 인스턴스화 대상을 일치시킨다.
+    claude_mod.ClaudeProvider = ClaudeProvider
     return cls
 
 
