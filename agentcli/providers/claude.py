@@ -815,12 +815,18 @@ class ClaudeProvider(LLMProvider):
                     yield StreamChunk(type="event", data=block)
         elif etype == "result":
             usage = evt.get("usage") or {}
-            pt = int(usage.get("input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+            # 비스트리밍 _parse_claude_json 과 동일 매핑 (#51): input_tokens 는
+            # 캐시 read/creation 제외분이므로 합쳐서 prompt_tokens 로 보고.
+            pt = int(usage.get("input_tokens") or 0) + cache_read + cache_creation
             ct = int(usage.get("output_tokens") or 0)
             prev = state.final_usage
             state.final_usage = TokenUsage(
                 prompt_tokens=pt, completion_tokens=ct,
                 total_tokens=pt + ct,
+                cached_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
                 payload_prompt_tokens=(prev.payload_prompt_tokens if prev else 0),
                 prompt_tokens_reliable=False,
                 prompt_tokens_source="claude_cli_reported")
@@ -853,7 +859,14 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
                or data.get("text")
                or "")
     usage = data.get("usage") or {}
-    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    # Anthropic 의 input_tokens 는 캐시 read/creation 분을 제외한다(OpenAI 는
+    # 포함). 정규화 계약은 "cached_tokens ⊆ prompt_tokens" 이므로 셋을 합쳐
+    # 실제 입력 컨텍스트 전체를 prompt_tokens 로 보고한다 (#51) — 안 그러면
+    # 14k 토큰짜리 캐시된 컨텍스트가 prompt_tokens=4 로 보인다.
+    prompt_tokens = input_tokens + cache_read + cache_creation
     completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
     total = prompt_tokens + completion_tokens
 
@@ -870,4 +883,6 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total,
+        cached_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
     ), error_msg

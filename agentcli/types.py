@@ -16,6 +16,10 @@ class TokenUsage:
     # prompt 토큰 중 캐시 히트로 처리된 수 (Codex cached_input_tokens, Anthropic cache_read).
     # 일반적으로 단가가 1/10 수준이므로 비용 계산 시 분리 필요.
     cached_tokens: int = 0
+    # prompt 토큰 중 캐시 "생성"에 쓰인 수 (Anthropic cache_creation_input_tokens,
+    # 단가 1.25x). 캐시를 보고하지 않는 provider(copilot)나 생성/읽기를 구분하지
+    # 않는 provider(codex)에서는 항상 0.
+    cache_creation_tokens: int = 0
     # agentcli가 provider CLI에 직접 넘긴 prompt 문자열의 가벼운 추정치.
     # provider CLI가 내부 agent 컨텍스트를 더하거나 일부 usage만 공개할 수 있어
     # prompt_tokens와 별도로 보관한다.
