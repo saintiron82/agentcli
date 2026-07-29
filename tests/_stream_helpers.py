@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -72,6 +74,28 @@ def patch_subprocess_exec(monkeypatch, fake_proc):
         return fake_proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+
+def write_fake_cli_launcher(tmp_path, script_body: str, *, name: str = "fake-cli") -> str:
+    """On-disk 실행 가능한 fake CLI 런처를 만들어 절대경로를 반환한다.
+
+    issue #44 real-subprocess 테스트용 — ``test_kiro_coverage.py`` 의 fake-binary
+    관례(스크립트 파일 + ``#!/bin/sh`` 런처 + chmod +x)를 claude/codex 스트리밍
+    stdin 라우팅 검증에도 그대로 적용한다. ``script_body`` 는 자신의 sys.argv 를
+    무시하고 stdin/stdout 만으로 동작해야 한다 — argv 검증(큰 프롬프트가 실제
+    spawn 인자에 없는지)은 호출부가 ``asyncio.create_subprocess_exec`` 를
+    spy 해서 별도로 확인한다.
+    """
+    script = tmp_path / f"{name}.py"
+    script.write_text(script_body, encoding="utf-8")
+    launcher = tmp_path / name
+    launcher.write_text(
+        "#!/bin/sh\nexec {py} {script} \"$@\"\n".format(
+            py=sys.executable, script=str(script)),
+        encoding="utf-8",
+    )
+    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return str(launcher)
 
 
 async def collect(agen) -> list:
