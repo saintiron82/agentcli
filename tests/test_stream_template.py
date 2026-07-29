@@ -4,18 +4,24 @@ triad-review 합의 (PR #8) follow-up:
 - issue #9: ``wall_timeout=0`` silent override 수정
 - issue #10: ``except Exception`` 이 ``GeneratorExit`` 못 잡아 좀비 잔존
 - issue #11: runtime 회로 mock 단위 (정상 시퀀스, idle/wall timeout)
+- issue #44: stream_async 대형 프롬프트 stdin 라우팅 (``input_bytes`` 훅)
 """
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import textwrap
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agentcli.providers.base import StreamState
+from agentcli.providers.base import PROMPT_STDIN_THRESHOLD, StreamState
 from agentcli.providers.claude import ClaudeProvider
+from agentcli.providers.codex import CodexProvider
 from tests._stream_helpers import (
     FakeReadline, HangingReadline, jsonl_bytes, make_fake_proc,
-    patch_subprocess_exec)
+    patch_subprocess_exec, write_fake_cli_launcher)
 
 
 # ============================================================
@@ -798,3 +804,433 @@ def test_run_subprocess_async_timeout_still_kills_proc(monkeypatch):
     # Fix A: 정상완료 포함 모든 경로에서 그룹 reap → except+finally 가 멱등적으로
     # 두 번 kill 할 수 있다(해롭지 않음). 한 번 이상 호출되면 충분.
     assert proc.kill.called
+
+
+# ============================================================
+# issue #44: stream_async 대형 프롬프트 stdin 라우팅
+#
+# #30(#41)은 claude/codex 의 invoke/invoke_async 만 8000 UTF-8 바이트 초과
+# 프롬프트를 stdin 으로 라우팅했다 — stream_async 는 별도 spawn 경로
+# (_run_stream_template)라 argv 전달이 남아있었다. 아래는:
+#   (a) _run_stream_template 자체의 input_bytes 훅 (mock 단위)
+#   (b) claude/codex stream_async 가 임계치 판정 → prompt_via_stdin/
+#       input_bytes 를 정확히 배선하는지 (mock 단위, 빠름)
+#   (c) 실제 subprocess 로 바이트가 stdin 을 통해 자식에 전달되는지
+#       (fake CLI 스크립트가 길이를 에코)
+#   (d) 자식이 stdin 을 전혀 읽지 않고 먼저 종료해도 hang/leak 없음
+# ============================================================
+
+
+def test_run_stream_template_default_keeps_stdin_devnull(monkeypatch):
+    """input_bytes 미지정(기본 None)은 기존과 byte-identical — stdin=DEVNULL,
+    추가 writer task 없음."""
+    events = [{"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "ok"}]}}]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    captured_kwargs: dict = {}
+
+    async def fake_create(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    provider = ClaudeProvider()
+    state = StreamState()
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["fake"], state, model="m")]
+
+    chunks = asyncio.run(run())
+    assert captured_kwargs.get("stdin") == asyncio.subprocess.DEVNULL
+    assert chunks[-1].type == "done"
+
+
+class _SlowFakeReadline:
+    """``FakeReadline`` 과 동일하지만 매 호출마다 살짝 await 로 suspend 한다.
+
+    순수 mock proc(``FakeReadline``) 은 실제 I/O 대기 없이 즉시 반환되기
+    때문에, spawn 직후 만든 stdin writer task 가 이벤트 루프에서 단 한 번도
+    스케줄될 기회 없이 메인 readline 루프가 끝나버릴 수 있다(실제 CLI는 첫
+    출력까지 부팅 시간이 걸려 이런 경합이 없다 — real-subprocess 테스트가
+    이를 증명한다). writer task 의 write/drain 호출 자체를 결정적으로
+    검증하려는 mock 단위 테스트에서만 이 헬퍼로 진짜 suspend point 를 준다.
+    """
+
+    def __init__(self, lines: list[bytes]):
+        self._lines = list(lines) + [b""]
+        self._idx = 0
+
+    async def readline(self) -> bytes:
+        await asyncio.sleep(0.01)
+        if self._idx >= len(self._lines):
+            return b""
+        line = self._lines[self._idx]
+        self._idx += 1
+        return line
+
+
+def test_run_stream_template_input_bytes_spawns_pipe_and_writes(monkeypatch):
+    """input_bytes 지정 시 stdin=PIPE 로 spawn 하고, write→drain→close(→
+    wait_closed) 순으로 정확히 그 바이트를 전달해야 한다."""
+    events = [{"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "ok"}]}}]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    proc.stdout = _SlowFakeReadline(jsonl_bytes(events))
+    fake_stdin = MagicMock()
+    fake_stdin.drain = AsyncMock()
+    fake_stdin.wait_closed = AsyncMock()
+    proc.stdin = fake_stdin
+    captured_kwargs: dict = {}
+
+    async def fake_create(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    provider = ClaudeProvider()
+    state = StreamState()
+    payload = b"hello-stdin-payload (issue #44)"
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["fake"], state, model="m", input_bytes=payload)]
+
+    chunks = asyncio.run(run())
+    assert captured_kwargs.get("stdin") == asyncio.subprocess.PIPE
+    fake_stdin.write.assert_called_once_with(payload)
+    fake_stdin.drain.assert_awaited_once()
+    fake_stdin.close.assert_called_once()
+    fake_stdin.wait_closed.assert_awaited_once()
+    assert chunks[-1].type == "done"
+
+
+def test_run_stream_template_input_bytes_write_error_swallowed(monkeypatch):
+    """자식이 stdin 을 안 읽고 먼저 죽어 write/drain 이 BrokenPipeError 를
+    내도, 스트림 자체는 정상적으로 완료돼야 한다(mock 단위 — 회로만 검증;
+    실제 프로세스 케이스는 아래 real-subprocess 테스트가 담당)."""
+    events = [{"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "ok"}]}}]
+    proc = make_fake_proc(stdout_lines=jsonl_bytes(events), returncode=0)
+    proc.stdout = _SlowFakeReadline(jsonl_bytes(events))
+    fake_stdin = MagicMock()
+    fake_stdin.drain = AsyncMock(side_effect=BrokenPipeError())
+    proc.stdin = fake_stdin
+    patch_subprocess_exec(monkeypatch, proc)
+    provider = ClaudeProvider()
+    state = StreamState()
+
+    async def run():
+        return [c async for c in provider._run_stream_template(
+            ["fake"], state, model="m", input_bytes=b"x" * 100)]
+
+    chunks = asyncio.run(run())
+    types = [c.type for c in chunks]
+    assert types[-1] == "done", (
+        f"write 에러가 stream 자체를 죽이면 안 된다, got {types}")
+    fake_stdin.drain.assert_awaited_once(), (
+        "이 테스트는 실제로 BrokenPipeError 경로를 타야 의미가 있다")
+
+
+# ---- claude/codex stream_async 배선 (mock 단위 — 빠름) ----
+
+
+def _big_prompt() -> str:
+    return "x" * (PROMPT_STDIN_THRESHOLD + 1)
+
+
+def test_claude_stream_async_large_prompt_threads_input_bytes(monkeypatch):
+    """claude stream_async: 8000바이트 초과 프롬프트는 _build_cmd 에
+    prompt_via_stdin=True, _run_stream_template 에 input_bytes=프롬프트
+    바이트로 전달돼야 한다 (issue #44)."""
+    from agentcli.types import Message, StreamChunk
+
+    captured: dict = {}
+
+    async def fake_template(self, cmd, state, **kwargs):
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        yield StreamChunk(type="done", session_id="s")
+
+    monkeypatch.setattr(ClaudeProvider, "_find_binary",
+                        lambda self: "/usr/bin/claude")
+    monkeypatch.setattr(
+        "agentcli.providers.base.LLMProvider._run_stream_template",
+        fake_template)
+    prov = ClaudeProvider()
+    big = _big_prompt()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content=big)])]
+
+    asyncio.run(run())
+    assert big not in captured["cmd"], "큰 프롬프트가 argv 에 남으면 안 된다"
+    assert captured["cmd"][captured["cmd"].index("-p") + 1] == "--output-format"
+    assert captured.get("input_bytes") == big.encode("utf-8")
+
+
+def test_claude_stream_async_small_prompt_stays_argv_byte_identical(monkeypatch):
+    """작은 프롬프트는 기존과 byte-identical — argv 에 그대로, input_bytes=None."""
+    from agentcli.types import Message, StreamChunk
+
+    captured: dict = {}
+
+    async def fake_template(self, cmd, state, **kwargs):
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        yield StreamChunk(type="done", session_id="s")
+
+    monkeypatch.setattr(ClaudeProvider, "_find_binary",
+                        lambda self: "/usr/bin/claude")
+    monkeypatch.setattr(
+        "agentcli.providers.base.LLMProvider._run_stream_template",
+        fake_template)
+    prov = ClaudeProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="small prompt")])]
+
+    asyncio.run(run())
+    assert captured["cmd"][captured["cmd"].index("-p") + 1] == "small prompt"
+    assert captured.get("input_bytes") is None
+
+
+def test_codex_stream_async_large_prompt_threads_dash_sentinel_and_input_bytes(
+        monkeypatch):
+    """codex stream_async: 8000바이트 초과 프롬프트는 `--` 뒤 위치인자가
+    stdin sentinel '-' 이고, _run_stream_template 에 input_bytes 로 전달돼야
+    한다 (issue #44)."""
+    from agentcli.types import Message, StreamChunk
+
+    captured: dict = {}
+
+    async def fake_template(self, cmd, state, **kwargs):
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        yield StreamChunk(type="done", session_id="s")
+
+    monkeypatch.setattr(CodexProvider, "_find_binary",
+                        lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    monkeypatch.setattr(
+        "agentcli.providers.base.LLMProvider._run_stream_template",
+        fake_template)
+    prov = CodexProvider()
+    big = _big_prompt()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content=big)])]
+
+    asyncio.run(run())
+    assert big not in captured["cmd"]
+    assert captured["cmd"][-1] == "-"
+    assert captured.get("input_bytes") == big.encode("utf-8")
+
+
+def test_codex_stream_async_small_prompt_stays_argv_byte_identical(monkeypatch):
+    """작은 프롬프트는 codex stream_async 도 기존과 byte-identical."""
+    from agentcli.types import Message, StreamChunk
+
+    captured: dict = {}
+
+    async def fake_template(self, cmd, state, **kwargs):
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        yield StreamChunk(type="done", session_id="s")
+
+    monkeypatch.setattr(CodexProvider, "_find_binary",
+                        lambda self: "/usr/bin/codex")
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: {"PATH": "/usr/bin"})
+    monkeypatch.setattr(
+        "agentcli.providers.base.LLMProvider._run_stream_template",
+        fake_template)
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content="small prompt")])]
+
+    asyncio.run(run())
+    assert captured["cmd"][-1] == "small prompt"
+    assert captured.get("input_bytes") is None
+
+
+# ---- real subprocess: 실제로 바이트가 stdin 을 통해 자식에 도달하는지 ----
+
+_CLAUDE_FAKE_CLI_SCRIPT = textwrap.dedent(
+    '''
+    import json, sys
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+    data = sys.stdin.buffer.read()
+    n = len(data)
+    send({"type": "system", "subtype": "init", "session_id": "fake-sid"})
+    send({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "stdin_len=%d" % n}]}})
+    send({"type": "result", "subtype": "success",
+          "result": "stdin_len=%d" % n,
+          "usage": {"input_tokens": 1, "output_tokens": 1},
+          "session_id": "fake-sid"})
+    '''
+)
+
+_CODEX_FAKE_CLI_SCRIPT = textwrap.dedent(
+    '''
+    import json, sys
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+    data = sys.stdin.buffer.read()
+    n = len(data)
+    send({"type": "thread.started", "thread_id": "fake-tid"})
+    send({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "stdin_len=%d" % n}})
+    send({"type": "turn.completed",
+          "usage": {"input_tokens": 1, "output_tokens": 1}})
+    '''
+)
+
+
+def test_claude_stream_async_large_prompt_delivered_via_real_stdin(
+        tmp_path, monkeypatch):
+    """실제 subprocess 로 8000바이트 초과 프롬프트가 spawn argv 가 아니라
+    stdin 을 통해 전달되는지 끝까지 검증한다 — fake CLI 가 받은 stdin 길이를
+    JSONL 로 에코, stream_async 가 그걸 text 청크로 정규화해야 한다."""
+    from agentcli.types import Message
+
+    launcher = write_fake_cli_launcher(
+        tmp_path, _CLAUDE_FAKE_CLI_SCRIPT, name="fake-claude")
+    big = "y" * (PROMPT_STDIN_THRESHOLD + 500)
+    expected_len = len(big.encode("utf-8"))
+
+    spawned_cmds: list[list] = []
+    orig_create = asyncio.create_subprocess_exec
+
+    async def spy_create(*args, **kwargs):
+        spawned_cmds.append(list(args))
+        return await orig_create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_create)
+
+    async def run():
+        with patch.object(ClaudeProvider, "_find_binary",
+                          return_value=launcher):
+            prov = ClaudeProvider()
+            return [c async for c in prov.stream_async(
+                [Message(role="user", content=big)], timeout=10)]
+
+    chunks = asyncio.run(asyncio.wait_for(run(), timeout=20))
+    assert spawned_cmds, "subprocess 가 spawn 되어야 한다"
+    assert big not in spawned_cmds[0], "큰 프롬프트가 실제 spawn argv 에 남으면 안 된다"
+    texts = [c.content for c in chunks if c.type == "text"]
+    assert texts and texts[0] == f"stdin_len={expected_len}", (
+        f"fake CLI 가 받은 stdin 길이가 실제 프롬프트 길이와 일치해야 한다, "
+        f"got {texts}")
+    assert chunks[-1].type == "done"
+
+
+def test_codex_stream_async_large_prompt_delivered_via_real_stdin(
+        tmp_path, monkeypatch):
+    """codex 버전 — `--` 뒤 stdin sentinel '-' 로 spawn 하고, 실제로 바이트가
+    stdin 을 통해 전달되는지 검증."""
+    from agentcli.types import Message
+
+    launcher = write_fake_cli_launcher(
+        tmp_path, _CODEX_FAKE_CLI_SCRIPT, name="fake-codex")
+    big = "y" * (PROMPT_STDIN_THRESHOLD + 500)
+    expected_len = len(big.encode("utf-8"))
+
+    monkeypatch.setattr(CodexProvider, "_find_binary", lambda self: launcher)
+    monkeypatch.setattr("agentcli.providers.codex.build_env",
+                        lambda: dict(os.environ))
+
+    spawned_cmds: list[list] = []
+    orig_create = asyncio.create_subprocess_exec
+
+    async def spy_create(*args, **kwargs):
+        spawned_cmds.append(list(args))
+        return await orig_create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_create)
+    prov = CodexProvider()
+
+    async def run():
+        return [c async for c in prov.stream_async(
+            [Message(role="user", content=big)], timeout=10)]
+
+    chunks = asyncio.run(asyncio.wait_for(run(), timeout=20))
+    assert spawned_cmds, "subprocess 가 spawn 되어야 한다"
+    assert big not in spawned_cmds[0]
+    assert spawned_cmds[0][-1] == "-", "stdin 모드에선 `--` 뒤 위치인자가 '-' 여야 한다"
+    texts = [c.content for c in chunks if c.type == "text"]
+    assert texts and texts[0] == f"stdin_len={expected_len}", (
+        f"fake CLI 가 받은 stdin 길이가 실제 프롬프트 길이와 일치해야 한다, "
+        f"got {texts}")
+    assert chunks[-1].type == "done"
+
+
+def test_run_stream_template_child_exits_without_reading_stdin_no_hang(caplog):
+    """자식이 stdin 을 전혀 읽지 않고 즉시 종료해도 stream 은 hang 없이
+    정상 완료돼야 하고, stdin writer task 가 pending 인 채 방치되어 "Task was
+    destroyed but it is pending!" 경고를 남기면 안 된다 (issue #44).
+
+    payload 를 OS 파이프 버퍼(보통 64KB)보다 훨씬 크게 잡아, 자식이 안 읽고
+    먼저 종료했을 때 writer 의 drain() 이 실제로 BrokenPipeError/
+    ConnectionResetError 를 만나는 경로를 실행시킨다.
+    """
+    import gc
+    import logging
+
+    child_script = textwrap.dedent(
+        '''
+        import json, sys
+        sys.stdout.write(json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text",
+                         "text": "done-without-reading-stdin"}]}}) + "\\n")
+        sys.stdout.write(json.dumps({"type": "result", "subtype": "success",
+            "result": "done-without-reading-stdin"}) + "\\n")
+        sys.stdout.flush()
+        '''
+    )
+    provider = ClaudeProvider()
+    state = StreamState()
+    big_payload = b"z" * 2_000_000  # 파이프 기본 용량(수십 KB)보다 훨씬 큼
+
+    async def run():
+        chunks = [c async for c in provider._run_stream_template(
+            [sys.executable, "-c", child_script], state,
+            model="m", timeout=10, input_bytes=big_payload)]
+        # 남은 이벤트 루프 tick 을 흘려보내 방금 끝난 task 들의 정리를 유도.
+        await asyncio.sleep(0)
+        # stdin writer task 만 겨냥해 필터링한다. py3.11 의 asyncio.wait_for 는
+        # 별도 래퍼 task 를 만들어(3.12+ 는 asyncio.timeout 기반이라 없음)
+        # all_tasks() 에 자기 자신이 잡히므로, "current 제외 전부" 방식은
+        # 버전에 따라 오탐한다.
+        pending = [t for t in asyncio.all_tasks()
+                  if t is not asyncio.current_task()
+                  and "_write_stdin_payload" in repr(t)]
+        return chunks, pending
+
+    with caplog.at_level(logging.ERROR, logger="asyncio"):
+        chunks, pending = asyncio.run(asyncio.wait_for(run(), timeout=20))
+        gc.collect()
+
+    assert not pending, f"stdin writer task 가 pending 인 채 남으면 안 된다: {pending}"
+    assert chunks, "stream 이 정상적으로 청크를 방출해야 한다"
+    assert chunks[-1].type == "done", (
+        f"자식이 stdin 을 안 읽어도 stream 은 정상 완료돼야 한다, "
+        f"got types={[c.type for c in chunks]}")
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "done-without-reading-stdin" in text
+    assert not any("Task was destroyed" in r.message for r in caplog.records), (
+        "stdin writer task 가 pending 인 채 방치되면 안 된다 (pending task 경고)")
