@@ -58,7 +58,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 
 **대화 히스토리의 single source of truth는 provider CLI 세션입니다.** 라이브러리는 provider별 `session_id`만 저장하고 이전 대화를 prompt에 다시 주입하지 않습니다. 이 원칙 때문에 토큰 중복, 히스토리 중복 저장, 예측하기 어려운 context 증가를 피할 수 있습니다.
 
-- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다. 단 하나의 예외는 Windows의 Claude로, `-p` + `--resume` 조합이 인터랙티브 입력 대기로 빠져 행이 걸릴 수 있어(issue #4) 무상태로 동작합니다. macOS/Linux의 Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지).
+- 새 호출은 새 CLI 세션을 만들거나 기존 `session_id`로 resume합니다(전 플랫폼). Claude는 첫 호출에서 `--session-id`를 발급하고 이후 같은 대화에서 `--resume <sid>`로 이어갑니다(Claude Code 2.1.x에서 검증, resume해도 동일 ID 유지). 과거 Windows hang(issue #4)은 stdin이 항상 EOF가 되도록 spawn하면서 전제가 해소되어 Windows resume 가드를 제거했습니다(issue #27, Windows 11에서 검증 완료).
 - `Conversation.metadata["session_id:<provider>"]`만 저장합니다.
 - `system_prompt`와 `AgentProfile.instructions`는 해당 지시문 hash를 세션이 아직 보지 않았거나 변경되었을 때만 주입합니다.
 - 세션이 없는 custom provider를 추가할 경우에만 라이브러리가 이전 messages를 직렬화할 수 있습니다.
@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -360,8 +360,8 @@ results = await ctx.fork_many(
 
 ## Provider 기능 비교
 
-기능은 **provider 마다, 그리고 OS 마다** 다르다(예: claude 는 Windows 에서 세션
-없음). 추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
+기능은 provider 마다 다르고, provider 가 OS 별로 다른 값을 선언할 수도 있다.
+추측하지 말고 호출 전에 질의하라 — 이 제어기가 "이 기능이 이 provider 에서
 여기서 되나?"의 단일 진실 소스다:
 
 ```python
@@ -375,7 +375,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Capability | claude | codex | copilot | kiro |
 |---|---|---|---|---|
-| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
 | `streaming` | ✅ | ✅ | ✅ | ✅ |
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
 | `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
@@ -392,14 +392,40 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
-| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
+| `ClaudeProvider` | ✅ | ✅ | 첫 호출에서 `--session-id` 발급; 이후 `--resume <sid>` 전달 |
 | `CodexProvider` | ✅ | ✅ | `thread.started.thread_id` 파싱 |
 | `CopilotProvider` | ✅ | ✅ | `result.sessionId` 파싱 |
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` 결과의 `sessionId`; 전송 계층 = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
 
-`ClaudeProvider`는 macOS/Linux에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). Windows에서는 `-p`와 `--resume` 조합이 인터랙티브 입력 대기로 빠질 수 있어(issue #4) 무상태로 동작합니다.
+`ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 spawn 경로도 CLI가 읽을 수 있는 stdin을 열어두지 않습니다 — 서브프로세스 헬퍼가 `stdin=DEVNULL`을 설정하거나, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30)입니다. 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
+
+### 상주(warm) claude 세션
+
+`claude -p` 는 호출마다 하네스 전체를 부팅한다. 지연에 민감한 호출자를 위해
+`agentcli.providers.warm` 은 프로세스를 한 번만 열고 stdin 으로 프롬프트를 계속
+먹인다 — 실측 TTFT 가 호출당 6.3~11.1s 에서 0.8~1.7s 로 떨어진다.
+
+```python
+from agentcli.providers.warm import open_warm
+
+s = await open_warm(append_system_prompt=COMPANY_RULES)
+async for chunk in s.stream("연차 이월은 어느 규정인가?"):
+    if chunk.type == "text":
+        print(chunk.content, end="")
+
+await s.send("/clear")     # 이전 턴들을 버린다 — session_id 가 바뀐다
+print(s.session_id)        # 서비스에 넘겨 나중에 이어받는다
+await s.close()
+```
+
+범위는 의도적으로 좁다: **상주 모드를 열고 그 `session_id` 를 넘겨주는 것**까지다.
+풀링·동시성·liveness 감시·재기동 후 잔여 프로세스 정리는 소비하는 서비스의 일이다 —
+agentcli 는 저장소를 스스로 고르지 않고 자기 소유가 아닌 프로세스를 건드리지 않는다.
+상주 세션 하나는 직렬이므로 병렬이 필요하면 여러 개를 연다. 자세한 내용은
+[docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md).
+
 
 ### Reasoning 제어
 
@@ -465,12 +491,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-현재 668개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
+현재 793개 테스트가 session routing, async/streaming parity, alias resolution, health check, drift detection, usage aggregation, profile materialization, SQLite session persistence, 같은 conversation 동시 호출 직렬화, lean/debug 커맨드 빌딩, partial-message 토큰 스트리밍, 프로세스 그룹 teardown, Codex/Copilot JSONL parsing을 다룹니다.
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.6.4`
-- 릴리즈 노트: [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
+- 현재 릴리즈: `0.7.1`
+- 릴리즈 노트: [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 - Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 

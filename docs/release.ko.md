@@ -22,7 +22,7 @@ API가 아직 beta이고 실제 Claude Code, Codex, GitHub Copilot CLI 환경에
 5. 사용자는 다음 명령으로 설치할 수 있습니다.
 
    ```bash
-   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
+   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
    ```
 
 ## 2단계: PyPI 릴리즈
@@ -48,7 +48,7 @@ GitHub 릴리즈로 기본 외부 검증을 받은 뒤, 패키지 이름을 안�
 4. 사용자는 다음 명령으로 설치할 수 있습니다.
 
    ```bash
-   pip install agentcli
+   pip install agentcli-py
    ```
 
 ## 자동 릴리즈 (GitHub Actions)

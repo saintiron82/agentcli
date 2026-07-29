@@ -204,12 +204,12 @@ class ProviderCapabilities:
     """한 provider 가 (현재 OS 에서) 실제로 제공하는 기능 선언.
 
     "이 기능이 이 provider 에서 되나?" 를 호출 전에 확실히 알기 위한 제어기.
-    provider 마다, 그리고 OS 마다 다르다 (예: claude 세션은 Windows 에서 False).
+    provider 마다 다르고, provider 가 OS 별로 다른 값을 선언할 수도 있다.
     ``options`` 는 그 provider 의 호출이 받는 ``provider_options`` 키 집합 —
     여기 없는 키는 ``_supported_kwargs`` 가 조용히 버린다.
     """
     provider: str
-    sessions: bool            # 세션 resume 지원 (claude 는 Windows 에서 False)
+    sessions: bool            # 세션 resume 지원
     streaming: bool           # 증분 스트리밍
     token_streaming: bool     # 토큰 단위 델타 (False = 메시지 블록 단위)
     session_recovery: bool    # 죽은 세션 자동 재개

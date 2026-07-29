@@ -102,7 +102,7 @@ flow** (shows a code, approve it in any browser) — it works headless.
 ## 4. Install agentcli
 
 ```bash
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.0"
 ```
 
 > Zero runtime dependencies, so the pip step is light. The import name is
@@ -215,7 +215,7 @@ it on a private mesh with **Tailscale** (`pkg install tailscale`, then
 1. Get Termux from **F-Droid/GitHub**.
 2. Install **only the provider CLIs you'll use** — prefer claude (JS, stable) and copilot (gh extension, device-flow); **codex may break on arm64**.
 3. **Subscription-login** each CLI (agentcli has no credentials).
-4. `pip install ...@v0.6.4` for agentcli (zero deps).
+4. `pip install ...@v0.7.0` for agentcli (zero deps).
 5. Verify with a health check, then a one-shot call.
 6. Add the server yourself with stdlib; expose via Tailscale.
 7. Latency, battery, and background kills are the real enemies → lean mode + wakelock.

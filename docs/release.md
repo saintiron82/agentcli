@@ -24,7 +24,7 @@ real Claude Code, Codex, and GitHub Copilot CLI behavior.
 5. Users can install with:
 
    ```bash
-   pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
+   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.4.2"
    ```
 
 ## Stage 2: PyPI release
@@ -51,7 +51,7 @@ name should become the stable public install path.
 4. Users can install with:
 
    ```bash
-   pip install agentcli
+   pip install agentcli-py
    ```
 
 ## Automated release (GitHub Actions)

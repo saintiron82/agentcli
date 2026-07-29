@@ -1,6 +1,37 @@
 # Changelog
 
-## 0.7.0 — unreleased
+## 0.7.1 — 2026-07-28
+
+### Added
+- **Warm (persistent) claude sessions (#48).** `agentcli.providers.warm` opens a
+  claude process once with `--input-format stream-json` and keeps feeding it
+  prompts over stdin, so the harness boots one time instead of per call.
+  Measured on Windows 11 / Claude Code 2.1.220 (lean): first turn 6.40s of which
+  ~4.7s is boot, then 2.69s / 1.61s / 1.65s — after boot, wall clock ≈ the
+  CLI-reported turn time, so harness overhead is effectively zero. TTFT
+  0.8–1.7s against 6.3–11.1s for the cold `-p` path.
+
+      s = await open_warm(append_system_prompt=RULES)
+      s.session_id                       # the one thing handed to the caller
+      async for chunk in s.stream("..."):   # standard StreamChunk contract
+          ...
+      await s.send("/clear")             # just a message; session_id changes
+      await s.close()
+
+  **Scope is deliberately narrow: open warm mode and hand over its
+  `session_id`.** Pooling, concurrency, overflow, liveness supervision,
+  restart-time residual-process discovery or termination, and any global file or
+  database for them are the consuming service's job — agentcli never picks its
+  own storage and never inspects or kills processes it does not own. A single
+  warm session is serial; open several if you need parallelism. Reattaching to a
+  live warm process from another process is impossible (pipes die with the
+  parent) — carry the conversation instead via `resume_session_id`.
+
+  claude-only, and outside the shared provider contract: warm mode is a separate
+  module, not a `provider_options` key or a `ProviderCapabilities` field, so the
+  three-provider normalization contract is untouched.
+
+## 0.7.0 — 2026-07-28
 
 ### Added
 - **Normalized reasoning controls.** First-class `effort` (minimal…max) and
@@ -18,6 +49,25 @@
   identical to before.
 
 ### Changed
+- **Claude session resume now works on Windows too (issue #27).** The Windows
+  `supports_sessions=False` guard (added for the issue #4 `-p` + `--resume`
+  5-minute hang) is removed. Root cause of #4 was an interactive **stdin** wait;
+  no spawn path leaves stdin open for the CLI to read from — the subprocess
+  helpers set `DEVNULL`, or `PIPE` written and closed for prompts over 8,000
+  UTF-8 bytes (issue #30) — so the hang can't occur. `run_subprocess_async`
+  used to inherit the parent's stdin when given neither, which reproduced the
+  #4 hang against a live parent stdin (`timed_out=True, rc=124`); it now
+  always closes stdin it does not write to, matching the sync helper. `ClaudeProvider.supports_sessions` is now
+  `True` on every platform, so `owner`+`alias` session reuse (and `ContextSession`
+  pin-then-`refine`) works on Windows — no more re-sending the context every
+  call. Stale sessions still fall back to a fresh session via the
+  `STALE_SESSION_MARKER` auto-recovery path. **Behavior change on Windows:**
+  repeated calls with the same `owner`+`alias` now continue one conversation
+  instead of starting a fresh one each time — code that relied on the old
+  stateless behavior should pass `new_session=True` (or use a new alias).
+  Verified end-to-end on Windows 11 / Claude Code 2.1.220: plain resume,
+  >8KB-via-stdin resume, and MCP-on resume all keep session continuity without
+  hanging.
 - **`CopilotProvider(effort=...)` now validates against the canonical scale.**
   Previously (since v0.2.0) any string was passed straight through to the
   CLI's `--effort` flag. It now resolves through the same canonical scale as

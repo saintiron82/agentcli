@@ -70,7 +70,7 @@ For a fuller product boundary, see [docs/positioning.md](docs/positioning.md).
 
 **The CLI session is the single source of truth for history.** The library stores only `session_id` per provider — it does not re-inject prior turns into prompts. This is what keeps the library lightweight and tokens predictable.
 
-- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag). The one exception is Claude on Windows, which stays stateless — see [Provider capabilities](#provider-capabilities).
+- Each call either starts a new session (library captures the sid) or resumes (library supplies the sid via CLI flag), on every platform — see [Provider capabilities](#provider-capabilities).
 - `Conversation.metadata["session_id:<provider>"]` is persisted; content is not.
 - `system_prompt` / `AgentProfile.instructions` are injected only when a session has not seen that instruction hash yet, or when the instruction changes; prior user/assistant turns are not.
 - Sessionless providers (e.g., plain HTTP models if added later) still work — the library serializes prior messages for them.
@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli @ git+https://github.com/saintiron82/agentcli.git@v0.6.4"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -370,8 +370,8 @@ use: durable session handles and usage logs, not conversation history.
 
 ## Provider capabilities
 
-Capabilities differ per provider **and per OS** (e.g. claude has no sessions on
-Windows). Query them before calling instead of guessing — the controller is the
+Capabilities differ per provider, and a provider may declare different values
+per OS. Query them before calling instead of guessing — the controller is the
 source of truth for "does this feature work on this provider here?":
 
 ```python
@@ -385,7 +385,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 
 | Capability | claude | codex | copilot | kiro |
 |---|---|---|---|---|
-| `sessions` (resume) | ✅ (Win ❌) | ✅ | ✅ | ✅ |
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
 | `streaming` | ✅ | ✅ | ✅ | ✅ |
 | `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
 | `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
@@ -402,21 +402,51 @@ version and `call_id`). kiro (ACP) has no debug instrumentation.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
-| `ClaudeProvider` | ✅ (macOS/Linux) · ❌ (Windows) | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
+| `ClaudeProvider` | ✅ | ✅ | First call mints `--session-id`; later calls pass `--resume <sid>` |
 | `CodexProvider` | ✅ | ✅ | Parsed from `thread.started.thread_id` |
 | `CopilotProvider` | ✅ | ✅ | Parsed from `result.sessionId` |
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` result `sessionId`; transport = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider` drives `kiro-cli acp` (line-delimited JSON-RPC 2.0) as one-shot turns per call: `initialize` → first turn `session/new` / resume `session/load(stored sessionId)` → `session/prompt` → `session/update` stream. Token usage comes from `usage_update` notifications; permissions are auto-answered via `session/request_permission` (`trust_all`/`trust_tools`). Authentication uses `KIRO_API_KEY` (or `kiro-cli login`).
 
-`ClaudeProvider` runs `claude -p` with native session resume on macOS/Linux:
+`ClaudeProvider` runs `claude -p` with native session resume on every platform:
 the first call mints a fresh `--session-id`, the library stores it, and later
 calls on the same conversation pass `--resume <sid>`. The resumed session keeps
-the same ID (verified against Claude Code 2.1.x). On Windows, `-p` combined
-with `--resume` can fall back to interactive input and hang (issue #4), so the
-provider stays stateless there: each call gets a fresh per-call `--session-id`
-used for usage audit only, and no conversation content is persisted by the
-library.
+the same ID (verified against Claude Code 2.1.x). The earlier Windows hang
+(issue #4) was caused by an interactive **stdin** wait. No spawn path leaves
+stdin open for the CLI to read from: the subprocess helpers set `stdin=DEVNULL`,
+or `stdin=PIPE` written and closed immediately for prompts over 8,000 UTF-8
+bytes (issue #30). So that wait cannot happen. The Windows guard was removed in issue #27 and
+verified end-to-end on Windows 11 / Claude Code 2.1.220 (plain, >8KB-via-stdin,
+and MCP-on resume all keep session continuity without hanging). No conversation
+content is persisted by the library.
+
+### Warm (persistent) claude sessions
+
+`claude -p` boots the whole harness per call. For latency-sensitive callers,
+`agentcli.providers.warm` opens the process once and keeps feeding it prompts
+over stdin — measured TTFT drops from 6.3–11.1s per call to 0.8–1.7s.
+
+```python
+from agentcli.providers.warm import open_warm
+
+s = await open_warm(append_system_prompt=COMPANY_RULES)
+async for chunk in s.stream("Which rule covers carryover?"):
+    if chunk.type == "text":
+        print(chunk.content, end="")
+
+await s.send("/clear")     # drop the previous turns; session_id changes
+print(s.session_id)        # hand this to your service to resume later
+await s.close()
+```
+
+Scope is deliberately narrow: **open warm mode and hand over its `session_id`.**
+Pooling, concurrency, liveness supervision, and cleaning up residual processes
+after a restart belong to the consuming service — agentcli never picks its own
+storage and never touches processes it does not own. One warm session is serial;
+open several for parallelism. See
+[docs/releases/v0.7.1.md](docs/releases/v0.7.1.md).
+
 
 ### Reasoning controls
 
@@ -684,7 +714,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-668 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
+793 tests cover session routing, async/streaming parity, alias resolution, health checks, drift detection, usage aggregation, profile materialization, SQLite session persistence, same-conversation concurrency, lean/debug command building, partial-message token streaming, process-group teardown, and Codex/Copilot JSONL parsing.
 
 ## Status
 
@@ -694,14 +724,14 @@ pytest
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
 - Runtime deps: **none**.
-- Tested on macOS. Linux should work (same CLI invocation path); Windows partial (only via `gh copilot` wrapper).
+- Tested on macOS and Windows 11; Linux should work (same CLI invocation path). CI runs ubuntu/macOS. copilot on Windows requires the `gh copilot` wrapper.
 
 ## Documentation
 
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.6.4 release note: [docs/releases/v0.6.4.md](docs/releases/v0.6.4.md) / [docs/releases/v0.6.4.ko.md](docs/releases/v0.6.4.ko.md)
+- v0.7.1 release note: [docs/releases/v0.7.1.md](docs/releases/v0.7.1.md) / [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
 - Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)
 
 ## License

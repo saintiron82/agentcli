@@ -286,8 +286,8 @@ class LLMProvider(ABC):
 
         ``options`` 는 ``invoke``/``stream_async`` 시그니처에서 자동 유래 —
         ``_supported_kwargs`` 와 같은 기준이라 "이 옵션이 이 provider 에서
-        먹히나?" 가 정확하다. ``supports_sessions`` 가 platform-conditional 인
-        claude 처럼 OS 에 따라 값이 달라진다.
+        먹히나?" 가 정확하다. provider 가 OS 별로 다른 값을 선언하면 그대로
+        반영된다 (현재 등록된 네 provider 는 모두 전 플랫폼 동일).
         """
         import inspect
         from ..types import ProviderCapabilities
@@ -745,8 +745,13 @@ async def run_subprocess_async(
         timeout: 초 단위 wall timeout.
         cwd: subprocess cwd.
         env: subprocess env. ``None`` 이면 부모 환경 상속.
-        use_stdin_devnull: True 면 stdin 을 ``/dev/null`` 로 닫는다 (codex/copilot
-            처럼 stdin 입력 대기를 막아야 하는 CLI 용).
+        use_stdin_devnull: 하위 호환용 명시 플래그. **False 여도 stdin 을 상속하지
+            않는다** — ``input_bytes`` 가 없으면 언제나 ``DEVNULL`` 이다.
+            예전에는 이 값이 False 면 ``stdin`` 을 아예 설정하지 않아 부모 stdin 을
+            상속했고, 부모 stdin 이 살아 있으면 자식이 거기서 대기해 issue #4 의
+            5분+ hang 조건이 그대로 재현됐다(fail-open). ``run_subprocess_sync``
+            는 원래 DEVNULL 이 기본이었으므로 이제 sync/async 가 대칭이다
+            (issue #27 후속: 안전이 호출자 규율이 아니라 구조가 되도록).
         input_bytes: 지정하면 stdin 을 PIPE 로 열어 이 바이트를 write-then-close
             로 전달한다(issue #30: 큰 프롬프트를 argv 대신 stdin 으로 넘겨
             Windows 32,767자 명령행 한계를 우회). communicate() 가 쓰기 후 바로
@@ -762,10 +767,11 @@ async def run_subprocess_async(
         # 새 세션 분리 → 타임아웃/취소 시 손자까지 그룹 단위로 reap.
         **_new_session_kwargs(),
     }
-    if input_bytes is not None:
-        kwargs["stdin"] = asyncio.subprocess.PIPE
-    elif use_stdin_devnull:
-        kwargs["stdin"] = asyncio.subprocess.DEVNULL
+    # stdin 은 PIPE(write-then-close) 아니면 무조건 DEVNULL — 부모 stdin 을
+    # 상속하는 경로는 없다. 상속하면 부모 stdin 이 살아 있을 때 자식이 거기서
+    # 대기해 #4 의 hang 이 되살아난다 (issue #27 후속).
+    kwargs["stdin"] = (asyncio.subprocess.PIPE if input_bytes is not None
+                       else asyncio.subprocess.DEVNULL)
     if env is not None:
         kwargs["env"] = env
     if cwd is not None:
