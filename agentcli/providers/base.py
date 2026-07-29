@@ -121,6 +121,25 @@ def build_session_prompt(messages: list[Message]) -> str:
     return "\n\n".join(parts)
 
 
+def split_system_messages(messages: list[Message]) -> tuple[str, list[Message]]:
+    """system 메시지를 분리해 ``(system_text, 나머지 메시지)`` 로 돌려준다.
+
+    네이티브 system-prompt 플래그가 있는 provider 용 (#51, 현재 claude):
+    system 을 ``-p`` 문자열 안에 라벨 접두사로 평탄화하면 정적 블록이 매 호출
+    user 턴의 일부로 재전송되어 서버측 prompt cache 가 잡을 안정된 prefix 가
+    생기지 않는다. 분리해서 실제 ``--append-system-prompt`` 계열 플래그로
+    보내야 격리된다. user 턴이 하나도 없는 퇴화 입력은 빈 ``-p`` 를 만들지
+    않도록 분리하지 않고 기존 평탄화에 맡긴다(``("", messages)`` 반환).
+    합치는 규칙(빈 줄 join)은 ``build_session_prompt`` 와 동일.
+    """
+    system_parts = [m.content.strip() for m in messages
+                    if m.role == "system" and m.content.strip()]
+    rest = [m for m in messages if m.role != "system"]
+    if not system_parts or not rest:
+        return "", list(messages)
+    return "\n\n".join(system_parts), rest
+
+
 def estimate_payload_prompt_tokens(prompt: str) -> int:
     """Return a cheap estimate for the prompt string agentcli passed to the CLI."""
     text = prompt.strip()
@@ -162,6 +181,13 @@ def redact_argv(cmd: list[str]) -> list[str]:
         if (arg == "-p" and i + 1 < n
                 and cmd[i + 1] != _CLAUDE_STDIN_MODE_NEXT_FLAG):
             out.append(f"<prompt:{len(cmd[i + 1])} chars>")
+            i += 2
+            continue
+        # #51: system 블록 본문도 프롬프트와 같은 민감도 — trace 에 그대로
+        # 흘리지 않는다 (파일 변형 ``--append-system-prompt-file`` 은 경로만
+        # argv 에 실리므로 redact 불필요).
+        if arg == "--append-system-prompt" and i + 1 < n:
+            out.append(f"<system-prompt:{len(cmd[i + 1])} chars>")
             i += 2
             continue
         i += 1

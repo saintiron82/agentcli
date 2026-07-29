@@ -370,7 +370,9 @@ def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
     """provider 는 받은 메시지를 충실히 직렬화한다 — 세션 모드에서 이전 턴이
     프롬프트에 안 들어가는 것은 client 가 [system?, user] 만 담는 것으로
     보장된다 (test_session_routing). 명시 주입(inject_context)분은 Context
-    블록으로 전달되어야 한다."""
+    블록으로 전달되어야 한다. system 은 #51 부터 ``-p`` 평탄화 대신 실제
+    ``--append-system-prompt`` 플래그로 격리되어 전달된다 — 내용은 여전히
+    유실 없이 전부 CLI 에 도달한다."""
     mock_run.return_value = _sync(stdout="ok")
     p = ClaudeProvider()
     p.invoke([
@@ -380,7 +382,9 @@ def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
     ])
     cmd = mock_run.call_args[0][0]
     prompt = cmd[cmd.index("-p") + 1]
-    assert "Follow GUIDE v2" in prompt
+    assert cmd[cmd.index("--append-system-prompt") + 1] == "Follow GUIDE v2"
+    assert "Follow GUIDE v2" not in prompt, (
+        "#51: system 블록이 -p 에도 남으면 격리가 무의미하다(이중 전송)")
     assert "new question" in prompt
     assert "Context (injected by host application):" in prompt
     assert "[user:bull] injected note" in prompt
