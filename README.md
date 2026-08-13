@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.2"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -602,7 +602,7 @@ machine running the service. What gets in is one axis, `env`:
 
 | tier | what gets in | ctx tokens* | for |
 |---|---|---:|---|
-| `"inherit"` | everything on the host (pre-0.8 default) | 50.7k | dev tools that *want* the host setup |
+| `"inherit"` | everything on the host (pre-0.7.2 default) | 50.7k | dev tools that *want* the host setup |
 | `"explicit"` — **default** | only what you pass — `mcp_config`, `allowed_tools`, system prompt — plus built-in tools | 31.6k | embedded backends |
 | `"isolated"` | built-in tools only; even explicit `mcp_config` is dead (`--safe-mode`, issue #56) | 29.5k | hard isolation, tools kept |
 | `"lean"` | nothing — no customization, no tools | 4.8k | single completions |
@@ -612,11 +612,11 @@ Claude Code 2.1.229.
 
 ```python
 ClaudeProvider()                       # explicit: your mcp_config/allowed_tools only
-ClaudeProvider(env="inherit")          # restore pre-0.8 inheritance
+ClaudeProvider(env="inherit")          # restore pre-0.7.2 inheritance
 client.chat(..., provider_options={"env": "inherit"})    # or per call
 ```
 
-**Breaking change in 0.8.0:** the default used to be `inherit`. Calls that
+**Breaking change in 0.7.2:** the default used to be `inherit`. Calls that
 relied on host MCP servers / skills / CLAUDE.md must now pass
 `env="inherit"`. `lean=True` / `isolated=True` keep working as boolean
 aliases for their tiers; combining them with `env` raises `ValueError`.

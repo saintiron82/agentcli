@@ -178,7 +178,7 @@ class ClaudeProvider(LLMProvider):
                 - `"lean"` — `--safe-mode` + `--tools ""`. 툴도 없는 단일
                   completion 전용.
                 env 와 lean/isolated 별칭을 동시에 주면 ValueError(모호).
-                **0.8.0 브레이킹:** 기본이 inherit → explicit 으로 바뀌었다.
+                **0.7.2 브레이킹:** 기본이 inherit → explicit 으로 바뀌었다.
                 호스트 환경 상속에 의존하던 호출은 `env="inherit"` 를 명시.
             lean: `env="lean"` 의 부울 별칭(하위호환). 단일 completion(요약/
                 생성 등 툴이 필요 없는 1회 호출) 전용 경량
