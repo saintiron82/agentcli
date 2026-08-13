@@ -166,20 +166,22 @@ def test_owner_only_file_does_not_warn(monkeypatch, tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
-# _auth_env — env=None 하위호환 계약 / env dict 조립
+# _spawn_env — env=None 하위호환 계약 / env dict 조립
+# (#62 이후 "얹을 게 없다" = 토큰 없음 + 부모가 트래픽 var 를 이미 정의)
 # ---------------------------------------------------------------------------
 
-def test_auth_env_returns_none_when_no_token(monkeypatch, tmp_path):
+def test_spawn_env_returns_none_when_nothing_to_add(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     p = ClaudeProvider()
-    assert p._auth_env(None) is None
+    assert p._spawn_env(None) is None
 
 
-def test_auth_env_injects_token_and_inherits_os_environ(monkeypatch, tmp_path):
+def test_spawn_env_injects_token_and_inherits_os_environ(monkeypatch, tmp_path):
     monkeypatch.setenv("SOME_MARKER_VAR", "marker-value")
     p = ClaudeProvider(oauth_token="tok-xyz")
-    env = p._auth_env(None)
+    env = p._spawn_env(None)
     assert env is not None
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-xyz"
     assert env["SOME_MARKER_VAR"] == "marker-value"
@@ -194,6 +196,7 @@ def test_auth_env_injects_token_and_inherits_os_environ(monkeypatch, tmp_path):
 def test_invoke_no_token_passes_env_none(mock_find, mock_run, monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     mock_run.return_value = _sync(stdout='{"result":"ok"}')
     p = ClaudeProvider()
     p.invoke([Message(role="user", content="hi")])
@@ -255,6 +258,7 @@ def test_invoke_stale_retry_preserves_oauth_token(mock_find, mock_run):
 def test_invoke_async_no_token_passes_env_none(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     with patch("agentcli.providers.claude.run_subprocess_async",
                new=AsyncMock(
                    return_value=(b'{"result":"ok"}', b"", 0, False))) as mock_run, \
@@ -287,6 +291,7 @@ def test_stream_async_no_token_omits_env_kwarg(monkeypatch, tmp_path):
 
     monkeypatch.delenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     proc = make_fake_proc(stdout_lines=jsonl_bytes([
         {"type": "result", "subtype": "success", "result": "ok",
          "session_id": "sid-1", "usage": {"input_tokens": 1, "output_tokens": 1}},

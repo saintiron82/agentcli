@@ -112,7 +112,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.2"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.3"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -571,7 +571,8 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `env` (environment tier), `lean`, `isolated`, `debug`,
+  `disallowed_tools`, `env` (environment tier), `lean`, `isolated`,
+  `exclude_dynamic_system_prompt` (cache-stable prefix), `debug`,
   `debug_log_path`, `partial_messages` (streaming-only).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
@@ -632,6 +633,84 @@ and is ignored under `isolated`/`lean`. Known limit of `explicit`:
 CLAUDE.md auto-discovery is a separate CLI mechanism, so ~1k tokens of it
 still load — use `isolated` when that matters. Session resume works under
 every tier (verified live).
+
+### Performance guide (claude)
+
+Where the time goes on a `claude -p` call, and which lever cuts which part.
+All numbers measured on Claude Code 2.1.229 / macOS unless noted.
+
+**1. Anatomy of a call.** Wall time = harness boot + context processing +
+output generation. A realistic 20k-char "organize this document" job:
+
+| tier | wall | cumulative ctx tokens | what happened |
+|---|---:|---:|---|
+| `inherit` | 369.6s | 592,752 | model wandered into a multi-turn tool loop |
+| `explicit` | 265.4s | 529,211 | still tool-looped (built-in tools available) |
+| `lean` | 145.6s | 25,563 | single turn; wall ≈ pure output generation |
+
+**Pick the tier by workload**: data pipelines that only transform text →
+`lean` (tools can only slow them down); embedded agents that need tools →
+`explicit`; host-integrated dev tooling that wants your local MCP/skills →
+`inherit`.
+
+**2. Boot (~1–3s, was 3–11s on older CLIs).** agentcli spawns every child
+with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` by default (0.7.3) —
+update checks / telemetry / error reporting / release-note fetches are
+skipped, measured 3.0–3.1s → 2.0s per lean call. Your interactive `claude`
+is unaffected (the variable rides only the child's env). To opt out, set
+that variable yourself (any value) in the parent environment — an explicit
+parent value always wins. For many sequential calls, amortize boot to ~zero
+with a [warm session](#warm-persistent-claude-sessions).
+
+**3. Prompt caching (server-side).** Anthropic's cache matches the request
+*prefix* byte-for-byte, so keeping the prefix stable is everything:
+
+- The CLI's system prompt embeds **dynamic sections** — cwd, OS info, git
+  branch/status/recent commits, auto-memory paths. Any commit or file
+  change between calls shifts those bytes and invalidates everything after
+  them, **including your `system_prompt` block**. Opt in to
+  `exclude_dynamic_system_prompt=True` (constructor or per call) to move
+  those sections into the first user message so the prefix stays static —
+  measured across a git change: `cache_creation` 1693 → 519,
+  `cache_read` 3289 → 4219. Opt-in because older CLIs without the flag
+  fail with unknown-option; trade-off: environment context moves to the
+  user message, slightly lowering its instruction weight.
+- **The cache key includes model and effort.** Switching either between
+  calls is a full cache miss — pin them per batch.
+- Subscription auth gets a **1-hour cache TTL** on the main conversation
+  (drops to 5 minutes when usage credits are exhausted). Every cache hit
+  resets the timer.
+- Parallel sessions in the **same directory share the cache** — run one
+  call to completion first to build it, then release the rest.
+- A CLI upgrade changes the system prompt → full cache rebuild.
+- Verify all of this from `TokenUsage.cached_tokens` /
+  `cache_creation_tokens` (0.7.2) — don't guess.
+
+**4. Generation usually dominates.** In the table above, lean's 145s is
+almost entirely output-token generation (17k output tokens). Levers, in
+order of preference: batch fewer items per call; pick a faster model
+(`haiku` where quality allows); lower `effort` — **but effort/thinking
+changes output quality, so never lower it on quality-sensitive work
+without an A/B on your own task** (one real case here: sonnet refused
+security-related articles that opus processed, so the 11% speed cost of
+opus was the right trade). Remember effort is part of the cache key.
+
+**5. Concurrency.** Rate limits are pooled per account, not per session.
+Community reports (anecdotal, not systematic): bursts beyond ~3–4
+simultaneous spawns hit 429 (`Server is temporarily limiting requests`)
+even on top paid tiers. A queue with 3–4 concurrent children plus start
+jitter is a sensible default; combine with the same-directory cache-warming
+order above.
+
+**6. Known upstream issues.**
+
+- **claude-code#83859**: v2.1.220/221 headless `-p` can stall ~405s early
+  in a session (unresolved upstream). If you must run those versions, keep
+  subprocess timeouts ≥ 420s so a stall doesn't read as a hang; better,
+  upgrade the CLI.
+- **claude-code#5653**: a bloated `~/.claude.json` slows every startup —
+  repeated `-p` calls accumulate project history there; trim it
+  periodically on busy hosts.
 
 ### Lean mode & debug (claude)
 

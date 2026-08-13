@@ -64,11 +64,13 @@ spawn 하고, issue #4 류 무한 대기의 상한으로 턴별 타임아웃을 
 
 import asyncio
 import json
+import os
 import platform
 import shutil
 from typing import AsyncIterator
 
 from ..types import StreamChunk
+from .claude import NONESSENTIAL_TRAFFIC_ENV_VAR
 
 # 상주 프로세스를 stream-json 입출력 모드로 띄우는 데 필요한 플래그.
 # --verbose 는 선택이 아니라 CLI 가 강제한다(모듈 docstring 참고).
@@ -180,8 +182,12 @@ class WarmSession:
         }
         if self._cwd is not None:
             kwargs["cwd"] = self._cwd
-        if self._env is not None:
-            kwargs["env"] = self._env
+        # issue #62: 비필수 트래픽 차단을 기본으로 얹는다(부팅 ~1s 절감 실측).
+        # 호출자가 env 를 명시했으면 그 dict 를 훼손하지 않고 복사본에 보충만
+        # 하고, 호출자/부모가 이 var 를 이미 정의했으면 그 값을 존중한다.
+        env = dict(self._env) if self._env is not None else dict(os.environ)
+        env.setdefault(NONESSENTIAL_TRAFFIC_ENV_VAR, "1")
+        kwargs["env"] = env
         self._proc = await asyncio.create_subprocess_exec(*self._cmd, **kwargs)
         asyncio.ensure_future(self._drain_stderr())
 

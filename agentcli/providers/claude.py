@@ -49,6 +49,12 @@ OAUTH_TOKEN_ENV_VAR = "AGENTCLI_CLAUDE_OAUTH_TOKEN"
 # 쓸 수 있도록 agentcli 전용 위치에 둔다 — ``~/.claude*`` 는 절대 건드리지 않는다.
 OAUTH_TOKEN_FILE_REL = pathlib.PurePath(".agentcli") / "claude_oauth_token"
 
+# issue #62: spawn 자식의 비필수 네트워크(자동업데이트 체크/텔레메트리/에러
+# 리포팅/릴리스노트 페치)를 끈다 — 실측: lean 1회 호출 부팅 3.0~3.1s → 2.0s.
+# 자식 프로세스에만 얹으므로 사용자의 대화형 claude 자동업데이트는 영향 없다.
+# 부모 env 가 이 var 를 직접 정의하면 그 값을 존중한다(명시가 기본을 이긴다).
+NONESSENTIAL_TRAFFIC_ENV_VAR = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+
 CLAUDE_MODELS = [
     {"id": "", "name": "기본", "aliases": ["default"]},
     {"id": "best", "name": "Best available"},
@@ -149,7 +155,8 @@ class ClaudeProvider(LLMProvider):
                  partial_messages: bool = False,
                  effort: str | None = None,
                  thinking: str | None = None,
-                 oauth_token: str | None = None):
+                 oauth_token: str | None = None,
+                 exclude_dynamic_system_prompt: bool = False):
         """
         Args:
             permission_mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` 중 하나.
@@ -222,6 +229,18 @@ class ClaudeProvider(LLMProvider):
                 동작 불변).
             thinking: 정규화 reasoning thinking 기본값. claude CLI 는 thinking
                 토글이 없어 항상 무플래그 no-op 로 보고된다(clamp 아님).
+            exclude_dynamic_system_prompt: `--exclude-dynamic-system-prompt-sections`
+                를 붙여 시스템 프롬프트의 동적 섹션(cwd/OS/git 상태·최근 커밋/
+                auto memory 경로)을 첫 user 메시지로 옮긴다 (issue #62).
+                프리픽스가 정적화되어 호출 사이에 git 상태가 바뀌어도 —
+                `--append-system-prompt` 로 넣은 정적 블록(#51) 포함 —
+                서버측 프롬프트 캐시가 유지된다(실측: 사이에 git 변경을 넣은
+                2회 호출에서 cache_creation 1693→519, cache_read 3289→4219).
+                반복 배치·큰 system_prompt 워크로드에 권장. **옵트인** 인
+                이유: 이 플래그가 없는 구버전 CLI 는 unknown-option 으로
+                즉시 실패한다(2.1.229 지원 확인, 하한 버전 미상). 트레이드
+                오프: 환경 컨텍스트가 user 메시지로 이동해 지시 가중치가
+                소폭 낮아질 수 있다. 기본 False.
             oauth_token: agentcli 가 관리하는 claude OAuth 토큰 기본값(issue #36).
                 지정하면 호출마다 subprocess env 에 ``CLAUDE_CODE_OAUTH_TOKEN``
                 으로 주입해, ``~/.claude`` 가 read-only 로 마운트된 headless/
@@ -245,6 +264,7 @@ class ClaudeProvider(LLMProvider):
         self._effort = effort
         self._thinking = thinking
         self._oauth_token = oauth_token
+        self._exclude_dynamic_system_prompt = exclude_dynamic_system_prompt
 
     @staticmethod
     def _mcp_args(mcp_config: dict | str) -> list[str]:
@@ -328,23 +348,29 @@ class ClaudeProvider(LLMProvider):
         except (OSError, UnicodeDecodeError):
             return None
 
-    def _auth_env(self, oauth_token: str | None) -> dict | None:
-        """subprocess 에 넘길 env dict — issue #36.
+    def _spawn_env(self, oauth_token: str | None) -> dict | None:
+        """subprocess 에 넘길 env dict — issue #36(인증) + #62(부팅 절감).
 
-        토큰이 하나도 안 resolve 되면 ``None`` 을 반환한다: 호출부가 이를
-        ``run_subprocess_sync``/``run_subprocess_async``/``_run_stream_template``
-        에 그대로 넘기면 그 helper 들은 ``env=None`` 일 때 ``Popen``/
-        ``create_subprocess_exec`` 에 ``env=`` 자체를 넘기지 않아 부모 프로세스
-        env 를 상속한다 — 즉 기존 동작과 byte-identical(하위호환 계약).
-        토큰이 있으면 ``os.environ`` 복사본 위에 ``CLAUDE_CODE_OAUTH_TOKEN``
-        만 얹어 반환한다(원본 ``os.environ`` 은 변경하지 않음). 이 값은 절대
-        로깅하지 않는다 — env 로만 전달되고 argv/debug trace 어디에도
-        나타나지 않는다.
+        ``None`` 을 반환하면 호출부 helper 들(``run_subprocess_sync``/
+        ``run_subprocess_async``/``_run_stream_template``)이 ``env=`` 자체를
+        넘기지 않아 부모 프로세스 env 를 상속한다 — 얹을 것이 하나도 없을
+        때의 byte-identical 하위호환 계약. 얹는 것:
+        - ``NONESSENTIAL_TRAFFIC_ENV_VAR="1"`` — 부모가 이 var 를 정의하지
+          않았을 때만(정의했으면 상속이 곧 그 값의 존중이다).
+        - ``CLAUDE_CODE_OAUTH_TOKEN`` — 토큰이 resolve 되면(#36). 이 값은
+          절대 로깅하지 않는다 — env 로만 전달되고 argv/debug trace 어디에도
+          나타나지 않는다.
+        원본 ``os.environ`` 은 변경하지 않는다.
         """
         token = self._resolve_oauth_token(oauth_token)
-        if not token:
+        extra: dict = {}
+        if NONESSENTIAL_TRAFFIC_ENV_VAR not in os.environ:
+            extra[NONESSENTIAL_TRAFFIC_ENV_VAR] = "1"
+        if token:
+            extra["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        if not extra:
             return None
-        return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
+        return {**os.environ, **extra}
 
     def list_models(self) -> list[dict]:
         return list(CLAUDE_MODELS)
@@ -427,7 +453,8 @@ class ClaudeProvider(LLMProvider):
                    reasoning_args: list[str] | None = None,
                    prompt_via_stdin: bool = False,
                    append_system_prompt: str = "",
-                   append_system_prompt_file: str = "") -> tuple[list[str] | None, str]:
+                   append_system_prompt_file: str = "",
+                   exclude_dynamic_system_prompt: bool | None = None) -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
         permission_mode/allowed_tools/disallowed_tools/mcp_config/env/lean/
@@ -478,6 +505,13 @@ class ClaudeProvider(LLMProvider):
             # ``--help`` 미표기지만 동작 확인된 플래그 (v2.1.220, #51 리포트) —
             # 존재하지 않는 경로면 CLI 가 명시적 에러로 즉시 실패한다.
             cmd += ["--append-system-prompt-file", append_system_prompt_file]
+        use_exclude = (self._exclude_dynamic_system_prompt
+                       if exclude_dynamic_system_prompt is None
+                       else exclude_dynamic_system_prompt)
+        if use_exclude:
+            # issue #62: 동적 섹션(git 상태 등)을 첫 user 메시지로 옮겨 시스템
+            # 프롬프트 프리픽스를 정적화한다 — 위 append 블록의 캐시 생존이 목적.
+            cmd.append("--exclude-dynamic-system-prompt-sections")
         if output_format == "stream-json":
             # stream-json은 반드시 --verbose 필요 (Claude Code 제약)
             cmd.append("--verbose")
@@ -593,7 +627,8 @@ class ClaudeProvider(LLMProvider):
                debug_log_path: str | None = None,
                effort: str | None = None,
                thinking: str | None = None,
-               oauth_token: str | None = None) -> LLMResponse:
+               oauth_token: str | None = None,
+               exclude_dynamic_system_prompt: bool | None = None) -> LLMResponse:
         # issue #51: system 메시지는 ``-p`` 평탄화 대신 실제
         # ``--append-system-prompt`` 계열 플래그로 격리한다.
         system_text, chat_messages = split_system_messages(messages)
@@ -604,7 +639,7 @@ class ClaudeProvider(LLMProvider):
         # issue #36: agentcli 가 관리하는 claude OAuth 토큰 → subprocess env.
         # None 이면 run_subprocess_sync 가 env= 자체를 안 넘겨 기존 동작(부모
         # env 상속)과 byte-identical(하위호환 계약) — 토큰은 argv 에 안 실린다.
-        run_env = self._auth_env(oauth_token)
+        run_env = self._spawn_env(oauth_token)
         # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달 —
         # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
         prompt_bytes = prompt.encode("utf-8")
@@ -619,7 +654,8 @@ class ClaudeProvider(LLMProvider):
                 debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
-                append_system_prompt_file=sys_file)
+                append_system_prompt_file=sys_file,
+                exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             if cmd is None:
                 logger.error("Claude CLI를 찾을 수 없습니다")
                 return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -687,7 +723,8 @@ class ClaudeProvider(LLMProvider):
                     env=env, lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
-                    oauth_token=oauth_token)
+                    oauth_token=oauth_token,
+                    exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             err_msg = stderr_txt.strip()[:300]
             msg = err_msg or f"exit={rc}"
             logger.error("Claude 실패 (code=%d): %s", rc, msg)
@@ -736,7 +773,8 @@ class ClaudeProvider(LLMProvider):
                            debug_log_path: str | None = None,
                            effort: str | None = None,
                            thinking: str | None = None,
-                           oauth_token: str | None = None) -> LLMResponse:
+                           oauth_token: str | None = None,
+                           exclude_dynamic_system_prompt: bool | None = None) -> LLMResponse:
         # issue #51: invoke() 와 동일 — system 은 실제 플래그로 격리.
         system_text, chat_messages = split_system_messages(messages)
         prompt = build_session_prompt(chat_messages)
@@ -744,7 +782,7 @@ class ClaudeProvider(LLMProvider):
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
         # issue #36: 위 invoke() 와 동일 계약 — None 이면 부모 env 상속 불변.
-        run_env = self._auth_env(oauth_token)
+        run_env = self._spawn_env(oauth_token)
         # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
@@ -758,7 +796,8 @@ class ClaudeProvider(LLMProvider):
                 debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
-                append_system_prompt_file=sys_file)
+                append_system_prompt_file=sys_file,
+                exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             if cmd is None:
                 logger.error("Claude CLI를 찾을 수 없습니다")
                 return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -821,7 +860,8 @@ class ClaudeProvider(LLMProvider):
                     env=env, lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
-                    oauth_token=oauth_token)
+                    oauth_token=oauth_token,
+                    exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
             resp = LLMResponse(
@@ -866,7 +906,8 @@ class ClaudeProvider(LLMProvider):
                            partial_messages: bool | None = None,
                            effort: str | None = None,
                            thinking: str | None = None,
-                           oauth_token: str | None = None) -> AsyncIterator[StreamChunk]:
+                           oauth_token: str | None = None,
+                           exclude_dynamic_system_prompt: bool | None = None) -> AsyncIterator[StreamChunk]:
         """Claude Code `--output-format stream-json` 기반 스트리밍.
 
         공통 readline/timeout/cleanup 골격은 ``LLMProvider._run_stream_template``
@@ -892,7 +933,7 @@ class ClaudeProvider(LLMProvider):
         # 루프 안에서 매번 다시 계산할 이유가 없다). None 이면 이 값을 그대로
         # ``_run_stream_template(env=...)`` 에 넘기고, 그 helper 는 env=None
         # 일 때 spawn kwargs 에 "env" 자체를 넣지 않아 부모 env 상속 불변.
-        run_env = self._auth_env(oauth_token)
+        run_env = self._spawn_env(oauth_token)
         # issue #44: invoke/invoke_async 와 동일 임계치 판정 — stream_async 는
         # 별도 spawn 경로(_run_stream_template)라 #30 의 stdin 라우팅이
         # 적용되지 않았다. 재시도 루프 전체에서 한 번만 계산(프롬프트는
@@ -924,7 +965,8 @@ class ClaudeProvider(LLMProvider):
                     partial_messages=use_partial, reasoning_args=reasoning_args,
                     prompt_via_stdin=use_stdin,
                     append_system_prompt=sys_argv,
-                    append_system_prompt_file=sys_file)
+                    append_system_prompt_file=sys_file,
+                exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
                 if cmd is None:
                     yield StreamChunk(type="error", content="Claude CLI not found")
                     return

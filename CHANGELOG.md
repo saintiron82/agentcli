@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.7.3 — 2026-08-13
+
+### Added
+- **Nonessential-traffic cutoff on every spawn (issue #62).** All claude
+  child processes (invoke / streaming / warm) now get
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in their environment —
+  update checks, telemetry, error reporting and release-note fetches are
+  skipped, measured 3.0–3.1s → 2.0s boot per lean call. The interactive
+  `claude` on the host is unaffected (the variable rides only the child
+  env), and an explicit parent/caller value always wins (set the variable
+  yourself — any value — to opt out).
+- **Cache-stable prompt prefix, opt-in (issue #62).**
+  `ClaudeProvider(exclude_dynamic_system_prompt=True)` (also per call /
+  `provider_options`) appends `--exclude-dynamic-system-prompt-sections`,
+  moving the system prompt's dynamic sections (cwd, OS info, git
+  branch/status/commits, auto-memory paths) into the first user message so
+  the request prefix — including a `system_prompt` block from #51 — stays
+  byte-stable across git/env changes and keeps hitting Anthropic's prompt
+  cache. Measured across an interposed git change: `cache_creation`
+  1693 → 519, `cache_read` 3289 → 4219 per call. Opt-in because CLIs
+  without the flag fail with unknown-option (verified on 2.1.229).
+- **Performance guide in the README (en/ko).** Where call time goes
+  (boot / context / caching / generation / concurrency), tier selection by
+  workload, prompt-cache prefix rules (model+effort are part of the cache
+  key; 1h subscription TTL; same-directory cache sharing), the
+  quality-first rule for effort/thinking, and known upstream issues
+  (claude-code#83859 v2.1.220/221 headless stall — keep timeouts ≥ 420s
+  or upgrade; claude-code#5653 `~/.claude.json` bloat).
+
 ## 0.7.2 — 2026-08-13
 
 ### Changed
