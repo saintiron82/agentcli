@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.2"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.3"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -231,7 +231,8 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `env`(환경 티어), `lean`, `isolated`, `debug`,
+  `disallowed_tools`, `env`(환경 티어), `lean`, `isolated`,
+  `exclude_dynamic_system_prompt`(캐시 안정 프리픽스), `debug`,
   `debug_log_path`, `partial_messages` (스트리밍 전용).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
   `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
@@ -288,6 +289,78 @@ CLAUDE.md 에 의존하던 호출은 이제 `env="inherit"` 를 명시해야 한
 에서는 무시된다. `explicit` 의 알려진 한계: CLAUDE.md auto-discovery 는 CLI
 의 별개 메커니즘이라 ~1k 토큰이 여전히 실린다 — 그것까지 막아야 하면
 `isolated` 를 쓴다. 세션 resume 은 모든 티어에서 동작한다(라이브 검증).
+
+### 성능 가이드 (claude)
+
+`claude -p` 호출에서 시간이 어디로 가는지, 어떤 레버가 어느 부분을 줄이는지.
+별도 표기 없으면 전부 Claude Code 2.1.229 / macOS 실측이다.
+
+**1. 호출의 해부.** 벽시계 = 하네스 부팅 + 컨텍스트 처리 + 출력 생성.
+실제 2만자 "문서 정리" 작업:
+
+| 티어 | wall | 누적 ctx 토큰 | 무슨 일이 있었나 |
+|---|---:|---:|---|
+| `inherit` | 369.6초 | 592,752 | 모델이 멀티턴 툴 루프로 방황 |
+| `explicit` | 265.4초 | 529,211 | 여전히 툴 루프(빌트인 툴이 있으므로) |
+| `lean` | 145.6초 | 25,563 | 단일 턴; wall ≈ 순수 출력 생성 |
+
+**워크로드로 티어를 고른다**: 텍스트 변환만 하는 데이터 파이프라인 →
+`lean`(툴은 느려지게만 한다); 툴이 필요한 임베디드 에이전트 → `explicit`;
+로컬 MCP/skills 를 원하는 호스트 통합 개발 도구 → `inherit`.
+
+**2. 부팅 (~1–3초, 구버전 CLI 는 3–11초였다).** agentcli 는 0.7.3 부터 모든
+자식을 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 로 spawn 한다 —
+업데이트 체크/텔레메트리/에러 리포팅/릴리스노트 페치가 빠지고, lean 1회
+호출 기준 3.0–3.1초 → 2.0초 실측. 사용자의 대화형 `claude` 는 영향받지
+않는다(이 var 는 자식 env 에만 실린다). 끄려면 부모 환경에 그 변수를 직접
+설정하면 된다 — 부모의 명시 값이 항상 이긴다. 연속 호출이 많으면 [warm
+세션](#상주warm-claude-세션)으로 부팅을 사실상 0 으로 상각한다.
+
+**3. 프롬프트 캐싱 (서버측).** Anthropic 캐시는 요청 *프리픽스*를 바이트
+단위로 정확히 맞춰야 한다 — 프리픽스를 안정시키는 것이 전부다:
+
+- CLI 시스템 프롬프트에는 **동적 섹션** — cwd, OS 정보, git 브랜치/상태/
+  최근 커밋, auto-memory 경로 — 이 임베드된다. 호출 사이의 커밋이나 파일
+  변경이 그 바이트를 흔들면 그 뒤 전부 — **`system_prompt` 블록 포함** —
+  캐시 미스다. `exclude_dynamic_system_prompt=True`(생성자 또는 호출
+  시점)를 켜면 동적 섹션이 첫 user 메시지로 이동해 프리픽스가 정적화된다
+  — git 변경을 사이에 넣은 실측: `cache_creation` 1693 → 519,
+  `cache_read` 3289 → 4219. 옵트인인 이유: 플래그 없는 구버전 CLI 는
+  unknown-option 으로 실패. 트레이드오프: 환경 컨텍스트가 user 메시지로
+  가서 지시 가중치가 소폭 낮아질 수 있다.
+- **캐시 키에 모델과 effort 가 포함된다.** 호출 사이에 어느 쪽이든 바꾸면
+  전체 미스 — 배치 단위로 고정할 것.
+- 구독 인증은 메인 대화에 **1시간 캐시 TTL**(사용 크레딧 소진 시 5분으로
+  강하). 캐시 히트마다 타이머가 리셋된다.
+- **같은 디렉토리의 병렬 세션은 캐시를 공유**한다 — 첫 호출 하나를 먼저
+  완주시켜 캐시를 만든 뒤 나머지를 푸는 순서가 유리하다.
+- CLI 업그레이드는 시스템 프롬프트 변경 = 전체 캐시 재구축.
+- 전부 `TokenUsage.cached_tokens` / `cache_creation_tokens`(0.7.2)로
+  검증한다 — 추측하지 말 것.
+
+**4. 보통은 생성이 지배한다.** 위 표에서 lean 의 145초는 거의 전부 출력
+토큰 생성(17k 출력 토큰)이다. 레버는 선호 순으로: 호출당 항목 수를 줄인다;
+더 빠른 모델을 고른다(품질이 허용하면 `haiku`); `effort` 를 낮춘다 — **단
+effort/thinking 은 출력 품질을 바꾸므로, 품질 민감 작업에서는 자기 작업
+기준의 A/B 없이 낮추지 말 것**(실사례: sonnet 이 보안 기사를 거부해 opus
+의 11% 속도 손해가 옳은 선택이었다). effort 는 캐시 키의 일부라는 것도
+기억할 것.
+
+**5. 동시성.** 레이트리밋은 세션이 아니라 계정 풀 단위다. 커뮤니티 보고
+(개별 사례, 체계적 실측 아님): 동시 spawn ~3–4개를 넘는 버스트는 최상위
+유료 티어에서도 429(`Server is temporarily limiting requests`)를 맞는다.
+동시 자식 3–4개 + 시작 지터를 주는 큐가 합리적 기본값이고, 위의 같은
+디렉토리 캐시 워밍 순서와 조합한다.
+
+**6. 알려진 업스트림 이슈.**
+
+- **claude-code#83859**: v2.1.220/221 의 headless `-p` 가 세션 초반
+  ~405초 스톨할 수 있다(업스트림 미해결). 이 버전을 써야 한다면 서브프로세스
+  타임아웃을 420초 이상으로 잡아 스톨이 행으로 오인되지 않게 하고, 가능하면
+  CLI 를 올려라.
+- **claude-code#5653**: 비대해진 `~/.claude.json` 이 매 시작을 늦춘다 —
+  반복 `-p` 호출이 프로젝트 히스토리를 거기 쌓으므로 바쁜 호스트에서는
+  주기적으로 정리할 것.
 
 ### lean 모드 & debug (claude)
 
