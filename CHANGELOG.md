@@ -2,6 +2,35 @@
 
 ## 0.7.2 — unreleased
 
+### Added
+- **Claude system prompts now ride real `--append-system-prompt` flags
+  (issue #51).** `Message(role="system")` / `LLMClient.chat(system_prompt=...)`
+  on the claude provider used to be flattened into the single `-p` string as a
+  labeled prefix, so a large static block (domain spec, batch instructions)
+  was re-sent as user-turn content on every call and could never sit on a
+  stable, cacheable prefix. The provider now splits system messages out and
+  passes them via `--append-system-prompt` (argv) or — over the same
+  8,000-byte threshold the prompt-stdin routing uses — a temp file +
+  `--append-system-prompt-file` (Windows argv-limit safe; the file is removed
+  as soon as the child exits). Applies to `invoke`/`invoke_async`/
+  `stream_async`; the append variant (not `--system-prompt`) preserves the
+  CLI's own system prompt, matching the warm module's choice. codex/copilot
+  keep flattening — their CLIs have no system-prompt flag. Degenerate
+  system-only message lists keep the old flattening instead of producing an
+  empty `-p`. `--append-system-prompt` payloads are redacted from debug
+  traces the same way `-p` payloads are. Verified live against Claude Code
+  2.1.220 (both variants, plus temp-file cleanup).
+- **Claude cache-token visibility (issue #51).** The CLI's
+  `usage.cache_read_input_tokens` / `cache_creation_input_tokens` now land in
+  `TokenUsage.cached_tokens` / new `TokenUsage.cache_creation_tokens` on both
+  the invoke and streaming paths, so callers can verify whether isolating
+  static context actually earns the caching discount (codex has surfaced its
+  `cached_input_tokens` since day one). **Behavior change:** claude's
+  `prompt_tokens` now reports `input + cache_read + cache_creation` — the
+  real input context — instead of Anthropic's cache-exclusive `input_tokens`
+  (a 14k-token cached context used to report `prompt_tokens=4`). This keeps
+  the normalized "`cached_tokens` is a subset of `prompt_tokens`" contract.
+
 ### Fixed
 - **`stream_async` now also routes large prompts through stdin (issue #44).**
   `invoke`/`invoke_async` got the issue #30 stdin fix, but `stream_async` uses

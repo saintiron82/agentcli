@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import stat
+import tempfile
 import time
 import uuid
 from typing import AsyncIterator
@@ -17,7 +18,7 @@ from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
                    estimate_payload_prompt_tokens, health_from_response,
                    run_health_command, run_subprocess_async,
-                   run_subprocess_sync)
+                   run_subprocess_sync, split_system_messages)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -67,6 +68,39 @@ def _emit_invoke_debug(cmd: list[str], rc, latency_ms: int, stderr: str,
     """비스트리밍 invoke debug — 공용 ``emit_invoke_debug`` 에 위임."""
     emit_invoke_debug("claude", cmd, rc, latency_ms, stderr,
                       session_id=sid, path=path, phase=phase)
+
+
+def _materialize_system_prompt(system_text: str) -> tuple[str, str]:
+    """system 블록 전달 방식 결정 — ``(argv 텍스트, 임시 파일 경로)`` 중 하나만 채운다.
+
+    #51: 임계치(``PROMPT_STDIN_THRESHOLD``) 이하는 ``--append-system-prompt``
+    로 argv 에 싣고, 초과분은 임시 파일 + ``--append-system-prompt-file`` 로
+    보낸다 — stdin 은 user 프롬프트가 이미 쓸 수 있는 채널이라(#30/#44) 선택지가
+    아니고, 대형 블록을 argv 에 실으면 Windows 32,767자 한계를 다시 뚫는다.
+    파일 삭제는 호출자 책임(자식 프로세스가 끝난 뒤 ``finally``).
+
+    ``--system-prompt``(전체 교체) 가 아니라 append 변형을 쓰는 이유: CLI 의
+    기본 system prompt 를 보존하는 쪽이 안전하고, warm 모듈(#48)과 같은 선택.
+    """
+    if not system_text:
+        return "", ""
+    if len(system_text.encode("utf-8")) <= PROMPT_STDIN_THRESHOLD:
+        return system_text, ""
+    fd, path = tempfile.mkstemp(prefix="agentcli-system-prompt-",
+                                suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(system_text)
+    return "", path
+
+
+def _discard_system_prompt_file(path: str) -> None:
+    """``_materialize_system_prompt`` 가 만든 임시 파일 정리 (best-effort)."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 class ClaudeProvider(LLMProvider):
@@ -307,7 +341,9 @@ class ClaudeProvider(LLMProvider):
                    debug: bool | None = None,
                    partial_messages: bool | None = None,
                    reasoning_args: list[str] | None = None,
-                   prompt_via_stdin: bool = False) -> tuple[list[str] | None, str]:
+                   prompt_via_stdin: bool = False,
+                   append_system_prompt: str = "",
+                   append_system_prompt_file: str = "") -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
         permission_mode/allowed_tools/disallowed_tools/mcp_config/lean 은 호출
@@ -321,6 +357,8 @@ class ClaudeProvider(LLMProvider):
         ``-p`` 뒤 위치 인자로 prompt 를 넣지 않는다(issue #30) — claude CLI 는
         ``-p`` 뒤 인자가 없으면 stdin 에서 프롬프트를 읽으므로, 호출자가 프롬프트
         바이트를 subprocess stdin 으로 별도 전달해야 한다. 기본 False(기존 동작).
+        append_system_prompt / append_system_prompt_file 은 상호 배타 (#51):
+        ``_materialize_system_prompt`` 가 임계치로 결정한 한쪽만 채워 넘긴다.
         """
         bin_path = self._find_binary()
         if not bin_path:
@@ -340,6 +378,12 @@ class ClaudeProvider(LLMProvider):
             cmd.append(prompt)
         cmd += ["--output-format", output_format,
                 "--permission-mode", pmode]
+        if append_system_prompt:
+            cmd += ["--append-system-prompt", append_system_prompt]
+        elif append_system_prompt_file:
+            # ``--help`` 미표기지만 동작 확인된 플래그 (v2.1.220, #51 리포트) —
+            # 존재하지 않는 경로면 CLI 가 명시적 에러로 즉시 실패한다.
+            cmd += ["--append-system-prompt-file", append_system_prompt_file]
         if output_format == "stream-json":
             # stream-json은 반드시 --verbose 필요 (Claude Code 제약)
             cmd.append("--verbose")
@@ -421,7 +465,10 @@ class ClaudeProvider(LLMProvider):
                effort: str | None = None,
                thinking: str | None = None,
                oauth_token: str | None = None) -> LLMResponse:
-        prompt = build_session_prompt(messages)
+        # issue #51: system 메시지는 ``-p`` 평탄화 대신 실제
+        # ``--append-system-prompt`` 계열 플래그로 격리한다.
+        system_text, chat_messages = split_system_messages(messages)
+        prompt = build_session_prompt(chat_messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
@@ -433,35 +480,43 @@ class ClaudeProvider(LLMProvider):
         # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
-        cmd, used_sid = self._build_cmd(
-            prompt, model, session_id, "json",
-            permission_mode=permission_mode, allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-            reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
-        if cmd is None:
-            logger.error("Claude CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="Claude CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
-
-        start = time.time()
+        sys_argv, sys_file = _materialize_system_prompt(system_text)
         try:
-            # run_subprocess_sync: 새 프로세스 그룹 + 타임아웃/정리 시 그룹 전체
-            # killpg → CLI 가 띄운 MCP/hook 손자 좀비 방지 (subprocess.run 의
-            # 직속-only kill 한계 회피). use_stdin 이면 프롬프트를 argv 대신
-            # stdin(PIPE)으로 write-then-close 전달(issue #30) — 아니면
-            # input_bytes=None 으로 기존과 byte-identical(stdin=DEVNULL).
-            stdout_b, stderr_b, rc, timed_out = run_subprocess_sync(
-                cmd, timeout=timeout, cwd=cwd, env=run_env,
-                input_bytes=prompt_bytes if use_stdin else None)
-        except FileNotFoundError:
-            logger.error("Claude CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="Claude CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
+            cmd, used_sid = self._build_cmd(
+                prompt, model, session_id, "json",
+                permission_mode=permission_mode, allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
+                append_system_prompt=sys_argv,
+                append_system_prompt_file=sys_file)
+            if cmd is None:
+                logger.error("Claude CLI를 찾을 수 없습니다")
+                return LLMResponse(content="", provider=self.provider_id, model=model,
+                                    error="Claude CLI not found",
+                                    error_type=ERROR_BINARY_MISSING,
+                                    exit_code=127)
+
+            start = time.time()
+            try:
+                # run_subprocess_sync: 새 프로세스 그룹 + 타임아웃/정리 시 그룹 전체
+                # killpg → CLI 가 띄운 MCP/hook 손자 좀비 방지 (subprocess.run 의
+                # 직속-only kill 한계 회피). use_stdin 이면 프롬프트를 argv 대신
+                # stdin(PIPE)으로 write-then-close 전달(issue #30) — 아니면
+                # input_bytes=None 으로 기존과 byte-identical(stdin=DEVNULL).
+                stdout_b, stderr_b, rc, timed_out = run_subprocess_sync(
+                    cmd, timeout=timeout, cwd=cwd, env=run_env,
+                    input_bytes=prompt_bytes if use_stdin else None)
+            except FileNotFoundError:
+                logger.error("Claude CLI를 찾을 수 없습니다")
+                return LLMResponse(content="", provider=self.provider_id, model=model,
+                                    error="Claude CLI not found",
+                                    error_type=ERROR_BINARY_MISSING,
+                                    exit_code=127)
+        finally:
+            # 자식이 종료(또는 spawn 실패·바이너리 부재)한 뒤에는 파일이 더
+            # 필요 없다 — stale-세션 재귀 호출은 자기 파일을 새로 만든다.
+            _discard_system_prompt_file(sys_file)
         if timed_out:
             logger.error("Claude 타임아웃 (%d초)", timeout)
             if use_debug:
@@ -517,7 +572,10 @@ class ClaudeProvider(LLMProvider):
             return resp
 
         content, tokens, err = _parse_claude_json(stdout_txt)
-        tokens.payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+        # system 블록도 agentcli 가 CLI 에 넘긴 payload 다 (#51) — 플래그로
+        # 분리 전달되어도 추정치에는 포함한다.
+        tokens.payload_prompt_tokens = (estimate_payload_prompt_tokens(prompt)
+                                        + estimate_payload_prompt_tokens(system_text))
         tokens.prompt_tokens_reliable = False
         tokens.prompt_tokens_source = "claude_cli_reported"
         resp = LLMResponse(
@@ -547,7 +605,9 @@ class ClaudeProvider(LLMProvider):
                            effort: str | None = None,
                            thinking: str | None = None,
                            oauth_token: str | None = None) -> LLMResponse:
-        prompt = build_session_prompt(messages)
+        # issue #51: invoke() 와 동일 — system 은 실제 플래그로 격리.
+        system_text, chat_messages = split_system_messages(messages)
+        prompt = build_session_prompt(chat_messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
@@ -556,34 +616,41 @@ class ClaudeProvider(LLMProvider):
         # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
-        cmd, used_sid = self._build_cmd(
-            prompt, model, session_id, "json",
-            permission_mode=permission_mode, allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-            reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
-        if cmd is None:
-            logger.error("Claude CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="Claude CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
-
-        start = time.time()
+        sys_argv, sys_file = _materialize_system_prompt(system_text)
         try:
-            # use_stdin_devnull 과 input_bytes 는 상호 배타적(run_subprocess_async
-            # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
-            # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
-            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd, env=run_env,
-                use_stdin_devnull=not use_stdin,
-                input_bytes=prompt_bytes if use_stdin else None)
-        except FileNotFoundError:
-            logger.error("Claude CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="Claude CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
+            cmd, used_sid = self._build_cmd(
+                prompt, model, session_id, "json",
+                permission_mode=permission_mode, allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
+                append_system_prompt=sys_argv,
+                append_system_prompt_file=sys_file)
+            if cmd is None:
+                logger.error("Claude CLI를 찾을 수 없습니다")
+                return LLMResponse(content="", provider=self.provider_id, model=model,
+                                    error="Claude CLI not found",
+                                    error_type=ERROR_BINARY_MISSING,
+                                    exit_code=127)
+
+            start = time.time()
+            try:
+                # use_stdin_devnull 과 input_bytes 는 상호 배타적(run_subprocess_async
+                # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
+                # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
+                stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                    cmd, timeout=timeout, cwd=cwd, env=run_env,
+                    use_stdin_devnull=not use_stdin,
+                    input_bytes=prompt_bytes if use_stdin else None)
+            except FileNotFoundError:
+                logger.error("Claude CLI를 찾을 수 없습니다")
+                return LLMResponse(content="", provider=self.provider_id, model=model,
+                                    error="Claude CLI not found",
+                                    error_type=ERROR_BINARY_MISSING,
+                                    exit_code=127)
+        finally:
+            # invoke() 와 동일 — 자식 종료 후 즉시 정리 (best-effort).
+            _discard_system_prompt_file(sys_file)
         if timed_out:
             logger.error("Claude 타임아웃 (%d초)", timeout)
             if use_debug:
@@ -677,7 +744,9 @@ class ClaudeProvider(LLMProvider):
           {"type":"user","message":{"content":[{"type":"tool_result",...}]}}
           {"type":"result","subtype":"success","result":"...","usage":{...},"session_id":"..."}
         """
-        prompt = build_session_prompt(messages)
+        # issue #51: invoke() 와 동일 — system 은 실제 플래그로 격리.
+        system_text, chat_messages = split_system_messages(messages)
+        prompt = build_session_prompt(chat_messages)
         use_debug = self._debug if debug is None else debug
         dbg_path = self._debug_log_path if debug_log_path is None else debug_log_path
         use_partial = (self._partial_messages if partial_messages is None
@@ -705,46 +774,57 @@ class ClaudeProvider(LLMProvider):
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다. 어떤 출력이든
         # caller 에 전달된 뒤에는 재시도하지 않는다.
         attempt_sid = session_id
-        for _attempt in range(2):
-            cmd, used_sid = self._build_cmd(
-                prompt, model, attempt_sid, "stream-json",
-                permission_mode=permission_mode, allowed_tools=allowed_tools,
-                disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
-                partial_messages=use_partial, reasoning_args=reasoning_args,
-                prompt_via_stdin=use_stdin)
-            if cmd is None:
-                yield StreamChunk(type="error", content="Claude CLI not found")
-                return
-            state = StreamState(
-                final_session_id=used_sid,
-                final_usage=TokenUsage(
-                    payload_prompt_tokens=estimate_payload_prompt_tokens(prompt),
-                    prompt_tokens_reliable=False,
-                    prompt_tokens_source="claude_cli_reported"))
-            # partial 모드: assistant 전체 블록 text/thinking 를 건너뛰고 델타로만
-            # 누적·방출한다 (이중 집계 방지). _dispatch_stream_event 가 참조.
-            state.extra["partial"] = use_partial
-            retry_stale = False
-            emitted = False
-            async for chunk in self._run_stream_template(
-                    cmd, state, model=model, cwd=cwd, timeout=timeout,
-                    idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=run_env, debug=use_debug, debug_log_path=dbg_path,
-                    input_bytes=prompt_bytes if use_stdin else None):
-                if (attempt_sid and not emitted
-                        and chunk.type == "error"
-                        and STALE_SESSION_MARKER in (chunk.content or "")):
-                    retry_stale = True
-                    break
-                emitted = True
-                yield chunk
-            if not retry_stale:
-                return
-            logger.warning(
-                "Claude 세션 %s 만료 — 새 세션으로 스트림 재시도",
-                attempt_sid[:8])
-            attempt_sid = ""
+        # #51: 파일 변형이면 재시도 attempt 두 번이 같은 파일을 재사용한다 —
+        # 내용이 attempt 간 불변이므로 한 번만 만들고 스트림이 끝나면(소비자가
+        # 중간에 버려 GeneratorExit 이 나도) finally 로 정리한다.
+        sys_argv, sys_file = _materialize_system_prompt(system_text)
+        try:
+            for _attempt in range(2):
+                cmd, used_sid = self._build_cmd(
+                    prompt, model, attempt_sid, "stream-json",
+                    permission_mode=permission_mode, allowed_tools=allowed_tools,
+                    disallowed_tools=disallowed_tools, mcp_config=mcp_config,
+                    strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                    partial_messages=use_partial, reasoning_args=reasoning_args,
+                    prompt_via_stdin=use_stdin,
+                    append_system_prompt=sys_argv,
+                    append_system_prompt_file=sys_file)
+                if cmd is None:
+                    yield StreamChunk(type="error", content="Claude CLI not found")
+                    return
+                state = StreamState(
+                    final_session_id=used_sid,
+                    final_usage=TokenUsage(
+                        payload_prompt_tokens=(
+                            estimate_payload_prompt_tokens(prompt)
+                            + estimate_payload_prompt_tokens(system_text)),
+                        prompt_tokens_reliable=False,
+                        prompt_tokens_source="claude_cli_reported"))
+                # partial 모드: assistant 전체 블록 text/thinking 를 건너뛰고 델타로만
+                # 누적·방출한다 (이중 집계 방지). _dispatch_stream_event 가 참조.
+                state.extra["partial"] = use_partial
+                retry_stale = False
+                emitted = False
+                async for chunk in self._run_stream_template(
+                        cmd, state, model=model, cwd=cwd, timeout=timeout,
+                        idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                        env=run_env, debug=use_debug, debug_log_path=dbg_path,
+                        input_bytes=prompt_bytes if use_stdin else None):
+                    if (attempt_sid and not emitted
+                            and chunk.type == "error"
+                            and STALE_SESSION_MARKER in (chunk.content or "")):
+                        retry_stale = True
+                        break
+                    emitted = True
+                    yield chunk
+                if not retry_stale:
+                    return
+                logger.warning(
+                    "Claude 세션 %s 만료 — 새 세션으로 스트림 재시도",
+                    attempt_sid[:8])
+                attempt_sid = ""
+        finally:
+            _discard_system_prompt_file(sys_file)
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:
@@ -823,12 +903,18 @@ class ClaudeProvider(LLMProvider):
                     yield StreamChunk(type="event", data=block)
         elif etype == "result":
             usage = evt.get("usage") or {}
-            pt = int(usage.get("input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+            # 비스트리밍 _parse_claude_json 과 동일 매핑 (#51): input_tokens 는
+            # 캐시 read/creation 제외분이므로 합쳐서 prompt_tokens 로 보고.
+            pt = int(usage.get("input_tokens") or 0) + cache_read + cache_creation
             ct = int(usage.get("output_tokens") or 0)
             prev = state.final_usage
             state.final_usage = TokenUsage(
                 prompt_tokens=pt, completion_tokens=ct,
                 total_tokens=pt + ct,
+                cached_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
                 payload_prompt_tokens=(prev.payload_prompt_tokens if prev else 0),
                 prompt_tokens_reliable=False,
                 prompt_tokens_source="claude_cli_reported")
@@ -861,7 +947,14 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
                or data.get("text")
                or "")
     usage = data.get("usage") or {}
-    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    # Anthropic 의 input_tokens 는 캐시 read/creation 분을 제외한다(OpenAI 는
+    # 포함). 정규화 계약은 "cached_tokens ⊆ prompt_tokens" 이므로 셋을 합쳐
+    # 실제 입력 컨텍스트 전체를 prompt_tokens 로 보고한다 (#51) — 안 그러면
+    # 14k 토큰짜리 캐시된 컨텍스트가 prompt_tokens=4 로 보인다.
+    prompt_tokens = input_tokens + cache_read + cache_creation
     completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
     total = prompt_tokens + completion_tokens
 
@@ -878,4 +971,6 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total,
+        cached_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
     ), error_msg
