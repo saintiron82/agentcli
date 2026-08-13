@@ -24,7 +24,7 @@ from typing import AsyncIterator
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
                    emit_invoke_debug, health_from_response, run_health_command,
-                   run_subprocess_async)
+                   run_subprocess_async, validate_reasoning_defaults)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
                      ProviderHealth, TokenUsage, StreamChunk, classify_error)
 from ..utils import build_env
@@ -86,8 +86,9 @@ class CopilotProvider(LLMProvider):
         self._allow_all_paths = allow_all_paths
         self._add_dirs = add_dirs or []
         # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
-        self._effort = effort
-        self._thinking = thinking
+        # #38: 기본값 오타는 선언 지점에서 즉시 터뜨리고 "" 는 미설정으로.
+        self._effort, self._thinking = validate_reasoning_defaults(
+            self.provider_id, effort, thinking)
 
     def _find_binary(self) -> tuple[str | None, bool]:
         bin_path = shutil.which("copilot")
@@ -212,20 +213,12 @@ class CopilotProvider(LLMProvider):
         thinking 은 불리언 — concise/detailed 는 --enable-reasoning-summaries,
         off 는 무플래그. detailed 는 불리언으로 접혀 clamped 로 보고된다.
         """
-        from ..reasoning import resolve_effort, resolve_thinking
-        from ..types import ReasoningResolution
-        eff = self._effort if effort is None else effort
-        thk = self._thinking if thinking is None else thinking
-        args, er, tr = [], None, None
-        if eff:
-            er = resolve_effort(self.provider_id, eff)
-            if er.applied:
-                args += ["--effort", er.applied]
-        if thk:
-            tr = resolve_thinking(self.provider_id, thk)
-            if tr.applied == "on":
-                args.append("--enable-reasoning-summaries")
-        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        er, tr, res = self._resolve_reasoning(effort, thinking)
+        args = []
+        if er and er.applied:
+            args += ["--effort", er.applied]
+        if tr and tr.applied == "on":
+            args.append("--enable-reasoning-summaries")
         return args, res
 
     # ---------- 동기 ----------

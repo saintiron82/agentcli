@@ -140,6 +140,25 @@ def split_system_messages(messages: list[Message]) -> tuple[str, list[Message]]:
     return "\n\n".join(system_parts), rest
 
 
+def validate_reasoning_defaults(provider_id: str,
+                                effort: str | None,
+                                thinking: str | None) -> tuple[str | None, str | None]:
+    """생성자 reasoning 기본값의 fail-fast 검증 + ``""``→None 정규화 (#38).
+
+    오타난 기본값이 첫 호출까지 잠복하지 않도록 선언 지점에서 ValueError 를
+    낸다. 빈 문자열은 "미설정"으로 정규화한다 — truthiness 우회로 기본값이
+    검증 없이 조용히 꺼지던 함정 방지. 반환 튜플을 그대로 저장하면 된다.
+    """
+    from ..reasoning import resolve_effort, resolve_thinking
+    eff = effort or None
+    thk = thinking or None
+    if eff:
+        resolve_effort(provider_id, eff)
+    if thk:
+        resolve_thinking(provider_id, thk)
+    return eff, thk
+
+
 def estimate_payload_prompt_tokens(prompt: str) -> int:
     """Return a cheap estimate for the prompt string agentcli passed to the CLI."""
     text = prompt.strip()
@@ -298,6 +317,10 @@ class LLMProvider(ABC):
     provider_id: str = ""
     supports_sessions: bool = False
     supports_streaming: bool = False
+    # reasoning 기본값 — 각 provider 생성자가 validate_reasoning_defaults 의
+    # 반환으로 채운다 (#38). _resolve_reasoning 이 읽는다.
+    _effort: str | None = None
+    _thinking: str | None = None
     # False 면 supports_sessions=False 여도 client 가 대화 내용을 messages
     # 테이블에 저장하거나 이전 턴을 프롬프트에 재주입하지 않는다. CLI 가 자체
     # 히스토리를 소유하는 3-provider 는 False. 라이브러리가 컨텍스트를 직접
@@ -314,6 +337,30 @@ class LLMProvider(ABC):
     _COMMON_CALL_ARGS = frozenset({
         "self", "messages", "model", "timeout", "session_id", "cwd",
         "alias", "resume_by_alias", "idle_timeout", "wall_timeout"})
+
+    def _resolve_reasoning(self, effort, thinking):
+        """유효 effort/thinking 결정 + resolve — 3 provider 공통부 (#38).
+
+        규칙: 호출 인자(None 이 아니면) 우선, 아니면 생성자 기본값. 빈
+        문자열은 어느 단계에서든 "미설정"으로 정규화한다 — 호출 시점 ``""``
+        가 생성자 기본값을 검증 없이 조용히 끄던 함정 방지. provider 몫은
+        반환된 resolution 을 native 플래그로 렌더링하는 것뿐이다.
+
+        Returns:
+            (effort_res, thinking_res, ReasoningResolution | None)
+        """
+        from ..reasoning import resolve_effort, resolve_thinking
+        from ..types import ReasoningResolution
+        # "" 는 먼저 "미지정"으로 정규화한 뒤 기본값과 병합한다 — 순서를
+        # 바꾸면 호출 시점 "" 가 기본값을 조용히 끄는 원래 함정이 돌아온다.
+        eff_call = effort or None
+        thk_call = thinking or None
+        eff = self._effort if eff_call is None else eff_call
+        thk = self._thinking if thk_call is None else thk_call
+        er = resolve_effort(self.provider_id, eff) if eff else None
+        tr = resolve_thinking(self.provider_id, thk) if thk else None
+        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        return er, tr, res
 
     def capabilities(self, *, capability_notes: str = "") -> "ProviderCapabilities":
         """이 provider 가 현재 OS 에서 제공하는 기능 선언 (호출 전 질의용).
