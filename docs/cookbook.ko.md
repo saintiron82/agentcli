@@ -189,7 +189,7 @@ print(t.prompt_tokens,        # 실제 입력 컨텍스트 전체
 ## 12. 구버전에서 업그레이드
 
 ```bash
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.3"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.4"
 ```
 
 확인할 브레이킹은 **하나**다(0.7.2): claude provider가 더 이상 호스트 환경을

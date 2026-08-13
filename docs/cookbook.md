@@ -204,7 +204,7 @@ print(t.prompt_tokens,          # the real input context, in full
 ## 12. Upgrading from an old version
 
 ```bash
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.3"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.4"
 ```
 
 There is **one** breaking change to check (0.7.2): the claude provider no

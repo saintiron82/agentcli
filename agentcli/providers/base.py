@@ -191,6 +191,14 @@ def redact_argv(cmd: list[str]) -> list[str]:
             i += 2
             continue
         i += 1
+    # #42: codex 는 프롬프트를 `--` 종결자 뒤 **마지막 위치 인자**로 싣는다
+    # (resume: `-- <sid> <prompt>` / 신규: `-- <prompt>`). stdin 모드
+    # placeholder("-") 는 내용이 없으므로 남겨 trace 에 stdin 경유임이 보이게
+    # 하고, 중간 위치 인자(session id)는 진단 가치가 있어 유지한다.
+    if "--" in out:
+        sep = out.index("--")
+        if len(out) > sep + 1 and out[-1] != "-":
+            out[-1] = f"<prompt:{len(out[-1])} chars>"
     return out
 
 
@@ -575,7 +583,9 @@ class LLMProvider(ABC):
             if debug and stderr_task is not None:
                 try:
                     await stderr_task
-                except Exception:  # noqa: BLE001
+                # CancelledError 는 BaseException 이라 Exception 그물을
+                # 빠져나간다 — stdin_task 정리와 같은 계약 (#46).
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
                     pass
             if rc != 0 and not state.text_parts:
                 if debug:
@@ -643,7 +653,11 @@ class LLMProvider(ABC):
                     stderr_task.cancel()
                     try:
                         await stderr_task
-                    except Exception:  # noqa: BLE001
+                    # 방금 우리가 요청한 취소의 결과가 CancelledError 로
+                    # 돌아온다 — 여기서 새면 진행 중인 GeneratorExit 를
+                    # 대체해 aclose 가 예외로 끝나고, 아래 trace 마감까지
+                    # 건너뛴다 (#46; stdin_task 정리와 같은 계약).
+                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
                         pass
                 elapsed_ms = int((time.time() - start) * 1000)
                 logger.info(

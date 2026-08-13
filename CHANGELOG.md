@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.4 — 2026-08-13
+
+### Fixed
+- **Aborting a debug stream no longer loses the trace (issue #46).** The
+  streaming template's two stderr-drain cleanup sites caught only
+  `Exception`, but `CancelledError` is a `BaseException` — and the
+  `finally` site awaits a task it just cancelled, so `CancelledError` is
+  that await's *normal* outcome. When it leaked it replaced the in-flight
+  `GeneratorExit` (direct template consumers saw `aclose()` raise;
+  provider `stream_async` wrappers saw an asyncgen-finalizer warning) and
+  aborted the rest of the cleanup, silently dropping the debug trace
+  record. Both sites now share the stdin-task contract from #44; a
+  regression test drives the template directly, acloses mid-stream with
+  both pipes in flight, and pins that the trace record survives.
+- **codex prompts are now redacted from debug traces (issue #42).**
+  `redact_argv` only knew claude's `-p <prompt>` form, so a codex prompt —
+  riding as the last positional after the `--` terminator — landed in
+  `debug_log_path` traces in full. The last post-`--` positional is now
+  replaced with the usual `<prompt:N chars>` marker; the stdin
+  placeholder (`-`) is preserved so traces still show stdin routing, and
+  the resume session id stays visible for diagnosis. Measured while
+  fixing: copilot's `-p` form was already covered — now pinned by a
+  regression test alongside claude's.
+
 ## 0.7.3 — 2026-08-13
 
 ### Added
