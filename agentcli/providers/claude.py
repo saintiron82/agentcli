@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 # 함께 즉시 실패한다 — 이때만 새 세션으로 1회 자동 복구한다.
 STALE_SESSION_MARKER = "No conversation found with session ID"
 
+# issue #59: env 티어 — spawn 되는 claude 가 호스트 Claude Code 환경에서
+# 무엇을 들고 들어갈지의 단일 축. 실측 근거는 이슈 #59 의 표.
+#   inherit  — 전부 상속 (0.7.x 까지의 기본).
+#   explicit — 호출자가 지정한 것(mcp_config/allowed_tools/system prompt)만
+#              + 빌트인 툴. --setting-sources "" 는 ambient MCP/스킬을 끊되
+#              명시적 --mcp-config 는 살리는 유일한 격리 수단이다(safe-mode
+#              는 명시 MCP 까지 죽인다). 새 기본.
+#   isolated — --safe-mode. 명시 MCP 도 차단되는 더 강한 격리 (#56).
+#   lean     — --safe-mode --tools "". 툴 없는 단일 completion 전용.
+ENV_TIERS = ("inherit", "explicit", "isolated", "lean")
+_DEFAULT_ENV = "explicit"
+
 # issue #36: agentcli 가 관리하는 claude OAuth 토큰 소스 — 우선순위는
 # per-call kwarg > 생성자 기본값 > 이 env var > 아래 파일 (첫 발견 승리).
 OAUTH_TOKEN_ENV_VAR = "AGENTCLI_CLAUDE_OAUTH_TOKEN"
@@ -129,6 +141,7 @@ class ClaudeProvider(LLMProvider):
                  permission_mode: str = "bypassPermissions",
                  allowed_tools: list[str] | None = None,
                  disallowed_tools: list[str] | None = None,
+                 env: str | None = None,
                  lean: bool = False,
                  isolated: bool = False,
                  debug: bool = False,
@@ -143,17 +156,40 @@ class ClaudeProvider(LLMProvider):
                 **WARNING**: 기본값 `bypassPermissions`는 에이전트에 전체 권한을 부여한다.
                 신뢰할 수 없는 컨텍스트에서 임베딩할 때는 `default`로 변경할 것.
             allowed_tools: 허용 도구 목록 (예: ["Read", "Grep", "Bash"]).
-                None이면 제한 없음.
+                None이면 제한 없음. inherit 티어에서는 `--allowedTools`(권한
+                게이트)로, 다른 티어에서는 `--tools`(빌트인 정의 allowlist —
+                턴당 컨텍스트를 실제로 줄인다)로 배선된다.
             disallowed_tools: 금지 도구 목록.
-            lean: 단일 completion(요약/생성 등 툴이 필요 없는 1회 호출) 전용 경량
+            env: 호스트 Claude Code 환경에서 무엇을 들고 들어갈지의 티어
+                (issue #59). 미지정(None) 시 lean/isolated 별칭으로 결정하고,
+                별칭도 없으면 기본 `"explicit"`.
+                - `"inherit"` — 호스트의 MCP 서버/skills/CLAUDE.md/hooks 를
+                  전부 상속 (0.7.x 까지의 기본 동작). 호스트 머신 구성에 따라
+                  토큰·지연·재현성이 달라진다(#56 실측: 794k 토큰/타임아웃).
+                - `"explicit"` — **기본.** 호출자가 지정한 것만 들어간다:
+                  `mcp_config`(동작함 — safe-mode 와의 결정적 차이),
+                  `allowed_tools`, system prompt. 빌트인 툴셋은 유지된다.
+                  구현: `--setting-sources ""` + `--disable-slash-commands`
+                  + `--strict-mcp-config`. 한계: CLAUDE.md auto-discovery 는
+                  별개 메커니즘이라 ~1k 토큰이 남는다 — 완전 차단이 필요하면
+                  isolated/lean.
+                - `"isolated"` — `--safe-mode`. 명시 mcp_config 까지 차단되는
+                  더 강한 격리. 빌트인 툴은 유지 (#56).
+                - `"lean"` — `--safe-mode` + `--tools ""`. 툴도 없는 단일
+                  completion 전용.
+                env 와 lean/isolated 별칭을 동시에 주면 ValueError(모호).
+                **0.8.0 브레이킹:** 기본이 inherit → explicit 으로 바뀌었다.
+                호스트 환경 상속에 의존하던 호출은 `env="inherit"` 를 명시.
+            lean: `env="lean"` 의 부울 별칭(하위호환). 단일 completion(요약/
+                생성 등 툴이 필요 없는 1회 호출) 전용 경량
                 모드. True 면 호출마다 `--safe-mode`(CLAUDE.md/skills/plugins/hooks/
                 MCP/custom agents 등 커스터마이즈 비활성화) + `--tools`(빌트인 툴
                 allowlist; allowed_tools 미지정 시 `""` 로 전부 비활성화) 를 붙여
                 하네스 부팅 비용과 주입 컨텍스트를 최소화한다. lean 에서는 mcp_config/
                 disallowed_tools 가 무시된다(safe-mode 가 MCP 를 끄고 `--tools` 가
-                allowlist 이므로). 기본 False — 기존 동작 불변. lean 은 격리를
-                겸한다 — 툴을 유지한 채 격리만 원하면 isolated 를 쓴다.
-            isolated: 호스트 Claude Code 환경 상속 차단 (#56). True 면 호출마다
+                allowlist 이므로). lean 은 격리를 겸한다 — 툴을 유지한 채
+                격리만 원하면 isolated/explicit 티어를 쓴다.
+            isolated: `env="isolated"` 의 부울 별칭(하위호환, #56). True 면 호출마다
                 `--safe-mode` 를 붙여 호스트의 CLAUDE.md/skills/plugins/hooks/
                 MCP/custom agents 가 컨텍스트로 주입되는 것을 끊되, **빌트인
                 툴셋은 그대로 둔다** — 임베딩된 서비스가 자기 작업용 에이전트를
@@ -200,8 +236,8 @@ class ClaudeProvider(LLMProvider):
         self._permission_mode = permission_mode
         self._allowed_tools = allowed_tools
         self._disallowed_tools = disallowed_tools
-        self._lean = lean
-        self._isolated = isolated
+        # env/별칭 충돌·미지원 티어는 spawn 시점이 아니라 여기서 즉시 터뜨린다.
+        self._env = self._resolve_env_tier(env, lean, isolated)
         self._debug = debug
         self._debug_log_path = debug_log_path
         self._partial_messages = partial_messages
@@ -209,6 +245,36 @@ class ClaudeProvider(LLMProvider):
         self._effort = effort
         self._thinking = thinking
         self._oauth_token = oauth_token
+
+    @staticmethod
+    def _mcp_args(mcp_config: dict | str) -> list[str]:
+        """``--mcp-config`` args — dict 면 ``mcpServers`` 로 감싸 직렬화 (#154)."""
+        if isinstance(mcp_config, str):
+            return ["--mcp-config", mcp_config]
+        payload = (mcp_config if "mcpServers" in mcp_config
+                   else {"mcpServers": mcp_config})
+        return ["--mcp-config", json.dumps(payload)]
+
+    @staticmethod
+    def _resolve_env_tier(env: str | None, lean, isolated) -> str | None:
+        """env 문자열 + lean/isolated 부울 별칭 → 티어 문자열 또는 None(미지정).
+
+        env 와 켜진(True) 별칭을 동시에 주면 ValueError — 어느 쪽이 이겨야
+        할지 모호하다. False 는 "그 별칭을 끈다"는 뜻이라 충돌이 아니다.
+        """
+        if env is not None:
+            if env not in ENV_TIERS:
+                raise ValueError(
+                    f"env 는 {'/'.join(ENV_TIERS)} 중 하나여야 한다: {env!r}")
+            if lean or isolated:
+                raise ValueError(
+                    "env 와 lean/isolated 를 동시에 주면 모호하다 — 한쪽만 지정")
+            return env
+        if lean:
+            return "lean"
+        if isolated:
+            return "isolated"
+        return None
 
     def _find_binary(self) -> str | None:
         executable = "claude.cmd" if platform.system() == "Windows" else "claude"
@@ -353,6 +419,7 @@ class ClaudeProvider(LLMProvider):
                    disallowed_tools: list[str] | None = None,
                    mcp_config: dict | str | None = None,
                    strict_mcp_config: bool = False,
+                   env: str | None = None,
                    lean: bool | None = None,
                    isolated: bool | None = None,
                    debug: bool | None = None,
@@ -363,8 +430,12 @@ class ClaudeProvider(LLMProvider):
                    append_system_prompt_file: str = "") -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
-        permission_mode/allowed_tools/disallowed_tools/mcp_config/lean/
-        isolated 는 호출 시점 오버라이드 (None 이면 생성자 기본값). mcp_config 는 외부 MCP 서버
+        permission_mode/allowed_tools/disallowed_tools/mcp_config/env/lean/
+        isolated 는 호출 시점 오버라이드 (None 이면 생성자 기본값). env 티어
+        해석: 호출 시점 env·별칭이 있으면 그것으로, 없으면 생성자 티어로,
+        둘 다 없으면 기본 explicit. 호출 시점 lean=False/isolated=False 는
+        생성자의 해당 별칭 티어를 끄고 기본 티어로 떨어진다(#59 — 0.7.x 는
+        inherit 로 떨어졌다). mcp_config 는 외부 MCP 서버
         정의 — dict 면 ``{"mcpServers": ...}`` 로 감싸 JSON 직렬화, str 이면 그대로
         (파일 경로 또는 사전 직렬화 JSON) 전달한다 (#154). lean=True 면 단일
         completion 용으로 ``--safe-mode`` + ``--tools`` allowlist 만 붙이고
@@ -385,8 +456,13 @@ class ClaudeProvider(LLMProvider):
         atools = allowed_tools if allowed_tools is not None else self._allowed_tools
         dtools = (disallowed_tools if disallowed_tools is not None
                   else self._disallowed_tools)
-        use_lean = self._lean if lean is None else lean
-        use_isolated = self._isolated if isolated is None else isolated
+        tier = self._resolve_env_tier(env, lean, isolated)
+        if tier is None:
+            if (lean is False and self._env == "lean") or \
+               (isolated is False and self._env == "isolated"):
+                tier = _DEFAULT_ENV       # 켜져 있던 별칭을 호출 시점에 끔
+            else:
+                tier = self._env or _DEFAULT_ENV
         use_debug = self._debug if debug is None else debug
         use_partial = (self._partial_messages if partial_messages is None
                        else partial_messages)
@@ -415,7 +491,7 @@ class ClaudeProvider(LLMProvider):
             cmd += ["--model", model]
         if reasoning_args:
             cmd += reasoning_args
-        if use_lean:
+        if tier == "lean":
             # 단일 completion 경량 모드: 커스터마이즈(CLAUDE.md/skills/plugins/
             # hooks/MCP/custom agents 등) 와 빌트인 툴을 끊어 호출당 하네스 부팅
             # 비용·주입 컨텍스트를 최소화한다. --tools 는 빌트인 allowlist 로,
@@ -423,31 +499,51 @@ class ClaudeProvider(LLMProvider):
             # safe-mode 가 MCP 를 끄므로 mcp_config/disallowed_tools 는 무시.
             cmd.append("--safe-mode")
             cmd += ["--tools", ",".join(atools) if atools else ""]
-        elif use_isolated:
+        elif tier == "isolated":
             # 격리만 (#56): 호스트 커스터마이즈(CLAUDE.md/skills/plugins/hooks/
             # MCP/custom agents) 상속을 끊되 빌트인 툴셋은 유지한다. allowed_tools
             # 는 --tools(빌트인 정의 allowlist) 로 좁힌다 — --allowedTools 는
             # 권한 게이트일 뿐 툴 정의 컨텍스트를 줄이지 못하는 것이 실측됨
             # (2.1.229: safe-mode+allowedTools ctx 58.7k vs safe-mode+tools 18.6k).
-            # safe-mode 가 MCP 를 끄므로 mcp_config 는 무시. --disallowedTools 는
-            # safe-mode 밑에서도 차단이 실측 확인돼 유지.
+            # safe-mode 가 MCP 를 끄므로 mcp_config 는 무시(명시적으로 줘도
+            # CLI 가 시도조차 안 함 — init 이벤트 mcp_servers: [] 실측, #59).
+            # --disallowedTools 는 safe-mode 밑에서도 차단이 실측 확인돼 유지.
             cmd.append("--safe-mode")
             if atools:
                 cmd += ["--tools", ",".join(atools)]
             if dtools:
                 cmd += ["--disallowedTools", ",".join(dtools)]
-        else:
+        elif tier == "explicit":
+            # 기본 티어 (#59): 호출자가 지정한 것만 + 빌트인 툴.
+            # --setting-sources "" 가 ambient MCP/스킬 상속을 끊되 명시적
+            # --mcp-config 는 살린다(safe-mode 와의 결정적 차이 — unreachable
+            # 프로브 서버가 init 이벤트에 failed 로 "시도됨" 실측). 스킬은
+            # --disable-slash-commands 로 마저 끊고, --strict-mcp-config 로
+            # 프로젝트 .mcp.json 류까지 차단을 보증한다. CLAUDE.md
+            # auto-discovery 는 별개 메커니즘이라 ~1k 토큰이 남는다(한계 —
+            # 완전 차단은 isolated/lean 몫).
+            cmd += ["--setting-sources", "", "--disable-slash-commands",
+                    "--strict-mcp-config"]
+            if atools:
+                if any(t.startswith("mcp__") for t in atools):
+                    # --tools 는 빌트인 전용이라 MCP 툴 이름을 못 받는다 —
+                    # mcp_config 로 붙인 서버의 툴을 좁히는 문서화된 패턴
+                    # (allowed_tools=["mcp__..."]) 은 권한 게이트로 보낸다.
+                    cmd += ["--allowedTools", ",".join(atools)]
+                else:
+                    # isolated 와 같은 근거로 --tools(정의 allowlist) 쪽.
+                    cmd += ["--tools", ",".join(atools)]
+            if dtools:
+                cmd += ["--disallowedTools", ",".join(dtools)]
+            if mcp_config:
+                cmd += self._mcp_args(mcp_config)
+        else:   # inherit — 0.7.x 까지의 기본 동작 그대로.
             if atools:
                 cmd += ["--allowedTools", ",".join(atools)]
             if dtools:
                 cmd += ["--disallowedTools", ",".join(dtools)]
             if mcp_config:
-                if isinstance(mcp_config, str):
-                    cmd += ["--mcp-config", mcp_config]
-                else:
-                    payload = (mcp_config if "mcpServers" in mcp_config
-                               else {"mcpServers": mcp_config})
-                    cmd += ["--mcp-config", json.dumps(payload)]
+                cmd += self._mcp_args(mcp_config)
                 if strict_mcp_config:
                     cmd.append("--strict-mcp-config")
 
@@ -490,6 +586,7 @@ class ClaudeProvider(LLMProvider):
                permission_mode: str | None = None,
                allowed_tools: list[str] | None = None,
                disallowed_tools: list[str] | None = None,
+               env: str | None = None,
                lean: bool | None = None,
                isolated: bool | None = None,
                debug: bool | None = None,
@@ -518,7 +615,7 @@ class ClaudeProvider(LLMProvider):
                 prompt, model, session_id, "json",
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                strict_mcp_config=strict_mcp_config, env=env, lean=lean, isolated=isolated,
                 debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
@@ -587,7 +684,7 @@ class ClaudeProvider(LLMProvider):
                     disallowed_tools=disallowed_tools,
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
-                    lean=lean, isolated=isolated, debug=debug,
+                    env=env, lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token)
@@ -632,6 +729,7 @@ class ClaudeProvider(LLMProvider):
                            permission_mode: str | None = None,
                            allowed_tools: list[str] | None = None,
                            disallowed_tools: list[str] | None = None,
+                           env: str | None = None,
                            lean: bool | None = None,
                            isolated: bool | None = None,
                            debug: bool | None = None,
@@ -656,7 +754,7 @@ class ClaudeProvider(LLMProvider):
                 prompt, model, session_id, "json",
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                strict_mcp_config=strict_mcp_config, env=env, lean=lean, isolated=isolated,
                 debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
@@ -720,7 +818,7 @@ class ClaudeProvider(LLMProvider):
                     disallowed_tools=disallowed_tools,
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
-                    lean=lean, isolated=isolated, debug=debug,
+                    env=env, lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token)
@@ -760,6 +858,7 @@ class ClaudeProvider(LLMProvider):
                            permission_mode: str | None = None,
                            allowed_tools: list[str] | None = None,
                            disallowed_tools: list[str] | None = None,
+                           env: str | None = None,
                            lean: bool | None = None,
                            isolated: bool | None = None,
                            debug: bool | None = None,
@@ -820,7 +919,7 @@ class ClaudeProvider(LLMProvider):
                     prompt, model, attempt_sid, "stream-json",
                     permission_mode=permission_mode, allowed_tools=allowed_tools,
                     disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                    strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                    strict_mcp_config=strict_mcp_config, env=env, lean=lean, isolated=isolated,
                 debug=use_debug,
                     partial_messages=use_partial, reasoning_args=reasoning_args,
                     prompt_via_stdin=use_stdin,

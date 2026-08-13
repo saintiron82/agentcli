@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.7.2 — unreleased
+## 0.8.0 — unreleased
+
+### Changed
+- **BREAKING — the claude provider no longer inherits the host environment
+  by default (issue #59).** Environment inheritance is now one axis,
+  `ClaudeProvider(env=...)`, also a per-call override / `provider_options`
+  key:
+  - `"inherit"` — everything on the host machine (the previous default);
+  - `"explicit"` — **new default**: only what the caller passes
+    (`mcp_config`, `allowed_tools`, system prompt) plus the built-in
+    toolset. Implemented as `--setting-sources ""` +
+    `--disable-slash-commands` + `--strict-mcp-config`, which cuts ambient
+    MCP/skills inheritance while still honoring explicit `--mcp-config` —
+    measured as the only isolation lever that does (`--safe-mode` kills
+    explicit MCP too; `--bare` never reads OAuth so it can't serve
+    subscription auth);
+  - `"isolated"` — `--safe-mode` (the #56 behavior, tools kept, explicit
+    MCP dead);
+  - `"lean"` — `--safe-mode --tools ""` as before.
+
+  `lean=True` / `isolated=True` remain as boolean aliases for their tiers;
+  combining them with `env` raises `ValueError`. Under `explicit`/`isolated`,
+  built-in names in `allowed_tools` ride `--tools` (definition allowlist)
+  while a list containing `mcp__*` names rides `--allowedTools` (permission
+  gate), so narrowing your own MCP server's tools keeps working.
+
+  **Migration:** calls that relied on host MCP servers / skills / CLAUDE.md
+  must now pass `env="inherit"` (constructor or `provider_options`). Also
+  note: per-call `lean=False`/`isolated=False` now falls back to the
+  `explicit` default rather than to inheritance. Known limit: `explicit`
+  still loads ~1k tokens of CLAUDE.md (auto-discovery is a separate CLI
+  mechanism — use `isolated` to cut it). Measured effect of the new default
+  on a dev machine (2 MCP servers + 28 skills): same one-line prompt
+  50.8k → 31.6k prompt tokens, 12.7s → 3.4s; session resume verified live
+  under every tier (Claude Code 2.1.229).
 
 ### Added
 - **Claude system prompts now ride real `--append-system-prompt` flags
