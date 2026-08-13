@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 import sys
 from unittest.mock import AsyncMock, MagicMock
@@ -88,6 +89,16 @@ def write_fake_cli_launcher(tmp_path, script_body: str, *, name: str = "fake-cli
     """
     script = tmp_path / f"{name}.py"
     script.write_text(script_body, encoding="utf-8")
+    if os.name == "nt":
+        # Windows CreateProcess 는 shebang 을 모른다 — 프로덕션이 claude.cmd 를
+        # 그대로 spawn 하는 것과 같은 관례로 .cmd 런처를 쓴다 (#65).
+        launcher = tmp_path / f"{name}.cmd"
+        launcher.write_text(
+            '@echo off\r\n"{py}" "{script}" %*\r\n'.format(
+                py=sys.executable, script=str(script)),
+            encoding="utf-8",
+        )
+        return str(launcher)
     launcher = tmp_path / name
     launcher.write_text(
         "#!/bin/sh\nexec {py} {script} \"$@\"\n".format(

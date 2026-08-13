@@ -32,7 +32,7 @@ def test_resolve_percall_wins_over_everything(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", "env-token")
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
-    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token")
+    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token", encoding="utf-8")
     p = ClaudeProvider(oauth_token="ctor-token")
     assert p._resolve_oauth_token("percall-token") == "percall-token"
 
@@ -41,7 +41,7 @@ def test_resolve_constructor_wins_over_env_and_file(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", "env-token")
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
-    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token")
+    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token", encoding="utf-8")
     p = ClaudeProvider(oauth_token="ctor-token")
     assert p._resolve_oauth_token(None) == "ctor-token"
 
@@ -50,7 +50,7 @@ def test_resolve_env_wins_over_file(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTCLI_CLAUDE_OAUTH_TOKEN", "env-token")
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
-    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token")
+    (tmp_path / ".agentcli" / "claude_oauth_token").write_text("file-token", encoding="utf-8")
     p = ClaudeProvider()
     assert p._resolve_oauth_token(None) == "env-token"
 
@@ -60,7 +60,7 @@ def test_resolve_file_used_when_no_other_source(monkeypatch, tmp_path):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
     token_path = tmp_path / ".agentcli" / "claude_oauth_token"
-    token_path.write_text("file-token")
+    token_path.write_text("file-token", encoding="utf-8")
     token_path.chmod(0o600)
     p = ClaudeProvider()
     assert p._resolve_oauth_token(None) == "file-token"
@@ -78,7 +78,7 @@ def test_resolve_empty_env_var_falls_through_to_file(monkeypatch, tmp_path):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
     token_path = tmp_path / ".agentcli" / "claude_oauth_token"
-    token_path.write_text("file-token")
+    token_path.write_text("file-token", encoding="utf-8")
     token_path.chmod(0o600)
     p = ClaudeProvider()
     assert p._resolve_oauth_token(None) == "file-token"
@@ -89,7 +89,7 @@ def test_resolve_empty_file_value_means_not_set(monkeypatch, tmp_path):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
     token_path = tmp_path / ".agentcli" / "claude_oauth_token"
-    token_path.write_text("   \n")
+    token_path.write_text("   \n", encoding="utf-8")
     token_path.chmod(0o600)
     p = ClaudeProvider()
     assert p._resolve_oauth_token(None) is None
@@ -139,7 +139,7 @@ def test_world_readable_file_warns_but_still_used(monkeypatch, tmp_path, caplog)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
     token_path = tmp_path / ".agentcli" / "claude_oauth_token"
-    token_path.write_text("super-secret-token")
+    token_path.write_text("super-secret-token", encoding="utf-8")
     token_path.chmod(0o644)  # world-readable
     p = ClaudeProvider()
     with caplog.at_level(logging.WARNING):
@@ -157,7 +157,7 @@ def test_owner_only_file_does_not_warn(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     (tmp_path / ".agentcli").mkdir()
     token_path = tmp_path / ".agentcli" / "claude_oauth_token"
-    token_path.write_text("super-secret-token")
+    token_path.write_text("super-secret-token", encoding="utf-8")
     token_path.chmod(0o600)
     p = ClaudeProvider()
     with caplog.at_level(logging.WARNING):

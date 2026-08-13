@@ -45,7 +45,11 @@ _DRIFT_HASH_CACHE: dict[str, tuple[float, str]] = {}
 def _compute_instructions_hashes(cwd: str | None) -> dict:
     """cwd의 agent 지시 파일들 해시를 dict로 반환.
 
-    mtime 기반 캐시: 파일 수정 시각이 이전과 같으면 재해시 스킵 → I/O 0.
+    (mtime_ns, size) 기반 캐시: 둘 다 이전과 같으면 재해시 스킵 → I/O 0.
+    mtime float 하나만 보면 Windows 에서 변경이 은폐된다 — 파일 시각이
+    ~15.6ms 시스템 틱 단위라 같은 틱 안의 연속 수정이 같은 mtime 을 받는다
+    (#65 Windows CI 도입에서 실측). size 를 함께 보면 그 창이 "같은 틱 +
+    같은 길이" 로 줄어든다.
     """
     if not cwd:
         return {}
@@ -61,13 +65,14 @@ def _compute_instructions_hashes(cwd: str | None) -> dict:
         try:
             stat = f.stat()
             key = str(f)
+            sig = (stat.st_mtime_ns, stat.st_size)
             cached = _DRIFT_HASH_CACHE.get(key)
-            if cached and cached[0] == stat.st_mtime:
+            if cached and cached[0] == sig:
                 result[fname] = cached[1]
             else:
                 data = f.read_bytes()
                 h = hashlib.sha256(data).hexdigest()[:16]
-                _DRIFT_HASH_CACHE[key] = (stat.st_mtime, h)
+                _DRIFT_HASH_CACHE[key] = (sig, h)
                 result[fname] = h
         except OSError:
             pass

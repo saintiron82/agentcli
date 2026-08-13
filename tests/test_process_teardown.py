@@ -9,6 +9,10 @@ from unittest.mock import MagicMock
 
 import agentcli.providers.base as base
 
+# Windows 에는 signal.SIGKILL 이 없다 — _POSIX 를 강제로 True 로 모킹하는
+# 테스트는 라이브러리가 참조할 SIGKILL 도 같이 모킹해야 한다 (#65).
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
 
 def test_new_session_kwargs_posix_vs_windows(monkeypatch):
     monkeypatch.setattr(base, "_POSIX", True)
@@ -20,12 +24,13 @@ def test_new_session_kwargs_posix_vs_windows(monkeypatch):
 def test_kill_process_group_posix_uses_killpg(monkeypatch):
     """POSIX: proc.pid 를 PGID 로 killpg, 성공 시 proc.kill 안 부른다."""
     monkeypatch.setattr(base, "_POSIX", True)
+    monkeypatch.setattr(base.signal, "SIGKILL", _SIGKILL, raising=False)
     calls = []
     monkeypatch.setattr(base.os, "killpg", lambda pg, sig: calls.append((pg, sig)),
                         raising=False)
     proc = MagicMock(); proc.pid = 4321
     base._kill_process_group(proc)
-    assert calls == [(4321, signal.SIGKILL)]
+    assert calls == [(4321, _SIGKILL)]
     proc.kill.assert_not_called()
 
 
@@ -43,6 +48,7 @@ def test_kill_process_group_windows_falls_back_to_direct_kill(monkeypatch):
 def test_kill_process_group_lookup_error_falls_back(monkeypatch):
     """그룹이 이미 사라진(race) ProcessLookupError 면 폴백, 예외 전파 안 함."""
     monkeypatch.setattr(base, "_POSIX", True)
+    monkeypatch.setattr(base.signal, "SIGKILL", _SIGKILL, raising=False)
 
     def boom(pg, sig):
         raise ProcessLookupError
