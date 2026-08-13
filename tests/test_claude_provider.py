@@ -211,8 +211,10 @@ def test_invoke_cwd_and_tools(mock_find, mock_run):
     assert "--permission-mode" in cmd
     pidx = cmd.index("--permission-mode")
     assert cmd[pidx + 1] == "default"
-    assert "--allowedTools" in cmd
-    aidx = cmd.index("--allowedTools")
+    # 기본 explicit 티어(#59)에서 빌트인 allowed_tools 는 --tools(정의
+    # allowlist)로 간다 — --allowedTools 는 inherit 티어의 배선이다.
+    assert "--tools" in cmd
+    aidx = cmd.index("--tools")
     assert cmd[aidx + 1] == "Read,Grep"
     assert "--disallowedTools" in cmd
     didx = cmd.index("--disallowedTools")

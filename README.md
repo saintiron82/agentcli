@@ -393,7 +393,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
 | `effort` (reasoning intensity) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
 | `thinking` (visibility) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
-| claude-only options | `lean`, `isolated`, `partial_messages` | — | — | — |
+| claude-only options | `env` (tier), `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a
 per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr
@@ -571,8 +571,8 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `lean`, `isolated`, `debug`, `debug_log_path`,
-  `partial_messages` (streaming-only).
+  `disallowed_tools`, `env` (environment tier), `lean`, `isolated`, `debug`,
+  `debug_log_path`, `partial_messages` (streaming-only).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
   **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
@@ -590,42 +590,56 @@ above. If you only edit files in `cwd`, you don't need `mcp_config` at all — t
 `permission_mode` / `allowed_tools` constructor flags (or these per-call
 overrides) are enough.
 
-### Host environment isolation (claude)
+### Environment tiers (claude) — what the spawned CLI inherits
 
-A spawned `claude` process inherits the host machine's Claude Code
+A spawned `claude` process can inherit the host machine's Claude Code
 customizations — MCP servers, skills, CLAUDE.md, hooks. For an embedded
 backend that is almost never what you want: tool definitions irrelevant to
 your service ride along on every turn (measured in issue #56: 794k prompt
 tokens and a timeout vs 196k and success for the same request), and behavior
 stops being reproducible because it depends on whatever is installed on the
-machine running the service. `isolated=True` severs that inheritance
-(`--safe-mode`) while keeping the built-in toolset available:
+machine running the service. What gets in is one axis, `env`:
+
+| tier | what gets in | ctx tokens* | for |
+|---|---|---:|---|
+| `"inherit"` | everything on the host (pre-0.8 default) | 50.7k | dev tools that *want* the host setup |
+| `"explicit"` — **default** | only what you pass — `mcp_config`, `allowed_tools`, system prompt — plus built-in tools | 31.6k | embedded backends |
+| `"isolated"` | built-in tools only; even explicit `mcp_config` is dead (`--safe-mode`, issue #56) | 29.5k | hard isolation, tools kept |
+| `"lean"` | nothing — no customization, no tools | 4.8k | single completions |
+
+*Same one-line prompt on a dev machine with 2 MCP servers + 28 skills,
+Claude Code 2.1.229.
 
 ```python
-ClaudeProvider(isolated=True)                          # no host MCP/skills/CLAUDE.md;
-                                                       # built-in tools intact
-ClaudeProvider(isolated=True, allowed_tools=["Bash"])  # + narrow the tool definitions
-                                                       # (rides --tools, which actually
-                                                       # shrinks per-turn context)
+ClaudeProvider()                       # explicit: your mcp_config/allowed_tools only
+ClaudeProvider(env="inherit")          # restore pre-0.8 inheritance
+client.chat(..., provider_options={"env": "inherit"})    # or per call
 ```
 
-Under `isolated`, `allowed_tools` maps to `--tools` (the built-in definition
-allowlist — measured to cut the definition context ~3x) rather than
-`--allowedTools` (a permission gate that leaves all definitions loaded —
-measured: no context reduction). `mcp_config` is ignored (`--safe-mode`
-disables MCP); `disallowed_tools` still blocks (verified under safe-mode).
-Also available per call: `provider_options={"isolated": True}`. Isolation
-stays opt-in for backward compatibility — embedded services should almost
-always turn it on. Dev-machine A/B (2 MCP servers + 28 skills installed):
-same one-line prompt, 50.7k → 29.5k prompt tokens and 10.5s → 3.2s.
+**Breaking change in 0.8.0:** the default used to be `inherit`. Calls that
+relied on host MCP servers / skills / CLAUDE.md must now pass
+`env="inherit"`. `lean=True` / `isolated=True` keep working as boolean
+aliases for their tiers; combining them with `env` raises `ValueError`.
+
+Tool routing under `explicit`/`isolated`: built-in names in `allowed_tools`
+ride `--tools` (the definition allowlist — measured to actually shrink
+per-turn context ~3x), while any `mcp__*` name switches the list to
+`--allowedTools` (a permission gate) so narrowing your own MCP server's
+tools keeps working. `mcp_config` works under `explicit` — that is the
+point of the tier (`--setting-sources ""` cuts ambient inheritance but
+honors explicit `--mcp-config`, unlike `--safe-mode` which kills both) —
+and is ignored under `isolated`/`lean`. Known limit of `explicit`:
+CLAUDE.md auto-discovery is a separate CLI mechanism, so ~1k tokens of it
+still load — use `isolated` when that matters. Session resume works under
+every tier (verified live).
 
 ### Lean mode & debug (claude)
 
 For a single completion that needs no tools — summarize / generate / draft over
 a large context — `lean=True` strips the agent harness: it adds `--safe-mode`
 (no CLAUDE.md/skills/plugins/hooks/MCP/custom agents) and `--tools ""` (no
-built-in tools). `lean` is the stricter sibling of `isolated`: same
-isolation, plus no tools at all. The completion then can't pay for MCP startup or wander into an
+built-in tools). `lean` is the strictest environment tier (`env="lean"`;
+see *Environment tiers* above). The completion then can't pay for MCP startup or wander into an
 autonomous tool loop. The dominant remaining cost is output-token generation, so
 also pick a faster model when latency matters.
 
@@ -664,8 +678,8 @@ async for chunk in client.chat_stream(prompt, provider="claude",
         print(chunk.content, end="", flush=True)   # token-by-token
 ```
 
-`lean` / `isolated` / `debug` / `partial_messages` are Claude-specific; other
-providers ignore them on fallback.
+`env` / `lean` / `isolated` / `debug` / `partial_messages` are
+Claude-specific; other providers ignore them on fallback.
 
 ### Tracking running CLIs (diagnostics)
 

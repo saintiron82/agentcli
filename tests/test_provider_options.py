@@ -59,6 +59,10 @@ def test_build_cmd_strict_mcp_config_flag(mock_find):
 def test_build_cmd_no_mcp_flag_when_absent(mock_find):
     p = ClaudeProvider()
     cmd, _ = p._build_cmd("hi", "", "", "json")
+    assert "--mcp-config" not in cmd     # 설정을 안 줬으면 서버 주입 없음
+    # 기본 explicit 티어(#59)는 --strict-mcp-config 를 항상 붙인다(ambient
+    # 차단 보증). "요청했을 때만 strict" 는 inherit 티어의 계약이다.
+    cmd, _ = p._build_cmd("hi", "", "", "json", env="inherit")
     assert "--mcp-config" not in cmd
     assert "--strict-mcp-config" not in cmd
 
