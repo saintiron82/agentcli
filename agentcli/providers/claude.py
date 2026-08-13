@@ -18,7 +18,8 @@ from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
                    estimate_payload_prompt_tokens, health_from_response,
                    run_health_command, run_subprocess_async,
-                   run_subprocess_sync, split_system_messages)
+                   run_subprocess_sync, split_system_messages,
+                   validate_reasoning_defaults)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -261,8 +262,9 @@ class ClaudeProvider(LLMProvider):
         self._debug_log_path = debug_log_path
         self._partial_messages = partial_messages
         # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
-        self._effort = effort
-        self._thinking = thinking
+        # #38: 기본값 오타는 선언 지점에서 즉시 터뜨리고 "" 는 미설정으로.
+        self._effort, self._thinking = validate_reasoning_defaults(
+            self.provider_id, effort, thinking)
         self._oauth_token = oauth_token
         self._exclude_dynamic_system_prompt = exclude_dynamic_system_prompt
 
@@ -592,23 +594,15 @@ class ClaudeProvider(LLMProvider):
         return cmd, used_session_id
 
     def _reasoning_flags(self, effort, thinking):
-        """유효 effort/thinking → (claude native 플래그 args, ReasoningResolution).
+        """resolve 된 effort/thinking → claude native 플래그 렌더링 (#38).
 
-        유효값 = 호출 인자(None 이 아니면) 우선, 아니면 생성자 기본값.
+        결정·정규화·resolve 는 base ``_resolve_reasoning`` 공통부가 담당.
         claude 는 thinking 토글이 없어 thinking 은 무플래그 no-op 로 보고된다.
         """
-        from ..reasoning import resolve_effort, resolve_thinking
-        from ..types import ReasoningResolution
-        eff = self._effort if effort is None else effort
-        thk = self._thinking if thinking is None else thinking
-        args, er, tr = [], None, None
-        if eff:
-            er = resolve_effort(self.provider_id, eff)
-            if er.applied:
-                args += ["--effort", er.applied]
-        if thk:
-            tr = resolve_thinking(self.provider_id, thk)  # 미지원 → 무플래그
-        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        er, _tr, res = self._resolve_reasoning(effort, thinking)
+        args = []
+        if er and er.applied:
+            args += ["--effort", er.applied]
         return args, res
 
     def invoke(self, messages: list[Message], *,

@@ -24,7 +24,8 @@ from typing import AsyncIterator
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command, run_subprocess_async)
+                   run_health_command, run_subprocess_async,
+                   validate_reasoning_defaults)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
@@ -173,8 +174,9 @@ class CodexProvider(LLMProvider):
         self._full_auto = full_auto
         self._skip_git = skip_git_repo_check
         # 정규화 reasoning 제어의 생성자 기본값(호출 시 override 가능).
-        self._effort = effort
-        self._thinking = thinking
+        # #38: 기본값 오타는 선언 지점에서 즉시 터뜨리고 "" 는 미설정으로.
+        self._effort, self._thinking = validate_reasoning_defaults(
+            self.provider_id, effort, thinking)
 
     def is_available(self) -> bool:
         return shutil.which("codex") is not None
@@ -333,20 +335,12 @@ class CodexProvider(LLMProvider):
         `-c model_reasoning_effort=<native>` / `-c model_reasoning_summary=<native>`.
         xhigh/max 는 codex 상한(high)으로 clamp 되어 보고된다.
         """
-        from ..reasoning import resolve_effort, resolve_thinking
-        from ..types import ReasoningResolution
-        eff = self._effort if effort is None else effort
-        thk = self._thinking if thinking is None else thinking
-        args, er, tr = [], None, None
-        if eff:
-            er = resolve_effort(self.provider_id, eff)
-            if er.applied:
-                args += ["-c", f"model_reasoning_effort={_toml_inline(er.applied)}"]
-        if thk:
-            tr = resolve_thinking(self.provider_id, thk)
-            if tr.applied:
-                args += ["-c", f"model_reasoning_summary={_toml_inline(tr.applied)}"]
-        res = ReasoningResolution(effort=er, thinking=tr) if (er or tr) else None
+        er, tr, res = self._resolve_reasoning(effort, thinking)
+        args = []
+        if er and er.applied:
+            args += ["-c", f"model_reasoning_effort={_toml_inline(er.applied)}"]
+        if tr and tr.applied:
+            args += ["-c", f"model_reasoning_summary={_toml_inline(tr.applied)}"]
         return args, res
 
     # ---------- 동기 ----------

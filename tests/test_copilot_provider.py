@@ -315,17 +315,13 @@ def test_invoke_binary_missing_leaves_reasoning_unset(mock_find):
 
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
-def test_constructor_effort_none_raises_on_first_call(mock_find):
-    """Pins the CHANGELOG-documented break: CopilotProvider(effort=...)
-    validates lazily. Copilot's own native value is "none" (canonical
-    "minimal" maps to it) -- passing the native string "none" straight
-    through construction succeeds (no validation happens there), but the
-    first invoke() call resolves it against the canonical scale
-    (minimal/low/medium/high/xhigh/max) and "none" isn't one of those, so
-    it raises ValueError mentioning the valid levels."""
-    p = CopilotProvider(effort="none")  # construction does not validate
+def test_constructor_effort_none_raises_at_declaration(mock_find):
+    """#38: 검증이 선언 지점으로 당겨졌다. copilot 의 네이티브 값 "none" 은
+    canonical scale(minimal/low/…)이 아니므로 — canonical "minimal" 이
+    그것으로 매핑된다 — 이제 생성자가 즉시 ValueError 를 낸다 (0.7.0 에서는
+    첫 invoke 까지 잠복했다). 에러 메시지는 유효 레벨을 안내한다."""
     with pytest.raises(ValueError, match="minimal"):
-        p.invoke([Message(role="user", content="hi")])
+        CopilotProvider(effort="none")
 
 
 # ===== stream_async (reasoning event ordering) =====

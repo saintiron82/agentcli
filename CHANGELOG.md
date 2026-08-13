@@ -1,5 +1,20 @@
 # Changelog
 
+## unreleased
+
+### Changed
+- **Reasoning defaults now fail fast at the declaration site (issue #38).**
+  `Provider(effort=..., thinking=...)` typos used to sit dormant until the
+  first call; all three providers now validate constructor defaults
+  immediately (`ValueError` naming the valid levels). Empty strings are
+  normalized to "unset" everywhere — previously a per-call `effort=""`
+  bypassed validation via truthiness and silently disabled the constructor
+  default; it now falls back to that default instead. Internals: the
+  triplicated default-merge/resolve logic moved to a shared
+  `LLMProvider._resolve_reasoning`, leaving per-provider code as pure flag
+  rendering; claude/codex gained the invoke→argv effort e2e tests copilot
+  already had.
+
 ## 0.7.4 — 2026-08-13
 
 ### Fixed
@@ -650,9 +665,8 @@ First release under the `agentcli` name (previously internal `libs.llm`). Major 
   - Codex: `sandbox_mode`, `approval_policy`, `full_auto`.
   - Copilot: `allow_all_tools`, `allowed_tools`, `disallowed_tools`,
     `available_tools`, `add_dirs` (constructor-only), `effort`
-    (constructor default; became a per-call option too in 0.7.0 — see
-    `capabilities().options`, which for copilot is currently `debug`,
-    `debug_log_path`, `effort`, `thinking`).
+    (constructor default; became a per-call option too in 0.7.0 — query
+    `capabilities().options` for the current per-call surface).
 - **`cwd` parameter** flows through `LLMClient` → provider subprocess, isolating session files per project.
 - **MemoryStore TTL + cap**; **SQLiteStore WAL + busy_timeout**; `build_env()` caches `gh auth token`.
 
