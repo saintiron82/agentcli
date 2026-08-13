@@ -130,6 +130,7 @@ class ClaudeProvider(LLMProvider):
                  allowed_tools: list[str] | None = None,
                  disallowed_tools: list[str] | None = None,
                  lean: bool = False,
+                 isolated: bool = False,
                  debug: bool = False,
                  debug_log_path: str | None = None,
                  partial_messages: bool = False,
@@ -150,7 +151,21 @@ class ClaudeProvider(LLMProvider):
                 allowlist; allowed_tools 미지정 시 `""` 로 전부 비활성화) 를 붙여
                 하네스 부팅 비용과 주입 컨텍스트를 최소화한다. lean 에서는 mcp_config/
                 disallowed_tools 가 무시된다(safe-mode 가 MCP 를 끄고 `--tools` 가
-                allowlist 이므로). 기본 False — 기존 동작 불변.
+                allowlist 이므로). 기본 False — 기존 동작 불변. lean 은 격리를
+                겸한다 — 툴을 유지한 채 격리만 원하면 isolated 를 쓴다.
+            isolated: 호스트 Claude Code 환경 상속 차단 (#56). True 면 호출마다
+                `--safe-mode` 를 붙여 호스트의 CLAUDE.md/skills/plugins/hooks/
+                MCP/custom agents 가 컨텍스트로 주입되는 것을 끊되, **빌트인
+                툴셋은 그대로 둔다** — 임베딩된 서비스가 자기 작업용 에이전트를
+                띄울 때 개발 머신의 MCP 서버·skill 이 따라 들어가 입력 토큰이
+                수 배로 부풀고 머신마다 재현성이 깨지는 것을 막는다. allowed_tools
+                를 함께 주면 `--tools`(빌트인 정의 allowlist — 툴 정의 컨텍스트를
+                실제로 줄이는, 이슈에서 검증된 조합) 로 좁힌다(`--allowedTools`
+                는 권한 게이트일 뿐 컨텍스트를 줄이지 못하는 것이 실측됨).
+                mcp_config 는 무시된다(safe-mode 가 MCP 를 끔). disallowed_tools
+                는 safe-mode 에서도 차단이 실측 확인돼 그대로 전달된다.
+                lean=True 면 이 옵션과 무관하게 lean 의 더 좁은 동작이 적용된다.
+                기본 False — 기존 동작(상속) 불변.
             debug: 진단용 계측 모드. True 면 호출마다 claude CLI 에 ``--debug`` 를
                 붙여 MCP 연결·툴 호출·API 왕복 내부 로그를 stderr 로 끌어내고,
                 agentcli 가 그것 + 타이밍을 Python logging(logger 이름
@@ -186,6 +201,7 @@ class ClaudeProvider(LLMProvider):
         self._allowed_tools = allowed_tools
         self._disallowed_tools = disallowed_tools
         self._lean = lean
+        self._isolated = isolated
         self._debug = debug
         self._debug_log_path = debug_log_path
         self._partial_messages = partial_messages
@@ -338,6 +354,7 @@ class ClaudeProvider(LLMProvider):
                    mcp_config: dict | str | None = None,
                    strict_mcp_config: bool = False,
                    lean: bool | None = None,
+                   isolated: bool | None = None,
                    debug: bool | None = None,
                    partial_messages: bool | None = None,
                    reasoning_args: list[str] | None = None,
@@ -346,8 +363,8 @@ class ClaudeProvider(LLMProvider):
                    append_system_prompt_file: str = "") -> tuple[list[str] | None, str]:
         """CLI 명령어와 사용한 session_id 반환. (None, "") 이면 바이너리 없음.
 
-        permission_mode/allowed_tools/disallowed_tools/mcp_config/lean 은 호출
-        시점 오버라이드 (None 이면 생성자 기본값). mcp_config 는 외부 MCP 서버
+        permission_mode/allowed_tools/disallowed_tools/mcp_config/lean/
+        isolated 는 호출 시점 오버라이드 (None 이면 생성자 기본값). mcp_config 는 외부 MCP 서버
         정의 — dict 면 ``{"mcpServers": ...}`` 로 감싸 JSON 직렬화, str 이면 그대로
         (파일 경로 또는 사전 직렬화 JSON) 전달한다 (#154). lean=True 면 단일
         completion 용으로 ``--safe-mode`` + ``--tools`` allowlist 만 붙이고
@@ -369,6 +386,7 @@ class ClaudeProvider(LLMProvider):
         dtools = (disallowed_tools if disallowed_tools is not None
                   else self._disallowed_tools)
         use_lean = self._lean if lean is None else lean
+        use_isolated = self._isolated if isolated is None else isolated
         use_debug = self._debug if debug is None else debug
         use_partial = (self._partial_messages if partial_messages is None
                        else partial_messages)
@@ -405,6 +423,19 @@ class ClaudeProvider(LLMProvider):
             # safe-mode 가 MCP 를 끄므로 mcp_config/disallowed_tools 는 무시.
             cmd.append("--safe-mode")
             cmd += ["--tools", ",".join(atools) if atools else ""]
+        elif use_isolated:
+            # 격리만 (#56): 호스트 커스터마이즈(CLAUDE.md/skills/plugins/hooks/
+            # MCP/custom agents) 상속을 끊되 빌트인 툴셋은 유지한다. allowed_tools
+            # 는 --tools(빌트인 정의 allowlist) 로 좁힌다 — --allowedTools 는
+            # 권한 게이트일 뿐 툴 정의 컨텍스트를 줄이지 못하는 것이 실측됨
+            # (2.1.229: safe-mode+allowedTools ctx 58.7k vs safe-mode+tools 18.6k).
+            # safe-mode 가 MCP 를 끄므로 mcp_config 는 무시. --disallowedTools 는
+            # safe-mode 밑에서도 차단이 실측 확인돼 유지.
+            cmd.append("--safe-mode")
+            if atools:
+                cmd += ["--tools", ",".join(atools)]
+            if dtools:
+                cmd += ["--disallowedTools", ",".join(dtools)]
         else:
             if atools:
                 cmd += ["--allowedTools", ",".join(atools)]
@@ -460,6 +491,7 @@ class ClaudeProvider(LLMProvider):
                allowed_tools: list[str] | None = None,
                disallowed_tools: list[str] | None = None,
                lean: bool | None = None,
+               isolated: bool | None = None,
                debug: bool | None = None,
                debug_log_path: str | None = None,
                effort: str | None = None,
@@ -486,7 +518,8 @@ class ClaudeProvider(LLMProvider):
                 prompt, model, session_id, "json",
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
                 append_system_prompt_file=sys_file)
@@ -554,7 +587,7 @@ class ClaudeProvider(LLMProvider):
                     disallowed_tools=disallowed_tools,
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
-                    lean=lean, debug=debug,
+                    lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token)
@@ -600,6 +633,7 @@ class ClaudeProvider(LLMProvider):
                            allowed_tools: list[str] | None = None,
                            disallowed_tools: list[str] | None = None,
                            lean: bool | None = None,
+                           isolated: bool | None = None,
                            debug: bool | None = None,
                            debug_log_path: str | None = None,
                            effort: str | None = None,
@@ -622,7 +656,8 @@ class ClaudeProvider(LLMProvider):
                 prompt, model, session_id, "json",
                 permission_mode=permission_mode, allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                debug=use_debug,
                 reasoning_args=reasoning_args, prompt_via_stdin=use_stdin,
                 append_system_prompt=sys_argv,
                 append_system_prompt_file=sys_file)
@@ -685,7 +720,7 @@ class ClaudeProvider(LLMProvider):
                     disallowed_tools=disallowed_tools,
                     mcp_config=mcp_config,
                     strict_mcp_config=strict_mcp_config,
-                    lean=lean, debug=debug,
+                    lean=lean, isolated=isolated, debug=debug,
                     debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token)
@@ -726,6 +761,7 @@ class ClaudeProvider(LLMProvider):
                            allowed_tools: list[str] | None = None,
                            disallowed_tools: list[str] | None = None,
                            lean: bool | None = None,
+                           isolated: bool | None = None,
                            debug: bool | None = None,
                            debug_log_path: str | None = None,
                            partial_messages: bool | None = None,
@@ -784,7 +820,8 @@ class ClaudeProvider(LLMProvider):
                     prompt, model, attempt_sid, "stream-json",
                     permission_mode=permission_mode, allowed_tools=allowed_tools,
                     disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-                    strict_mcp_config=strict_mcp_config, lean=lean, debug=use_debug,
+                    strict_mcp_config=strict_mcp_config, lean=lean, isolated=isolated,
+                debug=use_debug,
                     partial_messages=use_partial, reasoning_args=reasoning_args,
                     prompt_via_stdin=use_stdin,
                     append_system_prompt=sys_argv,

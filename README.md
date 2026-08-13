@@ -393,7 +393,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
 | `effort` (reasoning intensity) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
 | `thinking` (visibility) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
-| claude-only options | `lean`, `partial_messages` | — | — | — |
+| claude-only options | `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a
 per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr
@@ -571,8 +571,8 @@ Supported `provider_options` keys:
 
 - **claude** — `mcp_config` (dict → serialized under `--mcp-config`, or a
   path/JSON string), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
-  (streaming-only).
+  `disallowed_tools`, `lean`, `isolated`, `debug`, `debug_log_path`,
+  `partial_messages` (streaming-only).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. Codex reads MCP
   servers from `~/.codex/config.toml`, so its `mcp_config` uses the
   **codex-native shape** — `{name: {url, bearer_token_env_var?}}` (HTTP; the
@@ -590,12 +590,42 @@ above. If you only edit files in `cwd`, you don't need `mcp_config` at all — t
 `permission_mode` / `allowed_tools` constructor flags (or these per-call
 overrides) are enough.
 
+### Host environment isolation (claude)
+
+A spawned `claude` process inherits the host machine's Claude Code
+customizations — MCP servers, skills, CLAUDE.md, hooks. For an embedded
+backend that is almost never what you want: tool definitions irrelevant to
+your service ride along on every turn (measured in issue #56: 794k prompt
+tokens and a timeout vs 196k and success for the same request), and behavior
+stops being reproducible because it depends on whatever is installed on the
+machine running the service. `isolated=True` severs that inheritance
+(`--safe-mode`) while keeping the built-in toolset available:
+
+```python
+ClaudeProvider(isolated=True)                          # no host MCP/skills/CLAUDE.md;
+                                                       # built-in tools intact
+ClaudeProvider(isolated=True, allowed_tools=["Bash"])  # + narrow the tool definitions
+                                                       # (rides --tools, which actually
+                                                       # shrinks per-turn context)
+```
+
+Under `isolated`, `allowed_tools` maps to `--tools` (the built-in definition
+allowlist — measured to cut the definition context ~3x) rather than
+`--allowedTools` (a permission gate that leaves all definitions loaded —
+measured: no context reduction). `mcp_config` is ignored (`--safe-mode`
+disables MCP); `disallowed_tools` still blocks (verified under safe-mode).
+Also available per call: `provider_options={"isolated": True}`. Isolation
+stays opt-in for backward compatibility — embedded services should almost
+always turn it on. Dev-machine A/B (2 MCP servers + 28 skills installed):
+same one-line prompt, 50.7k → 29.5k prompt tokens and 10.5s → 3.2s.
+
 ### Lean mode & debug (claude)
 
 For a single completion that needs no tools — summarize / generate / draft over
 a large context — `lean=True` strips the agent harness: it adds `--safe-mode`
 (no CLAUDE.md/skills/plugins/hooks/MCP/custom agents) and `--tools ""` (no
-built-in tools). The completion then can't pay for MCP startup or wander into an
+built-in tools). `lean` is the stricter sibling of `isolated`: same
+isolation, plus no tools at all. The completion then can't pay for MCP startup or wander into an
 autonomous tool loop. The dominant remaining cost is output-token generation, so
 also pick a faster model when latency matters.
 
@@ -634,8 +664,8 @@ async for chunk in client.chat_stream(prompt, provider="claude",
         print(chunk.content, end="", flush=True)   # token-by-token
 ```
 
-`lean` / `debug` / `partial_messages` are Claude-specific; other providers
-ignore them on fallback.
+`lean` / `isolated` / `debug` / `partial_messages` are Claude-specific; other
+providers ignore them on fallback.
 
 ### Tracking running CLIs (diagnostics)
 
