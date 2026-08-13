@@ -231,8 +231,8 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 
 - **claude** — `mcp_config`(dict → `--mcp-config` 로 직렬화, 또는 경로/JSON
   문자열), `strict_mcp_config`, `permission_mode`, `allowed_tools`,
-  `disallowed_tools`, `lean`, `debug`, `debug_log_path`, `partial_messages`
-  (스트리밍 전용).
+  `disallowed_tools`, `lean`, `isolated`, `debug`, `debug_log_path`,
+  `partial_messages` (스트리밍 전용).
 - **codex** — `mcp_config`, `sandbox_mode`, `approval_policy`. codex 는 MCP 서버를
   `~/.codex/config.toml` 에서 읽으므로, codex 의 `mcp_config` 는 **codex 네이티브
   형태** — `{name: {url, bearer_token_env_var?}}`(HTTP; 토큰은 inline 헤더가 아니라
@@ -248,6 +248,33 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 편집한다면 `mcp_config` 는 필요 없다 — 생성자 `permission_mode`/`allowed_tools`
 (또는 이 호출 시점 오버라이드)로 충분하다.
 
+### 호스트 환경 격리 (claude)
+
+spawn 된 `claude` 프로세스는 호스트 머신의 Claude Code 커스터마이즈 — MCP
+서버·skills·CLAUDE.md·hooks — 를 통째로 상속한다. 임베드된 백엔드에서 이것은
+거의 항상 원하는 동작이 아니다: 서비스와 무관한 툴 정의가 매 턴 실려가고
+(issue #56 실측: 같은 요청이 794k prompt 토큰/타임아웃 vs 196k/성공), 서비스를
+돌리는 머신에 뭐가 깔렸느냐에 따라 동작이 달라져 재현성이 깨진다.
+`isolated=True` 는 그 상속을 끊되(`--safe-mode`) 빌트인 툴셋은 유지한다:
+
+```python
+ClaudeProvider(isolated=True)                          # 호스트 MCP/skills/CLAUDE.md 없음;
+                                                       # 빌트인 툴은 그대로
+ClaudeProvider(isolated=True, allowed_tools=["Bash"])  # + 툴 정의까지 좁힘
+                                                       # (--tools 로 가서 턴당
+                                                       # 컨텍스트를 실제로 줄인다)
+```
+
+`isolated` 에서 `allowed_tools` 는 `--allowedTools`(권한 게이트 — 정의는 전부
+로드된 채라 실측상 컨텍스트 감소 없음)가 아니라 `--tools`(빌트인 정의
+allowlist — 정의 컨텍스트를 약 1/3 로 줄이는 것이 실측됨)로 간다. `mcp_config`
+는 무시되고(`--safe-mode` 가 MCP 를 끔), `disallowed_tools` 는 여전히
+차단된다(safe-mode 밑에서 검증). 호출 시점에도 가능:
+`provider_options={"isolated": True}`. 하위호환을 위해 격리는 opt-in 이다 —
+임베드된 서비스라면 거의 항상 켜는 것이 맞다. 개발 머신 A/B(MCP 서버 2개 +
+skill 28개 설치): 같은 한 줄 프롬프트가 50.7k → 29.5k prompt 토큰,
+10.5초 → 3.2초.
+
 ### lean 모드 & debug (claude)
 
 툴이 필요 없는 단일 completion — 큰 컨텍스트에 대한 요약/생성/초안 — 에서는
@@ -255,6 +282,7 @@ client.chat("이슈 #154에 'investigating' 코멘트 달아줘.", provider="cla
 plugins/hooks/MCP/custom agents 없음) + `--tools ""`(빌트인 툴 없음). 그러면
 completion 이 MCP 기동 비용을 내지 않고 자율 툴 루프로 빠지지도 않는다. 남는
 지배 비용은 출력 토큰 생성이므로, 지연이 중요하면 더 빠른 모델도 함께 고른다.
+`lean` 은 `isolated` 의 더 좁은 형제다 — 같은 격리에 더해 툴이 아예 없다.
 
 ```python
 # 약 5만 자 텍스트 → 회의록, 툴 불필요:
@@ -291,7 +319,7 @@ async for chunk in client.chat_stream(prompt, provider="claude",
         print(chunk.content, end="", flush=True)   # 토큰 단위
 ```
 
-`lean`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
+`lean`/`isolated`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
 
 ### 실행 중인 CLI 추적 (진단)
 
@@ -383,7 +411,7 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
 | `effort` (입력 다이얼) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
 | `thinking` (출력 가시성) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
-| claude 전용 옵션 | `lean`, `partial_messages` | — | — | — |
+| claude 전용 옵션 | `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
 타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr trace 를 남긴다.

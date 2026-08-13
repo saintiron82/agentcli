@@ -31,6 +31,23 @@
   (a 14k-token cached context used to report `prompt_tokens=4`). This keeps
   the normalized "`cached_tokens` is a subset of `prompt_tokens`" contract.
 
+- **Host-environment isolation decoupled from lean (issue #56).**
+  `ClaudeProvider(isolated=True)` (also per call:
+  `provider_options={"isolated": True}`) adds `--safe-mode` so an embedded
+  backend stops inheriting the host machine's Claude Code customizations
+  (MCP servers, skills, CLAUDE.md, hooks) — while keeping the built-in
+  toolset available, which is what separates it from `lean` (isolation +
+  `--tools ""`). The issue measured the inheritance at 794k prompt tokens
+  and a timeout vs 196k and success for the same request; a dev-machine A/B
+  for this change (2 MCP servers + 28 skills): 50.7k → 29.5k prompt tokens,
+  10.5s → 3.2s for the same one-line prompt. Under `isolated`,
+  `allowed_tools` rides `--tools` (the built-in definition allowlist —
+  measured to cut definition context ~3x) instead of `--allowedTools` (a
+  permission gate; measured: no context reduction), `mcp_config` is ignored
+  (safe-mode disables MCP), and `disallowed_tools` still blocks (verified
+  under safe-mode, Claude Code 2.1.229). Default stays inherit — no behavior
+  change unless opted in.
+
 ### Fixed
 - **`stream_async` now also routes large prompts through stdin (issue #44).**
   `invoke`/`invoke_async` got the issue #30 stdin fix, but `stream_async` uses
