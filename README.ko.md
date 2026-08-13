@@ -96,7 +96,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.1"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.2"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -259,7 +259,7 @@ spawn 된 `claude` 프로세스는 호스트 머신의 Claude Code 커스터마�
 
 | 티어 | 들어가는 것 | ctx 토큰* | 용도 |
 |---|---|---:|---|
-| `"inherit"` | 호스트의 전부 (0.8 이전 기본) | 50.7k | 호스트 구성을 *원하는* 개발 도구 |
+| `"inherit"` | 호스트의 전부 (0.7.2 이전 기본) | 50.7k | 호스트 구성을 *원하는* 개발 도구 |
 | `"explicit"` — **기본** | 지정한 것만 — `mcp_config`, `allowed_tools`, 시스템 프롬프트 — + 빌트인 툴 | 31.6k | 임베드된 백엔드 |
 | `"isolated"` | 빌트인 툴만; 명시 `mcp_config` 도 죽음 (`--safe-mode`, issue #56) | 29.5k | 강한 격리 + 툴 유지 |
 | `"lean"` | 없음 — 커스터마이즈도 툴도 없음 | 4.8k | 단일 completion |
@@ -269,11 +269,11 @@ spawn 된 `claude` 프로세스는 호스트 머신의 Claude Code 커스터마�
 
 ```python
 ClaudeProvider()                       # explicit: 지정한 mcp_config/allowed_tools 만
-ClaudeProvider(env="inherit")          # 0.8 이전 상속 동작 복원
+ClaudeProvider(env="inherit")          # 0.7.2 이전 상속 동작 복원
 client.chat(..., provider_options={"env": "inherit"})    # 호출 시점에도
 ```
 
-**0.8.0 브레이킹 체인지:** 기본이 `inherit` 였다. 호스트 MCP 서버/skills/
+**0.7.2 브레이킹 체인지:** 기본이 `inherit` 였다. 호스트 MCP 서버/skills/
 CLAUDE.md 에 의존하던 호출은 이제 `env="inherit"` 를 명시해야 한다.
 `lean=True` / `isolated=True` 는 해당 티어의 부울 별칭으로 계속 동작하며,
 `env` 와 동시에 주면 `ValueError`.

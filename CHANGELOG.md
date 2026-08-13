@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0 — unreleased
+## 0.7.2 — 2026-08-13
 
 ### Changed
 - **BREAKING — the claude provider no longer inherits the host environment
