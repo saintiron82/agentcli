@@ -30,7 +30,6 @@
   real input context — instead of Anthropic's cache-exclusive `input_tokens`
   (a 14k-token cached context used to report `prompt_tokens=4`). This keeps
   the normalized "`cached_tokens` is a subset of `prompt_tokens`" contract.
-
 - **Host-environment isolation decoupled from lean (issue #56).**
   `ClaudeProvider(isolated=True)` (also per call:
   `provider_options={"isolated": True}`) adds `--safe-mode` so an embedded
