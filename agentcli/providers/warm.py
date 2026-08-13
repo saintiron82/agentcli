@@ -82,6 +82,13 @@ _BASE_FLAGS = (
 # lean: 커스터마이즈(CLAUDE.md/skills/hooks/MCP)와 빌트인 툴을 끊는다.
 _LEAN_FLAGS = ("--safe-mode", "--tools", "")
 
+# stdout 한 줄(이벤트 하나)의 최대 바이트. asyncio StreamReader 기본값(64KiB)은
+# 상주 프로토콜과 맞지 않는다 — 이벤트는 한 줄에 하나고 assistant 이벤트는
+# 응답 전문을 담으므로, 긴 응답 한 줄이 64KiB 를 넘는 순간 readline() 이
+# ValueError 로 터진다(issue #54). 최대 출력(수십만 자)과 JSON 이스케이프
+# 팽창을 감안해도 남는 크기로 잡되, 무한은 아니게 둔다.
+_DEFAULT_STREAM_LIMIT = 8 * 1024 * 1024
+
 
 class WarmSessionError(RuntimeError):
     """상주 세션이 더 이상 신뢰할 수 없는 상태 — 호출자는 닫고 다시 연다."""
@@ -124,11 +131,13 @@ class WarmSession:
     def __init__(self, *, cmd: list[str],
                  cwd: str | None = None,
                  env: dict | None = None,
-                 turn_timeout: float = 300.0):
+                 turn_timeout: float = 300.0,
+                 stream_limit: int = _DEFAULT_STREAM_LIMIT):
         self._cmd = cmd
         self._cwd = cwd
         self._env = env
         self._turn_timeout = turn_timeout
+        self._stream_limit = stream_limit
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._session_id = ""
@@ -167,6 +176,7 @@ class WarmSession:
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
+            "limit": self._stream_limit,
         }
         if self._cwd is not None:
             kwargs["cwd"] = self._cwd
@@ -280,6 +290,16 @@ class WarmSession:
                         proc.stdout.readline(), timeout=remaining)
                 except asyncio.TimeoutError:
                     raise WarmSessionError(self._timeout_msg(limit)) from None
+                except ValueError as exc:
+                    # readline() 은 한 줄이 StreamReader 한도를 넘으면
+                    # LimitOverrunError 를 ValueError 로 바꿔 던진다(#54).
+                    # 그 지점에서 스트림 위치는 복구 불가 — "닫고 다시 연다"
+                    # 계약으로 올린다.
+                    raise WarmSessionError(
+                        f"상주 세션 이벤트 한 줄이 stream_limit"
+                        f"({self._stream_limit}B) 를 넘었다 — open_warm/"
+                        f"WarmSession 의 stream_limit 을 키워 다시 연다: {exc}"
+                    ) from exc
                 if not line:
                     raise WarmSessionError(
                         "상주 세션 stdout 이 EOF — 프로세스가 죽었다. stderr: "
@@ -372,7 +392,8 @@ async def open_warm(*, lean: bool = True,
                     cwd: str | None = None,
                     env: dict | None = None,
                     binary: str | None = None,
-                    turn_timeout: float = 300.0) -> WarmSession:
+                    turn_timeout: float = 300.0,
+                    stream_limit: int = _DEFAULT_STREAM_LIMIT) -> WarmSession:
     """상주 모드로 claude 를 열고 :class:`WarmSession` 을 돌려준다.
 
     프로세스는 첫 질의에서 뜬다 — 부팅 비용은 그 턴에 붙고, 이후 질의는 턴 처리
@@ -388,6 +409,9 @@ async def open_warm(*, lean: bool = True,
             서비스 몫이다(라이브러리는 남의 프로세스를 건드리지 않는다).
         turn_timeout: 턴당 상한. 상주 모드는 stdin 을 열어두는 유일한 경로라
             issue #4 류 무한 대기의 상한이 필요하다.
+        stream_limit: stdout 이벤트 한 줄의 최대 바이트(기본 8MiB). 이벤트는
+            한 줄에 하나고 assistant 이벤트는 응답 전문을 담으므로, 이 값이
+            응답 길이의 실질 상한이다(issue #54). 넘으면 WarmSessionError.
 
     Raises:
         WarmSessionError: claude CLI 를 찾지 못하면.
@@ -399,4 +423,5 @@ async def open_warm(*, lean: bool = True,
         binary=resolved, lean=lean, permission_mode=permission_mode,
         model=model, append_system_prompt=append_system_prompt,
         resume_session_id=resume_session_id)
-    return WarmSession(cmd=cmd, cwd=cwd, env=env, turn_timeout=turn_timeout)
+    return WarmSession(cmd=cmd, cwd=cwd, env=env, turn_timeout=turn_timeout,
+                       stream_limit=stream_limit)
