@@ -223,7 +223,7 @@ def test_materialize_skills_overwrites_existing_dst(tmpdir_path):
     result = p.materialize(target_cwd)
 
     dst = target_cwd / ".agents" / "skills" / "my-skill"
-    assert (dst / "SKILL.md").read_text() == "새 버전"
+    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "새 버전"
     # 잔여 파일은 rmtree 로 제거되어야 한다
     assert not (dst / "OLD.md").exists()
     assert len(result["skills_copied"]) == 1
@@ -330,7 +330,7 @@ def test_chat_async_materializes_when_cwd_present(tmpdir_path):
 
     assert resp.content == "ok"
     assert (tmpdir_path / "AGENTS.md").exists()
-    assert "강세 지시" in (tmpdir_path / "AGENTS.md").read_text()
+    assert "강세 지시" in (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
 
 
 # ===== chat_stream (line 315-322) =====
@@ -436,7 +436,7 @@ def test_chat_stream_materializes(tmpdir_path):
 
     asyncio.run(drain())
     assert (tmpdir_path / "AGENTS.md").exists()
-    assert "자재화 지시" in (tmpdir_path / "AGENTS.md").read_text()
+    assert "자재화 지시" in (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
 
 
 # ===== AgentRegistry: register/get/list/contains (line 362) =====
@@ -530,7 +530,7 @@ def test_materialize_all_writes_each_profile(tmpdir_path):
 
     assert len(results) == 2
     # 같은 cwd 라 AGENTS.md 는 마지막(이름순 정렬) 프로필 'b' 로 덮인다
-    assert "B 지시" in (target / "AGENTS.md").read_text()
+    assert "B 지시" in (target / "AGENTS.md").read_text(encoding="utf-8")
     names_in_results = {r["name"] for r in results}
     assert names_in_results == {"a", "b"}
 

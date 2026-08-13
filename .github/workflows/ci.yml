@@ -2,7 +2,8 @@ name: CI
 
 # Promotes the local `release-check` gate (pytest → build → twine check) to CI.
 # Proves the multi-version / multi-OS support claimed in README.md and
-# pyproject.toml classifiers (Python 3.11–3.14 on macOS + Linux).
+# pyproject.toml classifiers (Python 3.11–3.14 on macOS + Linux + Windows — every regression
+# in this library's history was Windows-specific: #4/#27/#30/#44/#54).
 
 on:
   push:
@@ -27,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4

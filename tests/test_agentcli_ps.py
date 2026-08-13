@@ -5,7 +5,15 @@
 테스트하지 않는다.
 """
 import importlib.util
+import os
 import pathlib
+
+import pytest
+
+# 스크립트 자체가 POSIX 전용이다 (stdlib + `ps`) — Windows 에서는 main() 이
+# ps 부재/차이로 다른 경로를 타므로 전체 스킵 (#65).
+pytestmark = pytest.mark.skipif(os.name != "posix",
+                                reason="agentcli_ps 는 POSIX ps 전용")
 
 _SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "agentcli_ps.py"
 _spec = importlib.util.spec_from_file_location("agentcli_ps", _SCRIPT)
@@ -114,7 +122,8 @@ def test_main_older_than_filters_out_young(monkeypatch, capsys):
 
 def test_main_kill_sends_sigkill(monkeypatch, capsys):
     calls = []
-    monkeypatch.setattr(ps.os, "killpg", lambda pg, sig: calls.append((pg, sig)))
+    monkeypatch.setattr(ps.os, "killpg", lambda pg, sig: calls.append((pg, sig)),
+                        raising=False)
     rc = ps.main(["--kill", "123"])
     assert rc == 0
     assert calls and calls[0][0] == 123
@@ -123,7 +132,7 @@ def test_main_kill_sends_sigkill(monkeypatch, capsys):
 def test_main_kill_missing_group_returns_1(monkeypatch, capsys):
     def boom(pg, sig):
         raise ProcessLookupError
-    monkeypatch.setattr(ps.os, "killpg", boom)
+    monkeypatch.setattr(ps.os, "killpg", boom, raising=False)
     rc = ps.main(["--kill", "999"])
     assert rc == 1
 

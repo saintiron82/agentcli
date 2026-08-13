@@ -91,16 +91,8 @@ _FAKE_ACP_SCRIPT = textwrap.dedent(
 def fake_kiro_bin(tmp_path):
     """Write an executable fake kiro-cli that ignores the `acp` argv and
     speaks the minimal ACP handshake on stdio. Returns its path."""
-    script = tmp_path / "fake_acp.py"
-    script.write_text(_FAKE_ACP_SCRIPT, encoding="utf-8")
-    launcher = tmp_path / "kiro-cli"
-    launcher.write_text(
-        "#!/bin/sh\nexec {py} {script} \"$@\"\n".format(
-            py=sys.executable, script=str(script)),
-        encoding="utf-8",
-    )
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return str(launcher)
+    from tests._stream_helpers import write_fake_cli_launcher
+    return write_fake_cli_launcher(tmp_path, _FAKE_ACP_SCRIPT, name="kiro-cli")
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +136,8 @@ async def test_subprocess_reader_breaks_on_clean_eof(tmp_path):
     subprocess closes stdout cleanly. We use a fake binary that answers
     `initialize` and then exits, closing its stdout, and await the reader
     task directly to confirm it terminates on EOF rather than being cancelled."""
-    script = tmp_path / "eof_acp.py"
-    script.write_text(textwrap.dedent('''
+    from tests._stream_helpers import write_fake_cli_launcher
+    launcher = write_fake_cli_launcher(tmp_path, textwrap.dedent('''
         import json, sys
         line = sys.stdin.readline()
         msg = json.loads(line)
@@ -155,12 +147,7 @@ async def test_subprocess_reader_breaks_on_clean_eof(tmp_path):
                        "authMethods": []}}) + "\\n")
         sys.stdout.flush()
         # Exit immediately -> stdout closes -> reader sees EOF.
-    '''), encoding="utf-8")
-    launcher = tmp_path / "kiro-cli"
-    launcher.write_text(
-        "#!/bin/sh\nexec {py} {s} \"$@\"\n".format(py=sys.executable, s=str(script)),
-        encoding="utf-8")
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    '''), name="kiro-cli")
 
     p = KiroProvider()
     with patch.object(KiroProvider, "_find_binary", return_value=str(launcher)):

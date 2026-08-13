@@ -110,8 +110,8 @@ def test_materialize_writes_agents_and_claude(tmpdir_path):
 
     assert (tmpdir_path / "AGENTS.md").exists()
     assert (tmpdir_path / "CLAUDE.md").exists()
-    assert MANAGED_MARKER in (tmpdir_path / "AGENTS.md").read_text()
-    assert "강세" in (tmpdir_path / "AGENTS.md").read_text()
+    assert MANAGED_MARKER in (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "강세" in (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
     assert result["hash"] == p.hash()
 
 
@@ -124,10 +124,10 @@ def test_materialize_does_not_overwrite_user_file(tmpdir_path):
     result = p.materialize(tmpdir_path)
 
     # AGENTS.md는 사용자 내용 유지
-    assert (tmpdir_path / "AGENTS.md").read_text() == user_content
+    assert (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8") == user_content
     # AGENTS.override.md에 프로필 내용 기록
     assert (tmpdir_path / "AGENTS.override.md").exists()
-    assert "프로필 지시문" in (tmpdir_path / "AGENTS.override.md").read_text()
+    assert "프로필 지시문" in (tmpdir_path / "AGENTS.override.md").read_text(encoding="utf-8")
     assert any(str(tmpdir_path / "AGENTS.md") in s for s in result["skipped"])
 
 
@@ -135,12 +135,12 @@ def test_materialize_re_overwrites_marker_file(tmpdir_path):
     """마커가 있는 기존 파일은 덮어쓸 수 있다 (같은 라이브러리가 만든 것)."""
     p1 = AgentProfile(name="x", instructions="첫 버전")
     p1.materialize(tmpdir_path)
-    v1 = (tmpdir_path / "AGENTS.md").read_text()
+    v1 = (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "첫 버전" in v1
 
     p2 = AgentProfile(name="x", instructions="두 번째 버전")
     p2.materialize(tmpdir_path)
-    v2 = (tmpdir_path / "AGENTS.md").read_text()
+    v2 = (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
     assert "두 번째 버전" in v2
     assert "첫 버전" not in v2
 
@@ -173,7 +173,7 @@ def test_materialize_copies_skills(tmpdir_path):
 
     dst_skill = target_cwd / ".agents" / "skills" / "my-skill" / "SKILL.md"
     assert dst_skill.exists()
-    assert dst_skill.read_text() == "스킬 내용"
+    assert dst_skill.read_text(encoding="utf-8") == "스킬 내용"
     assert len(result["skills_copied"]) == 1
 
 
@@ -253,7 +253,7 @@ def test_profile_materialize_before_call(tmpdir_path):
                  cwd=tmpdir_path, materialize=True)
 
     assert (tmpdir_path / "AGENTS.md").exists()
-    assert "강세 지시" in (tmpdir_path / "AGENTS.md").read_text()
+    assert "강세 지시" in (tmpdir_path / "AGENTS.md").read_text(encoding="utf-8")
 
 
 # ===== 드리프트 옵저버 =====
