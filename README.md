@@ -695,6 +695,19 @@ without an A/B on your own task** (one real case here: sonnet refused
 security-related articles that opus processed, so the 11% speed cost of
 opus was the right trade). Remember effort is part of the cache key.
 
+Evidence anchors for that A/B (researched 2026-08): hard-disabling
+thinking (`MAX_THINKING_TOKENS=0`) costs a reproducible **10–15pp of
+accuracy** across independent benchmarks — reserve it for pure
+classification/extraction on models without effort control, if anywhere.
+Official effort anchors: **Sonnet 5 at `medium` ≈ Sonnet 4.6 at `high`**,
+and Opus 4.5 at `medium` matched Sonnet 4.5's best SWE-bench score while
+emitting 76% fewer output tokens — so `medium` is the best-grounded
+stepdown, but Anthropic's own guidance is to lower effort **only after
+your own eval confirms quality holds**. `low` is documented as "some
+capability reduction" and recommended for non-coding chat only. Effort is
+a behavioral signal, not a hard cap — the model still thinks on genuinely
+hard problems even at lower levels.
+
 **5. Concurrency.** Rate limits are pooled per account, not per session.
 Community reports (anecdotal, not systematic): bursts beyond ~3–4
 simultaneous spawns hit 429 (`Server is temporarily limiting requests`)
