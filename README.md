@@ -636,6 +636,11 @@ every tier (verified live).
 
 ### Performance guide (claude)
 
+Just want the answer for your situation? The
+[cookbook](docs/cookbook.md) has copy-paste recipes per case (bulk
+batches, embedding, caching, Windows, parallelism, upgrades). This section
+explains the mechanics behind them.
+
 Where the time goes on a `claude -p` call, and which lever cuts which part.
 All numbers measured on Claude Code 2.1.229 / macOS unless noted.
 
