@@ -49,6 +49,18 @@
   change unless opted in.
 
 ### Fixed
+- **Warm sessions no longer die on long responses (issue #54).**
+  `WarmSession` spawned its process without a `limit=`, so the stdout
+  `StreamReader` kept asyncio's default 64KiB line cap — and the warm
+  protocol is one event per line, with the `assistant` event carrying the
+  full response text. Any single event over 64KiB blew up `readline()` with
+  `ValueError: Separator is found, but chunk is longer than limit`,
+  regardless of how small the request was (matches the issue's correction:
+  fewer rows per call didn't help). The pipe limit is now 8MiB by default
+  and tunable via `open_warm(stream_limit=...)` /
+  `WarmSession(stream_limit=...)`; genuinely oversized events now raise
+  `WarmSessionError` (the documented close-and-reopen contract) instead of
+  a bare `ValueError` from asyncio internals.
 - **`stream_async` now also routes large prompts through stdin (issue #44).**
   `invoke`/`invoke_async` got the issue #30 stdin fix, but `stream_async` uses
   a separate spawn path (`LLMProvider._run_stream_template`) that still put
