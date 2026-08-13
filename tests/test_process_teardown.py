@@ -21,7 +21,8 @@ def test_kill_process_group_posix_uses_killpg(monkeypatch):
     """POSIX: proc.pid 를 PGID 로 killpg, 성공 시 proc.kill 안 부른다."""
     monkeypatch.setattr(base, "_POSIX", True)
     calls = []
-    monkeypatch.setattr(base.os, "killpg", lambda pg, sig: calls.append((pg, sig)))
+    monkeypatch.setattr(base.os, "killpg", lambda pg, sig: calls.append((pg, sig)),
+                        raising=False)
     proc = MagicMock(); proc.pid = 4321
     base._kill_process_group(proc)
     assert calls == [(4321, signal.SIGKILL)]
@@ -32,7 +33,7 @@ def test_kill_process_group_windows_falls_back_to_direct_kill(monkeypatch):
     """비-POSIX: killpg 호출 안 하고 직속 proc.kill 만."""
     monkeypatch.setattr(base, "_POSIX", False)
     killpg = MagicMock()
-    monkeypatch.setattr(base.os, "killpg", killpg)
+    monkeypatch.setattr(base.os, "killpg", killpg, raising=False)
     proc = MagicMock(); proc.pid = 123
     base._kill_process_group(proc)
     killpg.assert_not_called()
@@ -46,7 +47,7 @@ def test_kill_process_group_lookup_error_falls_back(monkeypatch):
     def boom(pg, sig):
         raise ProcessLookupError
 
-    monkeypatch.setattr(base.os, "killpg", boom)
+    monkeypatch.setattr(base.os, "killpg", boom, raising=False)
     proc = MagicMock(); proc.pid = 9
     base._kill_process_group(proc)  # raise 없어야 함
     proc.kill.assert_called_once()
@@ -55,7 +56,9 @@ def test_kill_process_group_lookup_error_falls_back(monkeypatch):
 def test_kill_process_group_no_pid_is_safe(monkeypatch):
     """pid 없는(proc 미생성) 경우에도 죽지 않는다."""
     monkeypatch.setattr(base, "_POSIX", True)
-    monkeypatch.setattr(base.os, "killpg", MagicMock(side_effect=AssertionError("불러선 안 됨")))
+    monkeypatch.setattr(base.os, "killpg",
+                        MagicMock(side_effect=AssertionError("불러선 안 됨")),
+                        raising=False)
     proc = MagicMock(); proc.pid = None
     base._kill_process_group(proc)
     proc.kill.assert_called_once()
