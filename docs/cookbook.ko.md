@@ -22,6 +22,7 @@
 | [10. 품질이 떨어졌을 때](#10-품질이-떨어졌을-때) | effort 내리지 말고 원인부터 |
 | [11. 토큰 요금이 궁금할 때](#11-토큰-요금이-궁금할-때) | `resp.tokens` 를 본다 |
 | [12. 구버전에서 업그레이드](#12-구버전에서-업그레이드) | 브레이킹 1개 확인 |
+| [13. 여러 에이전트를 조율하는 코디네이터](#13-여러-에이전트를-조율하는-코디네이터) | 호스트 코드가 루프, 에이전트는 워커 |
 
 ---
 
@@ -200,3 +201,39 @@ pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.
 - `lean=True` / `isolated=True` 를 쓰던 코드: 그대로 동작한다(티어 별칭).
 - v0.6.x에서 온다면: warm 세션(0.7.1), 캐시 토큰 가시성(0.7.2), 부팅 1초
   단축(0.7.3)이 덤으로 따라온다.
+
+## 13. 여러 에이전트를 조율하는 코디네이터
+
+큰 작업을 쪼개 여러 에이전트에 뿌리고 회수·판정·재시도까지 하고 싶을 때의
+설계 패턴. 멀티에이전트 제품들이 쓰는 어휘(Orca 의 orchestration, 2026-08
+조사)를 빌리면 네 가지 부품이다 — **dispatch**(작업 분배), **worker
+done**(완료 신호), **decision gate**(결과 판정), **coordinator
+loop**(될 때까지 반복). agentcli 세계에서는 이 네 부품을 전부 **호스트
+코드가 결정적으로** 수행하고, 에이전트는 워커 역할만 한다:
+
+```python
+def coordinator_loop(items, max_rounds=3):
+    스펙 = 로드()
+    for round in range(max_rounds):
+        # dispatch — 병렬 워커 (동시 3~4개, 9번 케이스 참고)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(
+                lambda it: client.chat(it.payload, provider="claude",
+                                       system_prompt=스펙, new_session=True),
+                items))
+        # worker done + decision gate — 판정은 코드가 한다 (파싱/스키마 검증)
+        failed = [it for it, r in zip(items, results) if not 판정(r)]
+        if not failed:
+            return "완료"
+        items = failed                      # coordinator loop — 실패분만 재투입
+    return f"미해결 {len(items)}건"
+```
+
+- **판정(gate)을 모델에게 맡기지 않는 것**이 요점이다: 스키마 검증·필수
+  필드 확인은 코드가 하면 결정적이고 공짜다. 모델 판정이 정말 필요한
+  경우(품질 평가 등)에만 판정용 호출을 별도로 둔다.
+- 코디네이터를 claude 로 두는 변형(모델이 다음 dispatch 를 결정)도
+  가능하지만, 비용·비결정성이 붙는다 — 분기 규칙을 코드로 적을 수 있으면
+  코드가 낫다.
+- 워커 간 컨텍스트 공유가 필요하면 `ContextSession.fork_many` 가 같은
+  구도의 기성품이다(핀 1회 + 병렬 fork, 순서 보존, 실패 시 형제 취소).
