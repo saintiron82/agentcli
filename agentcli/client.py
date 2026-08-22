@@ -157,6 +157,47 @@ def _validate_reasoning_levels(effort, thinking):
                 f"unknown level {val!r}; valid: {', '.join(scale)}")
 
 
+def _augment_system_prompt_with_schema(system_prompt: str,
+                                       output_schema: dict) -> str:
+    """output_schema 를 모델에게 선언하는 표준 블록을 system 에 덧붙인다 (#72).
+
+    스키마 선언 없이 검증만 하면 재시도율이 불필요하게 오른다. system 경로로
+    가야 claude 에서 캐시 가능한 안정 프리픽스에 앉는다(#51).
+    """
+    import json as _json
+    block = ("반드시 아래 JSON Schema 를 만족하는 JSON 만 출력한다. "
+             "마크다운 펜스와 설명 문장을 붙이지 않는다.\n"
+             "=== OUTPUT JSON SCHEMA ===\n"
+             + _json.dumps(output_schema, ensure_ascii=False))
+    return f"{system_prompt}\n\n{block}" if system_prompt else block
+
+
+def _accumulate_tokens(total: TokenUsage, add: TokenUsage) -> None:
+    """스키마 재시도 전 호출의 usage 를 합산 — 시도 횟수만큼 쓴 토큰이 전부
+    기록되어야 usage 회계가 참이다 (#72)."""
+    for f in ("prompt_tokens", "completion_tokens", "total_tokens",
+              "cached_tokens", "cache_creation_tokens"):
+        setattr(total, f, getattr(total, f, 0) + getattr(add, f, 0))
+
+
+def _schema_correction_messages(messages: list[Message], raw: str,
+                                errs: list[str]) -> list[Message]:
+    """교정 재시도 메시지 — 이전 출력(절두)과 위반 목록을 되먹인다 (#72).
+
+    컨텍스트 블록 방식이라 세션/무세션(new_session) 어느 모드에서든 동일하게
+    동작한다. 세션 모드에서는 CLI 히스토리와 일부 중복되지만, 예측 가능성이
+    모드별 분기보다 낫다.
+    """
+    return messages + [
+        Message(role="assistant", content=raw[:2000]),
+        Message(role="user", content=(
+            "직전 응답이 출력 스키마를 위반했다:\n- "
+            + "\n- ".join(errs[:10])
+            + "\n위반을 고쳐 스키마를 만족하는 JSON 만 다시 출력하라. "
+              "설명·펜스 금지.")),
+    ]
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
                        effort=None, thinking=None,
@@ -524,9 +565,17 @@ class LLMClient:
              effort: str | None = None,
              thinking: str | None = None,
              provider_options: dict | None = None,
+             output_schema: dict | None = None,
+             validator=None,
+             schema_retries: int = 1,
              ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        if output_schema is not None:
+            from .schema import assert_supported_schema
+            assert_supported_schema(output_schema)   # 재시도 비용 전에 터뜨림
+            system_prompt = _augment_system_prompt_with_schema(
+                system_prompt, output_schema)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -543,12 +592,18 @@ class LLMClient:
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session)
-            response = self._invoke_with_fallback(
-                provider, messages, fallback_messages, model,
-                wall_timeout or timeout, session_id, cwd,
-                alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback, effort=effort, thinking=thinking,
-                provider_options=provider_options)
+
+            def _dispatch(msgs: list[Message]) -> LLMResponse:
+                return self._invoke_with_fallback(
+                    provider, msgs, fallback_messages, model,
+                    wall_timeout or timeout, session_id, cwd,
+                    alias=resolved_alias,
+                    resume_by_alias=not force_new_session,
+                    allow_fallback=fallback, effort=effort,
+                    thinking=thinking, provider_options=provider_options)
+
+            response = self._run_with_output_schema(
+                _dispatch, messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -561,6 +616,96 @@ class LLMClient:
                                   resolved_alias, alias_to_set,
                                   system_prompt_hash)
             return response
+
+    @staticmethod
+    def _check_output_schema(resp: LLMResponse, output_schema, validator):
+        """응답 1건을 파싱·검증 — ``(parsed, 위반목록)``. 통과면 위반이 빈 리스트."""
+        from .schema import parse_json_output, validate as _validate
+        obj, perr = parse_json_output(resp.content)
+        if perr:
+            return None, [perr]
+        errs: list[str] = []
+        if output_schema is not None:
+            errs = _validate(obj, output_schema)
+        if not errs and validator is not None:
+            try:
+                if validator(obj) is False:
+                    errs = ["validator 가 False 를 반환"]
+            except Exception as exc:  # noqa: BLE001 — 위반 사유로 수집
+                errs = [f"validator 예외: {type(exc).__name__}: {exc}"]
+        return obj, errs
+
+    @staticmethod
+    def _finalize_schema_failure(resp: LLMResponse, attempts: int,
+                                 raw: str, errs: list[str],
+                                 total: TokenUsage) -> LLMResponse:
+        resp.raw_content = raw           # 관측용 원문 보존
+        resp.content = ""                # 실패 계약: 저장 원자성 유지
+        resp.parsed = None
+        resp.error = (f"출력 스키마 위반 ({attempts}회 시도): "
+                      + "; ".join(errs[:5]))[:500]
+        resp.error_type = "schema"
+        resp.tokens = total
+        return resp
+
+    def _run_with_output_schema(self, dispatch, messages,
+                                output_schema, validator,
+                                schema_retries: int) -> LLMResponse:
+        """출력 계약 루프 (#72): 호출 → 파싱·검증 → 실패 시 교정 재시도.
+
+        스키마 미사용 호출은 dispatch 1회로 기존 경로와 동일하다(무비용).
+        전송 실패(content 없음)는 스키마 실패로 둔갑시키지 않고 그대로
+        돌려준다 — error_type 이 회복 전략을 결정하기 때문이다.
+        """
+        if output_schema is None and validator is None:
+            return dispatch(messages)
+        total = TokenUsage()
+        attempt_msgs = messages
+        raw, errs, resp = "", [], None
+        attempts = schema_retries + 1
+        for attempt in range(attempts):
+            resp = dispatch(attempt_msgs)
+            _accumulate_tokens(total, resp.tokens)
+            if not resp.content:
+                resp.tokens = total
+                return resp
+            raw = resp.content
+            obj, errs = self._check_output_schema(resp, output_schema,
+                                                  validator)
+            if not errs:
+                resp.parsed = obj
+                resp.tokens = total
+                return resp
+            if attempt < schema_retries:
+                attempt_msgs = _schema_correction_messages(messages, raw, errs)
+        return self._finalize_schema_failure(resp, attempts, raw, errs, total)
+
+    async def _arun_with_output_schema(self, dispatch, messages,
+                                       output_schema, validator,
+                                       schema_retries: int) -> LLMResponse:
+        """``_run_with_output_schema`` 의 async 쌍둥이 — dispatch 만 await."""
+        if output_schema is None and validator is None:
+            return await dispatch(messages)
+        total = TokenUsage()
+        attempt_msgs = messages
+        raw, errs, resp = "", [], None
+        attempts = schema_retries + 1
+        for attempt in range(attempts):
+            resp = await dispatch(attempt_msgs)
+            _accumulate_tokens(total, resp.tokens)
+            if not resp.content:
+                resp.tokens = total
+                return resp
+            raw = resp.content
+            obj, errs = self._check_output_schema(resp, output_schema,
+                                                  validator)
+            if not errs:
+                resp.parsed = obj
+                resp.tokens = total
+                return resp
+            if attempt < schema_retries:
+                attempt_msgs = _schema_correction_messages(messages, raw, errs)
+        return self._finalize_schema_failure(resp, attempts, raw, errs, total)
 
     def _invoke_with_fallback(self, provider_id: str,
                               messages: list[Message],
@@ -660,9 +805,17 @@ class LLMClient:
                          effort: str | None = None,
                          thinking: str | None = None,
                          provider_options: dict | None = None,
+                         output_schema: dict | None = None,
+                         validator=None,
+                         schema_retries: int = 1,
                          ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        if output_schema is not None:
+            from .schema import assert_supported_schema
+            assert_supported_schema(output_schema)
+            system_prompt = _augment_system_prompt_with_schema(
+                system_prompt, output_schema)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model,
@@ -679,12 +832,17 @@ class LLMClient:
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session)
-            response = await self._invoke_async_with_fallback(
-                provider, messages, fallback_messages, model,
-                wall_timeout or timeout, session_id, cwd,
-                alias=resolved_alias, resume_by_alias=not force_new_session,
-                allow_fallback=fallback, effort=effort, thinking=thinking,
-                provider_options=provider_options)
+            async def _dispatch(msgs: list[Message]) -> LLMResponse:
+                return await self._invoke_async_with_fallback(
+                    provider, msgs, fallback_messages, model,
+                    wall_timeout or timeout, session_id, cwd,
+                    alias=resolved_alias,
+                    resume_by_alias=not force_new_session,
+                    allow_fallback=fallback, effort=effort,
+                    thinking=thinking, provider_options=provider_options)
+
+            response = await self._arun_with_output_schema(
+                _dispatch, messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -769,25 +927,46 @@ class LLMClient:
 
     # ---------- 스트리밍 chat ----------
 
-    async def chat_stream(self, prompt: str, *,
-                          provider: str = "", model: str = "",
-                          conversation_id: str = "", owner: str = "",
-                          alias: str = "",
-                          system_prompt: str = "", context_turns: int = 3,
-                          timeout: int = 120,
-                          agent: str = "",
-                          cwd: str | None = None,
-                          inject_context: list[dict] | None = None,
-                          strict_model: bool = False,
-                          reset_on_instruction_change: bool = False,
-                          fallback: bool = False,
-                          idle_timeout: int | None = None,
-                          wall_timeout: int | None = None,
-                          new_session: bool = False,
-                          effort: str | None = None,
-                          thinking: str | None = None,
-                          provider_options: dict | None = None,
-                          ) -> AsyncIterator[StreamChunk]:
+    def chat_stream(self, prompt: str, *,
+                    output_schema: dict | None = None,
+                    validator=None,
+                    **kwargs) -> AsyncIterator[StreamChunk]:
+        """스트리밍 진입점 — 호출 시점 검증 후 실제 제너레이터를 돌려준다.
+
+        일반 함수인 이유: async generator 는 본문이 첫 iteration 까지 실행되지
+        않아 잘못된 인자가 조용히 잠복한다. 사용법(``async for ... in
+        client.chat_stream(...)``)은 동일하다. 전체 파라미터 목록은
+        :meth:`_chat_stream_impl` 참고.
+
+        output_schema/validator (#72) 는 스트리밍에서 지원하지 않는다 —
+        검증·교정 재시도는 완결된 응답을 전제한다. chat/chat_async 를 쓴다.
+        """
+        if output_schema is not None or validator is not None:
+            raise ValueError(
+                "output_schema/validator 는 스트리밍 미지원 (#72) — "
+                "검증·교정 재시도는 완결 응답 전제. chat/chat_async 를 쓴다.")
+        return self._chat_stream_impl(prompt, **kwargs)
+
+    async def _chat_stream_impl(self, prompt: str, *,
+                                provider: str = "", model: str = "",
+                                conversation_id: str = "", owner: str = "",
+                                alias: str = "",
+                                system_prompt: str = "",
+                                context_turns: int = 3,
+                                timeout: int = 120,
+                                agent: str = "",
+                                cwd: str | None = None,
+                                inject_context: list[dict] | None = None,
+                                strict_model: bool = False,
+                                reset_on_instruction_change: bool = False,
+                                fallback: bool = False,
+                                idle_timeout: int | None = None,
+                                wall_timeout: int | None = None,
+                                new_session: bool = False,
+                                effort: str | None = None,
+                                thinking: str | None = None,
+                                provider_options: dict | None = None,
+                                ) -> AsyncIterator[StreamChunk]:
         """스트리밍 호출. 청크를 yield하면서 응답을 누적하고 완료 시 저장.
 
         yield type:

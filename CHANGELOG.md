@@ -2,6 +2,28 @@
 
 ## unreleased
 
+### Added
+- **Structured-output guarantee — `output_schema` (issue #72).** The
+  missing half of the "AI as a component" contract: input plumbing was
+  done, output shape wasn't — every consuming app hand-rolled fence
+  stripping, JSON parsing, validation, failure logging, and retries.
+  `chat`/`chat_async` gain opt-in `output_schema=` (zero-dep JSON-Schema
+  subset: `type`/`required`/`properties`/`items`/`enum` — keys outside
+  the subset are rejected loudly, no silent non-validation),
+  `validator=` (any callable, the escape hatch), and `schema_retries=`
+  (default 1). The contract: `resp.parsed` is the validated object, or
+  the call fails as `error_type="schema"` with violations in `error` and
+  the model's last raw text in the new `LLMResponse.raw_content` (while
+  `content=""` keeps the store-atomicity contract). Violations are fed
+  back verbatim for corrective retries — which ride the cached system
+  prefix (#51/#62), so their marginal cost is mostly output tokens — and
+  every attempt's usage sums into `resp.tokens`. The schema is also
+  declared to the model via a standard system-prompt block. Client-layer,
+  so all three providers share the guarantee; `chat_stream` rejects the
+  options explicitly (validation presumes a complete response; the
+  entry point became a call-time-validating wrapper for this). Verified
+  live against claude/sonnet (nested schema, `resp.parsed` populated).
+
 ### Changed
 - **Reasoning defaults now fail fast at the declaration site (issue #38).**
   `Provider(effort=..., thinking=...)` typos used to sit dormant until the

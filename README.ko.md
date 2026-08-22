@@ -558,6 +558,34 @@ agentcli 는 저장소를 스스로 고르지 않고 자기 소유가 아닌 프
 [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md).
 
 
+### 구조화 출력 (`output_schema`)
+
+기계가 소비할 JSON 을 받아야 하는 호출 — 배치 분석기, 분류기, 추출기 — 은
+모양을 선언하고 클라이언트가 보장하게 한다:
+
+```python
+resp = client.chat(payload, provider="claude",
+                   output_schema={"type": "object", "required": ["results"],
+                                  "properties": {"results": {"type": "array"}}},
+                   schema_retries=1)          # 교정 재시도 횟수 (기본 1)
+resp.parsed          # 검증을 통과한 파이썬 객체
+```
+
+계약: `resp.parsed` 가 스키마에 맞거나, **아니면** `error_type="schema"` 로
+실패한다(위반 내용은 `resp.error`, 모델의 마지막 원문은 `resp.raw_content`
+에 보존). 위반 시 위반 목록을 되먹인 교정 재시도를 한다("`$.results[0].id`:
+필수 필드 누락 — 고쳐서 JSON 만 다시") — 맹목 재시도보다 수렴이 훨씬 좋고,
+재시도는 캐시된 system 프리픽스를 타므로 한계 비용이 사실상 출력 토큰뿐이다.
+모든 시도의 토큰은 `resp.tokens` 에 합산된다.
+
+의도적으로 zero-dep 이다: 내장 검증기는 JSON Schema 부분집합 `type` /
+`required` / `properties` / `items` / `enum` 을 지원하며, 부분집합 밖 키는
+호출 시점에 시끄럽게 거부한다(조용한 미검증 방지). 더 넓은 검증은
+`validator=` (임의 callable — `False` 반환 또는 raise 로 거부)가 탈출구다.
+스키마는 표준 system 프롬프트 블록으로 모델에게도 선언된다. client 계층
+구현이라 세 provider 가 같은 보장을 받는다. 스트리밍은 `output_schema` 를
+명시적으로 거부한다 — 검증은 완결 응답을 전제한다.
+
 ### Reasoning 제어
 
 호출마다, 또는 provider 기본값으로 지정할 수 있는 두 개의 독립된 정규화 제어:

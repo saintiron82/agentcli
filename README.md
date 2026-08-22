@@ -448,6 +448,37 @@ open several for parallelism. See
 [docs/releases/v0.7.1.md](docs/releases/v0.7.1.md).
 
 
+### Structured output (`output_schema`)
+
+For calls that must return machine-consumable JSON — batch analyzers,
+classifiers, extractors — declare the shape and let the client enforce it:
+
+```python
+resp = client.chat(payload, provider="claude",
+                   output_schema={"type": "object", "required": ["results"],
+                                  "properties": {"results": {"type": "array"}}},
+                   schema_retries=1)          # corrective retries (default 1)
+resp.parsed          # the validated Python object
+```
+
+The contract: `resp.parsed` matches the schema, **or** the call fails with
+`error_type="schema"` (violations in `resp.error`, the model's last raw
+text preserved in `resp.raw_content`). On a violation the client retries
+with the violations fed back ("`$.results[0].id`: required field missing —
+fix and return JSON only"), which converges far better than blind
+re-asking; retries ride the cached system prefix, so their marginal cost
+is mostly output tokens. Every attempt's tokens are summed into
+`resp.tokens`.
+
+Zero-dependency by design: the built-in validator covers the JSON-Schema
+subset `type` / `required` / `properties` / `items` / `enum` — keys outside
+the subset are rejected loudly at call time (no silent non-validation).
+For anything richer, pass `validator=` (any callable: return `False` or
+raise to reject). The schema is also declared to the model via a standard
+system-prompt block. Client-level, so all three providers get the same
+guarantee. Streaming calls reject `output_schema` explicitly — validation
+presumes a complete response.
+
 ### Reasoning controls
 
 Two independent, normalized controls, per call or as provider defaults:

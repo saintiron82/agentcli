@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +55,13 @@ class LLMResponse:
     error_type: str = ""
     exit_code: int | None = None
     recoverable: bool = False
+    # 출력 스키마 보장 (#72): output_schema/validator 통과 시 파싱된 파이썬
+    # 객체. 스키마 미사용 호출에서는 항상 None.
+    parsed: Any = None
+    # 스키마 최종 실패(error_type="schema") 시 마지막 모델 원문 — content 는
+    # 저장 원자성 계약("실패 호출은 content 비움")을 지키느라 비우므로,
+    # 관측/디버깅용 원문은 여기 보존된다.
+    raw_content: str = ""
     suggested_action: str = ""
     # 정규화 reasoning 제어(effort/thinking)의 요청/적용 결과. 둘 다 미사용이면 None.
     reasoning: "ReasoningResolution | None" = None
