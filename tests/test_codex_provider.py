@@ -209,7 +209,10 @@ def test_invoke_stale_recovery_preserves_options(mock_env, mock_run, mock_find):
     cmd2 = mock_run.call_args_list[1][0][0]
     assert "resume" not in cmd2
     assert "-s" in cmd2 and "workspace-write" in cmd2
-    assert "-a" in cmd2 and "never" in cmd2
+    # #74: -a 는 codex-cli 0.139+ exec 에서 제거됨 — config 오버라이드로 간다.
+    assert "-a" not in cmd2
+    assert any(a.startswith("approval_policy=") and "never" in a
+               for a in cmd2)
 
 
 def test_is_codex_stale_case_insensitive():

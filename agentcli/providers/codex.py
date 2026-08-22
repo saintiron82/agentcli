@@ -160,7 +160,10 @@ class CodexProvider(LLMProvider):
             sandbox_mode: `read-only` | `workspace-write` | `danger-full-access`.
                 **WARNING**: 기본값은 전체 권한. 임베딩 시 `workspace-write` 권장.
                 재개(resume) 시에는 원 세션 설정이 유지되어 이 옵션은 무시된다.
-            approval_policy: `-a` 옵션. None이면 생략. resume 시 무시.
+            approval_policy: 승인 정책 — `-c approval_policy=<값>` config
+                오버라이드로 전달 (#74: 구버전 `-a` 는 codex-cli 0.139+ exec
+                에서 제거되어 usage 에러로 전 호출이 죽는다). None이면 생략.
+                resume 시 무시.
             full_auto: `--full-auto` 플래그 사용 여부 (both exec & resume).
             skip_git_repo_check: `--skip-git-repo-check` — git 리포 외부에서도 실행 허용.
             effort: 정규화 reasoning effort 기본값 (``minimal``~``max``). 호출
@@ -315,7 +318,10 @@ class CodexProvider(LLMProvider):
         if sbox:
             cmd += ["-s", sbox]
         if apol:
-            cmd += ["-a", apol]
+            # codex-cli 0.139.0 의 `exec` 는 구버전 `-a` 를 더 이상 받지 않는다
+            # ("error: unexpected argument '-a' found" — #74 실증). reasoning/
+            # MCP 주입과 같은 config 오버라이드 경로로 보낸다.
+            cmd += ["-c", f"approval_policy={_toml_inline(apol)}"]
         if cwd:
             cmd += ["-C", cwd]
         if model:

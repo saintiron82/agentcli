@@ -2,6 +2,16 @@
 
 ## unreleased
 
+### Fixed
+- **codex `approval_policy` no longer kills every call on modern CLIs
+  (issue #74).** agentcli still emitted the legacy `-a` flag, which
+  codex-cli 0.139.0's `exec` rejects outright (`error: unexpected argument
+  '-a' found`) — a dormant trap since the constructor accepts the option
+  silently; ZND dodged it by never passing `approval_policy` (documented
+  in its client comments). The value now rides the same config-override
+  path reasoning and MCP injection already use:
+  `-c approval_policy="<value>"` (accepted on 0.139.0, verified live).
+
 ### Added
 - **Structured-output guarantee — `output_schema` (issue #72).** The
   missing half of the "AI as a component" contract: input plumbing was
