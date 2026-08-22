@@ -3,6 +3,16 @@
 ## unreleased
 
 ### Fixed
+- **codex works again on codex-cli 0.149+ — `--full-auto` demoted to a
+  no-op (issue #76).** 0.149 removed the flag outright (0.139 only warned
+  deprecated), and with `full_auto=True` as the constructor default —
+  which `create_default_registry` locks in — every `provider="codex"`
+  call died with `unexpected argument '--full-auto'`. The flag was
+  redundant all along: the sandbox always rides `-s` (default
+  `danger-full-access`) and approval rides `-c approval_policy=` (#74).
+  The `full_auto` parameter is kept for backward compatibility but is
+  never emitted on any path. Same flag-churn class as #74; reported from
+  a consuming project's real-world failure with the exact cause analysis.
 - **codex `approval_policy` no longer kills every call on modern CLIs
   (issue #74).** agentcli still emitted the legacy `-a` flag, which
   codex-cli 0.139.0's `exec` rejects outright (`error: unexpected argument

@@ -164,7 +164,11 @@ class CodexProvider(LLMProvider):
                 오버라이드로 전달 (#74: 구버전 `-a` 는 codex-cli 0.139+ exec
                 에서 제거되어 usage 에러로 전 호출이 죽는다). None이면 생략.
                 resume 시 무시.
-            full_auto: `--full-auto` 플래그 사용 여부 (both exec & resume).
+            full_auto: **deprecated no-op** (#76). codex-cli 0.149 가
+                `--full-auto` 를 제거해(0.139 은 경고만) 방출하면 전 호출이
+                usage 에러로 죽는다. 의미는 원래부터 잉여였다 — sandbox 는
+                항상 `-s` 로 나가고 승인은 `-c approval_policy=`(#74) 가
+                담당한다. 하위호환으로 인자만 받고 어디에도 방출하지 않는다.
             skip_git_repo_check: `--skip-git-repo-check` — git 리포 외부에서도 실행 허용.
             effort: 정규화 reasoning effort 기본값 (``minimal``~``max``). 호출
                 시 override 가능. None 이면 config override 를 붙이지 않는다
@@ -296,8 +300,6 @@ class CodexProvider(LLMProvider):
         cmd = [bin_path, "exec"]
         if session_id:
             cmd += ["resume", "--json"]
-            if self._full_auto:
-                cmd.append("--full-auto")
             if self._skip_git:
                 cmd.append("--skip-git-repo-check")
             if model:
@@ -311,8 +313,6 @@ class CodexProvider(LLMProvider):
             return cmd
         # 신규 세션
         cmd.append("--json")
-        if self._full_auto:
-            cmd.append("--full-auto")
         if self._skip_git:
             cmd.append("--skip-git-repo-check")
         if sbox:

@@ -56,6 +56,7 @@ def create_default_registry() -> ProviderRegistry:
     reg.register(CodexProvider())
     reg.register(CopilotProvider())
     reg.register(KiroProvider())
-    # 세션 지원 provider 우선. Codex --full-auto 는 가장 비싸 후순위.
+    # 세션 지원 provider 우선. Codex 는 권한 기본값(danger-full-access
+    # sandbox)이 가장 넓어 후순위. (--full-auto 는 #76 에서 no-op 화됨.)
     reg.set_fallback_order(["claude", "copilot", "codex", "kiro"])
     return reg
