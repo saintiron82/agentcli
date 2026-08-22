@@ -23,6 +23,7 @@ All recipes assume v0.7.3+.
 | [10. Quality dropped](#10-quality-dropped) | don't lower effort — find the cause |
 | [11. Wondering about token cost](#11-wondering-about-token-cost) | read `resp.tokens` |
 | [12. Upgrading from an old version](#12-upgrading-from-an-old-version) | one breaking change to check |
+| [13. A coordinator over multiple agents](#13-a-coordinator-over-multiple-agents) | host code loops, agents are workers |
 
 ---
 
@@ -216,3 +217,41 @@ longer inherits the host environment by default. After upgrading —
 - Code using `lean=True` / `isolated=True`: keeps working (tier aliases).
 - Coming from v0.6.x: warm sessions (0.7.1), cache-token visibility
   (0.7.2), and the 1s boot cut (0.7.3) come along for free.
+
+## 13. A coordinator over multiple agents
+
+The design pattern for splitting big work across agents with collection,
+judging, and retries. Borrowing the vocabulary multi-agent products use
+(Orca's orchestration, surveyed 2026-08), there are four parts —
+**dispatch**, **worker done**, **decision gate**, and the **coordinator
+loop**. In the agentcli world, all four belong to **deterministic host
+code**; agents are workers only:
+
+```python
+def coordinator_loop(items, max_rounds=3):
+    spec = load_spec()
+    for round in range(max_rounds):
+        # dispatch — parallel workers (3–4 concurrent, see recipe 9)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(
+                lambda it: client.chat(it.payload, provider="claude",
+                                       system_prompt=spec, new_session=True),
+                items))
+        # worker done + decision gate — judged by CODE (parse/schema checks)
+        failed = [it for it, r in zip(items, results) if not accept(r)]
+        if not failed:
+            return "done"
+        items = failed                      # coordinator loop — retry failures only
+    return f"unresolved: {len(items)}"
+```
+
+- The point is **not delegating the gate to a model**: schema validation
+  and required-field checks are deterministic and free in code. Add a
+  separate judging call only where model judgment is genuinely needed
+  (quality evaluation etc.).
+- A claude-as-coordinator variant (the model decides the next dispatch)
+  works too, but adds cost and nondeterminism — if the branching rule can
+  be written as code, code wins.
+- If workers need shared context, `ContextSession.fork_many` is the
+  ready-made version of this shape (pin once + parallel forks, ordered
+  results, sibling cancellation on failure).
