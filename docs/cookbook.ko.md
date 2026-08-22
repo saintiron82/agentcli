@@ -23,6 +23,7 @@
 | [11. 토큰 요금이 궁금할 때](#11-토큰-요금이-궁금할-때) | `resp.tokens` 를 본다 |
 | [12. 구버전에서 업그레이드](#12-구버전에서-업그레이드) | 브레이킹 1개 확인 |
 | [13. 여러 에이전트를 조율하는 코디네이터](#13-여러-에이전트를-조율하는-코디네이터) | 호스트 코드가 루프, 에이전트는 워커 |
+| [14. 구조화 JSON을 보장받기](#14-구조화-json을-보장받기) | `output_schema=` — 맞거나, 명명된 실패거나 |
 
 ---
 
@@ -237,3 +238,28 @@ def coordinator_loop(items, max_rounds=3):
   코드가 낫다.
 - 워커 간 컨텍스트 공유가 필요하면 `ContextSession.fork_many` 가 같은
   구도의 기성품이다(핀 1회 + 병렬 fork, 순서 보존, 실패 시 형제 취소).
+
+## 14. 구조화 JSON을 보장받기
+
+파서를 직접 짜고 실패 로그를 남기고 재시도를 구현하던 것(모든 소비 앱이
+각자 하던 일)을 한 줄로 끝낸다:
+
+```python
+resp = client.chat(payload, provider="claude",
+                   output_schema={"type": "object", "required": ["results"],
+                                  "properties": {"results": {"type": "array"}}},
+                   schema_retries=1)
+if resp.parsed is not None:
+    사용(resp.parsed)                    # 스키마 통과 보장
+else:
+    print(resp.error_type,              # "schema" — 명명된 실패
+          resp.error,                   # 위반 목록 ($.results[0].id: 누락 …)
+          resp.raw_content[:200])       # 모델 마지막 원문 (디버깅용)
+```
+
+- 위반은 되먹여져 교정 재시도된다 — 재시도는 캐시된 system 프리픽스를
+  타서 싸다([4번](#4-같은-지시문으로-수백-번-호출)과 시너지).
+- 내장 검증은 부분집합(type/required/properties/items/enum)만 — 그 밖의
+  키는 즉시 에러. 더 복잡한 규칙은 `validator=람다`로.
+- 모든 시도의 토큰이 `resp.tokens` 에 합산되므로 재시도 비용이 보인다.
+- 스트리밍(`chat_stream`)에서는 못 쓴다 — 검증은 완결 응답 전제.

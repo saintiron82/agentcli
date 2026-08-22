@@ -24,6 +24,7 @@ All recipes assume v0.7.3+.
 | [11. Wondering about token cost](#11-wondering-about-token-cost) | read `resp.tokens` |
 | [12. Upgrading from an old version](#12-upgrading-from-an-old-version) | one breaking change to check |
 | [13. A coordinator over multiple agents](#13-a-coordinator-over-multiple-agents) | host code loops, agents are workers |
+| [14. Guaranteed structured JSON](#14-guaranteed-structured-json) | `output_schema=` — conforms, or fails by name |
 
 ---
 
@@ -255,3 +256,30 @@ def coordinator_loop(items, max_rounds=3):
 - If workers need shared context, `ContextSession.fork_many` is the
   ready-made version of this shape (pin once + parallel forks, ordered
   results, sibling cancellation on failure).
+
+## 14. Guaranteed structured JSON
+
+Replaces the parser + failure log + retry loop every consuming app used
+to hand-roll:
+
+```python
+resp = client.chat(payload, provider="claude",
+                   output_schema={"type": "object", "required": ["results"],
+                                  "properties": {"results": {"type": "array"}}},
+                   schema_retries=1)
+if resp.parsed is not None:
+    use(resp.parsed)                    # guaranteed schema-conformant
+else:
+    print(resp.error_type,              # "schema" — a named failure
+          resp.error,                   # violations ($.results[0].id: missing …)
+          resp.raw_content[:200])       # the model's last raw text
+```
+
+- Violations are fed back for a corrective retry — retries ride the cached
+  system prefix, so they're cheap (synergy with
+  [recipe 4](#4-hundreds-of-calls-with-the-same-instructions)).
+- Built-in validation covers the subset (type/required/properties/items/
+  enum) only — anything else errors immediately. Richer rules go in
+  `validator=lambda`.
+- Every attempt's tokens sum into `resp.tokens`, so retry cost is visible.
+- Not available on `chat_stream` — validation presumes a complete response.
