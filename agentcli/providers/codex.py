@@ -26,7 +26,7 @@ from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    estimate_payload_prompt_tokens, health_from_response,
                    run_health_command, run_subprocess_async,
                    validate_reasoning_defaults)
-from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
+from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
 from ..utils import build_env
@@ -140,6 +140,7 @@ def _codex_run_kwargs(prompt: str, use_stdin: bool, *,
 
 class CodexProvider(LLMProvider):
     provider_id = "codex"
+    supports_account_usage = True
     supports_sessions = True
     supports_streaming = True
     supports_token_streaming = False      # item.completed = 메시지 블록 단위
@@ -211,6 +212,15 @@ class CodexProvider(LLMProvider):
         # session_id 의 glob 메타문자(*,?,[)를 escape — 안 하면 '*' 가 아무 파일
         # 이나 매칭해 죽은 세션을 살아있다고 오판할 수 있다.
         return any(root.glob(f"**/rollout-*{_glob.escape(session_id)}.jsonl"))
+
+    def get_account_usage(self, *, timeout: float = 15,
+                          allow_probe: bool = False,
+                          oauth_token: str | None = None,
+                          credentials_path: str | None = None) -> AccountUsage:
+        from ..account_usage import codex_account_usage
+        if oauth_token is not None:
+            raise ValueError("Codex usage requires auth.json; use credentials_path.")
+        return codex_account_usage(credentials_path=credentials_path, timeout=timeout)
 
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,

@@ -23,7 +23,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
-from .types import (Message, LLMResponse, ProviderCapabilities, ProviderHealth,
+from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, ProviderHealth,
                     TokenUsage, StreamChunk, make_error_chunk,
                     standardize_error_chunk)
 from .store.base import ConversationStore
@@ -1197,6 +1197,36 @@ class LLMClient:
                 result[pid] = p.health_check(
                     timeout=timeout, cwd=cwd, probe=probe)
         return result
+
+    def get_account_usage(self, provider: str, *, timeout: float = 15,
+                          allow_probe: bool = False,
+                          oauth_token: str | None = None,
+                          credentials_path: str | None = None) -> AccountUsage:
+        """Read subscription utilization/reset times, separate from token stats.
+
+        No session/store changes or token refresh. Claude setup-token inference
+        probes require explicit ``allow_probe=True``. Unsupported providers/auth
+        return a structured status rather than silently querying another account.
+        """
+        from .account_usage import validate_timeout
+        validate_timeout(timeout)
+        p = self._registry.get(provider)
+        if p is None:
+            return AccountUsage(provider=provider, status="unknown_provider",
+                                message="Register the provider before querying account usage.")
+        return p.get_account_usage(timeout=timeout, allow_probe=allow_probe,
+                                   oauth_token=oauth_token,
+                                   credentials_path=credentials_path)
+
+    async def get_account_usage_async(self, provider: str, *, timeout: float = 15,
+                                      allow_probe: bool = False,
+                                      oauth_token: str | None = None,
+                                      credentials_path: str | None = None) -> AccountUsage:
+        """Thread-backed async lookup. Cancellation cannot stop an in-flight HTTP request."""
+        return await asyncio.to_thread(
+            self.get_account_usage, provider, timeout=timeout,
+            allow_probe=allow_probe, oauth_token=oauth_token,
+            credentials_path=credentials_path)
 
     def session_alive(self, provider: str, *, owner: str = "",
                       alias: str = "", conversation_id: str = "",

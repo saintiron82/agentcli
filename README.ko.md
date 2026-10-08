@@ -424,6 +424,60 @@ async for chunk in client.chat_stream(prompt, provider="claude",
 
 `env`/`lean`/`isolated`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
 
+### 계정 한도 사용량 (Claude / Codex)
+
+`get_account_usage()`는 agentcli 밖의 활동까지 포함한 구독 계정의 한도 사용률과
+초기화 시각을 조회한다. `get_token_stats()`(로컬 호출 누적 통계),
+`health_check()`(CLI 준비 상태)와는 별개다. 공개 타입은 `AccountUsage`, `UsageWindow`다.
+
+```python
+quota = client.get_account_usage("claude")
+print(quota.public_dict())
+if quota.ok:
+    for name, window in quota.windows.items():
+        print(name, window.used_percentage, window.remaining_percentage,
+              window.resets_at)  # 초기화: Unix 초, 또는 None
+
+codex_quota = await client.get_account_usage_async("codex", timeout=15)
+client.supports("codex", "account_usage")  # True; Copilot/Kiro: False
+
+# 한도를 소비하는 실제 모델 요청을 허용할 때만:
+probe = client.get_account_usage("claude", allow_probe=True)
+```
+
+- Claude 브라우저 OAuth는 `GET https://api.anthropic.com/api/oauth/usage`를
+  사용하며 `user:profile` 권한이 필요하다. setup-token은 `allow_probe=True`일
+  때만 Messages API 응답의 한도 헤더를 읽는다. Haiku에 `max_tokens=1`로
+  요청하며, 이는 출력 상한이지 총 소비량이 1토큰이라는 뜻이 아니다.
+  허용하지 않으면 `probe_required`를 반환한다. 추론 전용 권한이 확인되면
+  요청을 보내지 않고, 권한이 불명확하면 GET을 시도한 뒤 HTTP 403에서
+  `probe_required`를 반환할 수 있다.
+- Claude는 기존 호출별/생성자/agentcli OAuth 토큰 우선순위를 따르고,
+  이어서 `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` 또는 `~/.claude`의
+  `.credentials.json`을 사용한다. `oauth_token=`은 토큰을 지정하고,
+  `credentials_path=`는 토큰 기본값을 건너뛰어 특정 인증 파일을 선택한다.
+  둘을 함께 전달하지 않는다. 브라우저 권한이 확인된 토큰의 오류에는 probe로
+  우회하지 않는다.
+- Codex는 `CODEX_HOME` 또는 `~/.codex`의 `auth.json`을 읽고
+  `GET https://chatgpt.com/backend-api/wham/usage`를 호출한다. 계정 ID가 있으면
+  `ChatGPT-Account-Id`도 전달한다. 다른 저장된 인증 파일은 `credentials_path=`로
+  지정한다. 계정 정보가 필요할 수 있어 Codex에는 단독 `oauth_token=`을 허용하지 않는다.
+- GET 조회는 모델 출력을 생성하지 않는다. 토큰 갱신, 인증 파일 수정, 계정 전환,
+  대화 세션 생성, 사용량 로그 기록을 하지 않는다. 파일 기반 인증을 지원하며,
+  키체인 전용 로그인은 명시 토큰(Claude) 또는 접근 가능한 인증 파일이 필요하다.
+  API-key 과금 통계와 Copilot/Kiro 한도 조회는 지원하지 않는다.
+- 결과에는 `windows`(응답에 있는 `five_hour` / `seven_day`), `source`,
+  `observed_at`, `http_status`, `probe_performed`가 포함된다. `ok=True`는 조회
+  성공을 뜻하므로 사용률 100%여도 참이다. 누락된 한도는 미확인이지 0%가 아니다.
+  실패는 `auth_required`, `token_expired`, `rate_limited`, `network_error`,
+  `timeout`, `invalid_response` 등의 상태로 반환하며 원문 응답이나 토큰을
+  노출하지 않는다. GET 요청 제한이 계정 한도 소진을 뜻하지는 않는다.
+  자동 폴링·재시도·캐시는 없다.
+
+CLI 내부 엔드포인트이므로 변경될 수 있다. `timeout`은 유한한 양수이며 소켓
+작업의 제한 시간이지 전체 처리 시간의 엄격한 상한은 아니다. 비동기 조회는
+스레드에서 실행되며 취소해도 이미 진행 중인 HTTP 요청은 중단되지 않는다.
+
 ### 실행 중인 CLI 추적 (진단)
 
 각 호출이 자기 프로세스 그룹으로 도므로(0.6.2+), 동봉된 `scripts/agentcli_ps.py`

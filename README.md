@@ -299,6 +299,59 @@ small prompt string estimate that agentcli passed to the CLI, and check
 `prompt_tokens_unreliable_calls` before using provider-reported prompt totals
 for cost or comparison.
 
+### Account quota usage (Claude / Codex)
+
+`get_account_usage()` reads subscription limit utilization and reset times,
+including activity outside agentcli. It is separate from `get_token_stats()`
+(local call totals) and `health_check()` (CLI readiness).
+
+```python
+quota = client.get_account_usage("claude")
+print(quota.public_dict())
+if quota.ok:
+    for name, window in quota.windows.items():
+        print(name, window.used_percentage, window.remaining_percentage,
+              window.resets_at)  # reset: Unix seconds, or None
+
+codex_quota = await client.get_account_usage_async("codex", timeout=15)
+client.supports("codex", "account_usage")  # True; Copilot/Kiro: False
+
+# Only when a real model request consuming quota is acceptable:
+probe = client.get_account_usage("claude", allow_probe=True)
+```
+
+- Claude browser OAuth uses `GET https://api.anthropic.com/api/oauth/usage`.
+  It requires `user:profile`. A setup-token uses Messages API rate-limit headers
+  instead, only with `allow_probe=True`: Haiku with `max_tokens=1` (an output
+  cap, not a promise of one total token). Without permission, the result is
+  `probe_required`; known inference-only scopes send no request. Unknown-scope
+  tokens first try the GET and may return `probe_required` on HTTP 403.
+- Claude honors existing per-call/constructor/agentcli OAuth token precedence,
+  then `CLAUDE_CODE_OAUTH_TOKEN`, then `.credentials.json` under
+  `CLAUDE_CONFIG_DIR` or `~/.claude`. `oauth_token=` overrides the token;
+  `credentials_path=` explicitly selects a credentials file and bypasses token
+  defaults. Do not pass both. Known browser-scope failures do not trigger probes.
+- Codex reads `auth.json` under `CODEX_HOME` or `~/.codex` and uses
+  `GET https://chatgpt.com/backend-api/wham/usage`, passing `ChatGPT-Account-Id`
+  when available. Use `credentials_path=` for another saved auth file. Bare
+  `oauth_token=` is rejected for Codex because account context can be required.
+- GET lookups do not generate model output. Neither provider refreshes tokens,
+  writes credentials, switches accounts, nor creates chat sessions/usage-log
+  rows. File-based credentials are supported; keychain-only logins need an
+  explicit token (Claude) or an accessible credentials file. API-key billing,
+  Copilot, and Kiro quota lookup are not supported.
+- `AccountUsage` contains `windows` (`five_hour` / `seven_day`, when supplied),
+  `source`, `observed_at`, `http_status`, and `probe_performed`. `ok=True` means
+  the lookup succeeded, even if usage is 100%. Missing windows are unknown,
+  not 0%. Failures return structured statuses (`auth_required`, `token_expired`,
+  `rate_limited`, `network_error`, `timeout`, `invalid_response`, etc.) without
+  raw server bodies/tokens. A rate-limited GET does not prove the account is
+  out of quota. There is no automatic polling, retry, or caching.
+
+These are CLI-internal endpoints and may change. Network timeout must be a finite
+positive number; it bounds socket operations, not a strict end-to-end deadline.
+Async lookup runs in a thread; cancellation cannot abort an in-flight request.
+
 ### Model selection
 
 `list_models()` exposes the models this library knows how to pass to each CLI.
@@ -337,6 +390,7 @@ from agentcli import (
 
     # Data
     Message, Conversation, LLMResponse, ProviderHealth, TokenUsage,
+    AccountUsage, UsageWindow,
     StreamChunk, make_error_chunk, standardize_error_chunk,
 
     # Providers
@@ -359,6 +413,8 @@ from agentcli import (
 | `client.select_model(provider, model)` | `str` |
 | `client.health_check(provider, probe=False)` | `ProviderHealth` |
 | `client.get_token_stats(owner, …, group_by=)` | `dict` |
+| `client.get_account_usage(provider, allow_probe=False, …)` | `AccountUsage` |
+| `client.get_account_usage_async(provider, …)` | `awaitable[AccountUsage]` |
 | `client.list_drifts(owner=, alias=)` | `list[dict]` |
 | `client.get_alias_status(owner, alias, cwd)` | `dict` |
 | `client.clear_session_metadata(owner=, alias=, provider=)` | `list[dict]` |

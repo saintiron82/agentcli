@@ -20,7 +20,7 @@ from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    run_health_command, run_subprocess_async,
                    run_subprocess_sync, split_system_messages,
                    validate_reasoning_defaults)
-from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
+from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
 from ..reasoning import needs_event as _reasoning_needs_event, to_dict as _reasoning_to_dict
@@ -141,6 +141,7 @@ class ClaudeProvider(LLMProvider):
     supports_session_recovery = True      # STALE_SESSION_MARKER → 새 세션
     supports_session_liveness = True      # session_alive: 세션 파일 검사
     supports_debug = True                 # --debug + 청크 타임라인 + trace
+    supports_account_usage = True
     # 어느 모드든 히스토리는 Claude CLI 가 소유 — 라이브러리는 대화 내용을 저장하지 않는다.
     stores_history = False
 
@@ -376,6 +377,17 @@ class ClaudeProvider(LLMProvider):
 
     def list_models(self) -> list[dict]:
         return list(CLAUDE_MODELS)
+
+    def get_account_usage(self, *, timeout: float = 15,
+                          allow_probe: bool = False,
+                          oauth_token: str | None = None,
+                          credentials_path: str | None = None) -> AccountUsage:
+        from ..account_usage import claude_account_usage
+        if oauth_token is not None and credentials_path is not None:
+            raise ValueError("Choose oauth_token or credentials_path, not both.")
+        token = None if credentials_path is not None else self._resolve_oauth_token(oauth_token)
+        return claude_account_usage(token=token, credentials_path=credentials_path,
+                                    timeout=timeout, allow_probe=allow_probe)
 
     def session_alive(self, session_id: str, *,
                       cwd: str | None = None) -> bool | None:

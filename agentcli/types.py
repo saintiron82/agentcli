@@ -38,6 +38,55 @@ class Message:
     agent: str = ""  # 메시지 작성자 에이전트 ID
 
 
+@dataclass(frozen=True)
+class UsageWindow:
+    """Account limit utilization, not a token count. Reset is Unix seconds."""
+    used_percentage: float
+    resets_at: int | None = None
+    limit_window_seconds: int | None = None
+
+    @property
+    def remaining_percentage(self) -> float:
+        return round(max(0.0, 100.0 - self.used_percentage), 2)
+
+    def to_dict(self) -> dict:
+        return {"used_percentage": self.used_percentage,
+                "remaining_percentage": self.remaining_percentage,
+                "resets_at": self.resets_at,
+                "limit_window_seconds": self.limit_window_seconds}
+
+
+@dataclass
+class AccountUsage:
+    """Read-only account quota snapshot; contains no credentials/raw payloads.
+
+    ``ok`` means lookup succeeded, even when utilization is 100%.
+    ``probe_performed`` records an attempted inference request, including failures.
+    """
+    provider: str
+    ok: bool = False
+    status: str = "unsupported"
+    windows: dict[str, UsageWindow] = field(default_factory=dict)
+    source: str = ""
+    plan: str = ""
+    observed_at: float | None = None
+    probe_performed: bool = False
+    http_status: int | None = None
+    error_type: str = ""
+    message: str = ""
+    suggested_action: str = ""
+
+    def public_dict(self) -> dict:
+        return {"provider": self.provider, "ok": self.ok, "status": self.status,
+                "windows": {k: v.to_dict() for k, v in self.windows.items()},
+                "source": self.source, "plan": _redact_public_text(self.plan),
+                "observed_at": self.observed_at,
+                "probe_performed": self.probe_performed,
+                "http_status": self.http_status, "error_type": self.error_type,
+                "message": _redact_public_text(self.message),
+                "suggested_action": _redact_public_text(self.suggested_action)}
+
+
 @dataclass
 class LLMResponse:
     content: str
@@ -231,6 +280,7 @@ class ProviderCapabilities:
     debug: bool = False        # debug 계측(청크 타임라인/trace) 지원
     effort_levels: frozenset = frozenset()     # 지원하는 canonical effort 레벨
     thinking_levels: frozenset = frozenset()   # 지원하는 canonical thinking 레벨
+    account_usage: bool = False  # 계정 한도 조회 (인증 방식에 따라 달라짐)
 
     def to_dict(self) -> dict:
         return {
@@ -245,6 +295,7 @@ class ProviderCapabilities:
             "notes": self.notes,
             "effort_levels": sorted(self.effort_levels),
             "thinking_levels": sorted(self.thinking_levels),
+            "account_usage": self.account_usage,
         }
 
     def supports(self, feature: str) -> bool:

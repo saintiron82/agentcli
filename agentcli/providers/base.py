@@ -12,7 +12,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
-from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
+from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
                      LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
 from ..utils import serialize_messages
 
@@ -333,6 +333,7 @@ class LLMProvider(ABC):
     supports_session_recovery: bool = False
     supports_session_liveness: bool = False
     supports_debug: bool = False   # debug 계측(청크 타임라인/trace) 지원
+    supports_account_usage: bool = False
     # capabilities().options 에서 제외할 공통 호출 인자 (provider 고유 옵션만 남김).
     _COMMON_CALL_ARGS = frozenset({
         "self", "messages", "model", "timeout", "session_id", "cwd",
@@ -394,6 +395,7 @@ class LLMProvider(ABC):
             notes=capability_notes,
             effort_levels=effort_levels(self.provider_id),
             thinking_levels=thinking_levels(self.provider_id),
+            account_usage=self.supports_account_usage,
         )
 
     @abstractmethod
@@ -800,6 +802,14 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def is_available(self) -> bool: ...
+
+    def get_account_usage(self, *, timeout: float = 15,
+                          allow_probe: bool = False,
+                          oauth_token: str | None = None,
+                          credentials_path: str | None = None) -> AccountUsage:
+        """Read account quota without refreshing credentials or changing sessions."""
+        return AccountUsage(provider=self.provider_id,
+                            message="Account usage lookup is not supported by this provider.")
 
 
 async def run_subprocess_async(
