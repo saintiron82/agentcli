@@ -1,13 +1,14 @@
 name: Release
 
-# Automates the two-stage release flow from docs/release.md on a `v*` tag push:
+# Automates the GitHub-first release flow from docs/release.md on a `v*` tag push:
 #   1. build + verify (pytest gate so a broken tag never ships)
-#   2. publish to PyPI via Trusted Publishing (OIDC — no stored token)
-#   3. create the GitHub Release from docs/releases/<tag>.md with dist assets
+#   2. create the GitHub Release from docs/releases/<tag>.md with dist assets
+#   3. optionally publish to PyPI via Trusted Publishing (OIDC)
 #
 # To complete Stage 2, configure a PyPI pending publisher (one-time, on PyPI):
 #   project: agentcli-py · owner: saintiron82 · repo: agentcli
 #   workflow: release.yml · environment: pypi
+# After setup, opt in with the repository variable PYPI_PUBLISH_ENABLED=true.
 # Prefer a token instead? Drop the `permissions.id-token` + `environment` from
 # pypi-publish and pass `password: ${{ secrets.PYPI_API_TOKEN }}` to the publish
 # step.
@@ -54,6 +55,7 @@ jobs:
 
   pypi-publish:
     name: publish to PyPI
+    if: ${{ vars.PYPI_PUBLISH_ENABLED == 'true' }}
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -73,9 +75,9 @@ jobs:
 
   github-release:
     name: GitHub Release
-    # Gate on a successful PyPI publish so the GitHub Release and PyPI never
-    # diverge (no GH Release for a version that failed to upload).
-    needs: [build, pypi-publish]
+    # GitHub packages remain available even when PyPI is disabled or unavailable.
+    # Both publication paths still require successful tests/build validation.
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
