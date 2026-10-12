@@ -431,6 +431,10 @@ class LLMClient:
         lock = getattr(self._store, "_lock", None)
         return lock if lock is not None else nullcontext()
 
+    def _store_write(self):
+        transaction = getattr(self._store, "transaction", None)
+        return transaction() if transaction is not None else self._store_lock()
+
     @property
     def auth_profile(self) -> AuthProfile | None:
         """Immutable service profile; use public_dict() for non-secret identity."""
@@ -665,7 +669,7 @@ class LLMClient:
                          alias: str, alias_to_set: str = "",
                          system_prompt_hash: str = "", provider_options=None,
                          force_new_session: bool = False) -> None:
-        with self._store_lock():
+        with self._store_write():
             current = self._store.get(conv.id)
             if current is None:
                 raise RuntimeError("Conversation disappeared before persistence")
@@ -1709,7 +1713,7 @@ class LLMClient:
         `session_id:<provider>` and matching `system_prompt_hash:<provider>` keys
         in the configured store so the next call starts a fresh CLI session.
         """
-        with self._store_lock():
+        with self._store_write():
             if alias:
                 conv = self._store.find_by_alias(owner, alias)
                 convs = [conv] if conv is not None else []

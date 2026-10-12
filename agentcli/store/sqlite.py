@@ -18,6 +18,7 @@ from threading import RLock
 from pathlib import Path
 import os
 from functools import wraps
+from contextlib import contextmanager
 from .base import ConversationStore
 from ..types import Conversation, Message
 from .locking import synchronized_store
@@ -41,6 +42,7 @@ def _read_snapshot(function):
 class SQLiteStore(ConversationStore):
     def __init__(self, db_path: str = ":memory:"):
         self._lock = RLock()
+        self._transaction_depth = 0
         self._coordination_path = (os.path.normcase(str(Path(db_path).resolve()))
                                    if str(db_path) != ":memory:" else None)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -57,6 +59,30 @@ class SQLiteStore(ConversationStore):
         """Close after all clients using this store have stopped."""
         with self._lock:
             self._conn.close()
+
+    @contextmanager
+    def transaction(self):
+        """Serialize an atomic write unit across local SQLite connections."""
+        with self._lock:
+            outer = self._transaction_depth == 0
+            if outer:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                if outer:
+                    self._conn.rollback()
+                raise
+            else:
+                if outer:
+                    self._conn.commit()
+            finally:
+                self._transaction_depth -= 1
+
+    def _commit(self):
+        if self._transaction_depth == 0:
+            self._conn.commit()
 
     def _create_tables(self):
         self._conn.executescript("""
@@ -116,7 +142,7 @@ class SQLiteStore(ConversationStore):
             CREATE INDEX IF NOT EXISTS idx_usage_alias ON usage_log(alias);
             CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_log(provider);
         """)
-        self._conn.commit()
+        self._commit()
         # Migrations — 구 스키마 호환
         for alter in (
             "ALTER TABLE messages ADD COLUMN agent TEXT DEFAULT ''",
@@ -129,7 +155,7 @@ class SQLiteStore(ConversationStore):
         ):
             try:
                 self._conn.execute(alter)
-                self._conn.commit()
+                self._commit()
             except sqlite3.OperationalError:
                 pass
 
@@ -173,7 +199,7 @@ class SQLiteStore(ConversationStore):
                    created_at, updated_at) VALUES (?,?,?,?,?,?,?)""",
                 (conv_id, owner, provider, model, alias or "",
                  now.isoformat(), now.isoformat()))
-            self._conn.commit()
+            self._commit()
         except sqlite3.IntegrityError:
             self._conn.rollback()
             existing = self.find_by_alias(owner, alias) if alias else self.get(conv_id)
@@ -218,7 +244,7 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?",
             (datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def get_messages(self, conversation_id: str, limit: int = 0,
                      agent: str = "") -> list[Message]:
@@ -251,7 +277,7 @@ class SQLiteStore(ConversationStore):
                            (conversation_id,))
         self._conn.execute("DELETE FROM conversations WHERE id=?",
                            (conversation_id,))
-        self._conn.commit()
+        self._commit()
 
     def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]:
         rows = self._conn.execute(
@@ -271,7 +297,7 @@ class SQLiteStore(ConversationStore):
             "UPDATE conversations SET metadata=?, updated_at=? WHERE id=?",
             (json.dumps(meta, ensure_ascii=False),
              datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def set_alias(self, conversation_id: str, alias: str) -> None:
         row = self._conn.execute(
@@ -287,7 +313,7 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET alias=?, updated_at=? WHERE id=?",
             (alias or "", datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def record_usage(self, conversation_id: str, *,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
@@ -317,7 +343,7 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?",
             (datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     @_read_snapshot
     def get_token_stats(self, owner: str = "", days: int = 7,
