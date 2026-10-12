@@ -54,6 +54,25 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 
 더 자세한 제품 경계는 [docs/positioning.ko.md](docs/positioning.ko.md)를 보세요.
 
+### 아직 배포되지 않은 보안 보강
+
+`fix/security-hardening` 브랜치는 v0.7.5 기반이며 공개된 태그와 패키지는
+교체하지 않았습니다. [변경 보고서](docs/security-hardening.ko.md)와
+[운영 지침](docs/operations.ko.md)을 확인하십시오.
+
+- 대화는 동일한 `owner`와 정규화한 작업 경로를 요구합니다. 다른 owner의
+  `inject_context`는 호스트의 `context_authorizer` 승인이 필요합니다. owner는 인증이 아닙니다.
+- 프로필의 도구·MCP 정책을 전달하고 미지원 보안 옵션·제한을 잃는 fallback은
+  차단합니다. Codex resume 정책 변경에는 `new_session=True`가 필요합니다.
+- Windows batch shim은 해석기를 직접 실행하며 알 수 없는 wrapper는 거부합니다.
+  materialization은 사용자 스킬을 삭제하지 않습니다.
+- Kiro 파일 접근 권한을 명시하고 파일 크기는 기본 1 MiB로 제한합니다.
+- 같은 세션의 클라이언트·호출 모드·로컬 SQLite 프로세스를 조정합니다.
+  다중 서버 writer는 별도 조정과 네이티브 히스토리 접근 구성이 필요합니다.
+- 명시한 `wall_timeout`은 재시도 전체에 공유하며 기본 `timeout`은 시도별로
+  유지합니다. 도구의 외부 변경은 rollback되지 않습니다. 정리·잠금 대기 시간은
+  실행 예산을 넘을 수 있습니다. 진단 trace는 본문을 제외하는 schema 2입니다.
+
 ## 핵심 설계 원칙
 
 **대화 히스토리의 single source of truth는 provider CLI 세션입니다.** 라이브러리는 provider별 `session_id`만 저장하고 이전 대화를 prompt에 다시 주입하지 않습니다. 이 원칙 때문에 토큰 중복, 히스토리 중복 저장, 예측하기 어려운 context 증가를 피할 수 있습니다.
@@ -204,8 +223,9 @@ registry.register(KiroProvider(
 위 생성자 플래그는 provider 인스턴스 단위로 고정된다. 도구/권한/MCP 서버를
 **호출마다** 바꾸려면 — 예: *같은* 대화를 읽기 전용에서 행위로 전환 —
 `chat`/`chat_async`/`chat_stream` 에 `provider_options` 를 넘긴다. 각 키는 그
-키를 받는 provider 에게만 전달되므로, 다른 provider 로 fallback 돼도 무관한
-옵션은 안전하게 무시된다.
+키를 받는 provider에게 전달하되, 미지원 보안 제어는 `ValueError`로 거부한다.
+제한된 fallback은 정책 동등성을 확인할 수 있을 때만 허용한다. 비보안 미지원
+키는 무시한다. Codex 정책 변경은 새 세션이 필요하다.
 
 ```python
 # 읽기 턴: plan 권한, 외부 도구 없음.
@@ -422,7 +442,9 @@ async for chunk in client.chat_stream(prompt, provider="claude",
         print(chunk.content, end="", flush=True)   # 토큰 단위
 ```
 
-`env`/`lean`/`isolated`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
+`env`/`lean`/`isolated`는 Claude 전용 실행 제어입니다. 미지원 보안 옵션은 거부하고
+fallback도 정책을 유지해야 합니다. 비보안 진단 옵션의 미지원 키는 계속 무시할 수
+있습니다. `debug`는 Codex/Copilot도 지원하며 `partial_messages`는 Claude 전용입니다.
 
 ### 계정 한도 사용량 (Claude / Codex)
 
@@ -716,8 +738,10 @@ pytest
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.7.1`
-- 릴리즈 노트: [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
+- 현재 공개 릴리즈: `0.7.5` (이 보안 수정은 아직 미배포)
+- 릴리즈 노트: [docs/releases/v0.7.5.ko.md](docs/releases/v0.7.5.ko.md)
+- 보안 수정: [docs/security-hardening.ko.md](docs/security-hardening.ko.md) / [docs/security-hardening.md](docs/security-hardening.md)
+- 운영 지침: [docs/operations.ko.md](docs/operations.ko.md) / [docs/operations.md](docs/operations.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 - Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 

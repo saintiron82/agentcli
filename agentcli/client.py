@@ -201,8 +201,8 @@ def _merge_options(base: dict, provider_options: dict | None) -> dict:
     """provider_options(호출 시점 옵션)를 base kwargs 에 병합 — provider_options 우선.
 
     실제로 provider 의 메서드가 받는 키만 호출 직전 ``_supported_kwargs`` 가
-    걸러내므로, 한 provider 전용 옵션(예: claude mcp_config)을 다른 provider
-    로 fallback 해도 안전하게 무시된다 (#154)."""
+    걸러낸다. 비보안 미지원 옵션은 무시하되 보안 제어는 검증 단계에서 거부하고
+    fallback 정책도 별도로 확인한다."""
     if provider_options:
         base.update(provider_options)
     return base

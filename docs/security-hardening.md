@@ -160,6 +160,7 @@ deletion or external side-effect rollback is introduced.
 | SEC-002 | Conversation and injected-context ownership | Fixed, regression tested |
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Fixed, regression tested |
+| SEC-005 | Automatic diagnostic payload exposure | Fixed; raw returned errors remain private |
 | SEC-006 | Materialization boundaries and user skill protection | Fixed, regression tested |
 | SEC-007 | Explicit Kiro filesystem access policy | Fixed, regression tested |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
