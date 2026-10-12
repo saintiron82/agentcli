@@ -241,8 +241,25 @@ def test_refine_async_and_stream_passthrough():
     client.chat_async = AsyncMock(return_value="RESP")
     ctx = ContextSession(client, "X", provider="claude", owner="u", alias="a")
     assert asyncio.run(ctx.refine_async("q")) == "RESP"
-    ctx.refine_stream("q2")
-    assert client.chat_stream.called
+    async def chunks(*args, **kwargs):
+        yield "CHUNK"
+    client.chat_stream = chunks
+    async def consume(): return [c async for c in ctx.refine_stream("q2")]
+    assert asyncio.run(consume()) == ["CHUNK"]
+
+
+def test_default_context_provider_and_import_compatibility():
+    from tests.test_turn_state import client_for
+    from agentcli.client import ContextSession as old_import
+    from agentcli.context_session import ContextSession as new_import
+    assert old_import is new_import is ContextSession
+    client, provider = client_for(MemoryStore())
+    ctx = client.pin_context("HOST_CONTEXT", owner="o", alias="a")
+    assert ctx._provider == "gate"
+    assert ctx.refine("q").content == "ok"
+    assert asyncio.run(ctx.refine_async("q")).content == "ok"
+    async def consume(): return [c async for c in ctx.refine_stream("q")]
+    assert asyncio.run(consume())[-1].content == "ok"
 
 
 # ===== 통합: 실제 LLMClient + 페이크 세션 provider =====
