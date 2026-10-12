@@ -31,6 +31,7 @@ from .store.base import ConversationStore
 from .store.locking import reserved_turn, reserve_conversation, session_generation_matches
 from .async_utils import complete_in_thread
 from .context_session import ContextSession
+from .planning import CallPlan
 from .coordination import ConversationLease, async_lease
 from .deadlines import request_budget, remaining_timeout, bounded_stream
 from .auth import AuthProfile, AuthProfileError
@@ -483,27 +484,6 @@ class LLMClient:
         with self._store_lock():
             return self._prepare(*args)
 
-    def _refresh_session_id(self, conv_id: str, provider: str,
-                            provider_obj, session_id: str,
-                            force_new_session: bool, *, owner=None, cwd=None) -> str:
-        """conversation 잠금 획득 후 최신 session_id 재조회.
-
-        _prepare 와 잠금 획득 사이에 동시 호출이 새 세션을 만들었을 수 있다.
-        클라이언트·호출 모드와 관계없이 공용 lease 안에서 재조회한다.
-        """
-        with self._store_lock():
-            conv = self._store.get(conv_id)
-        if conv is None:
-            return session_id
-        if owner is not None:
-            _require_conversation_scope(conv, owner, cwd)
-        if force_new_session or not (
-                provider_obj and provider_obj.supports_sessions):
-            return session_id
-        # 저장값을 그대로 반환 — 동시 clear_session_metadata("") 도 존중한다.
-        return conv.metadata.get(
-            SESSION_KEY_FMT.format(provider=provider), "")
-
     # ---------- 공용 준비/저장 로직 (sync/async 공유) ----------
 
     def _check_drift(self, conv, cwd: str | None) -> None:
@@ -533,7 +513,7 @@ class LLMClient:
                  reset_on_instruction_change: bool = False,
                  alias: str = "",
                  cwd: str | None = None,
-                 new_session: bool = False):
+                 new_session: bool = False) -> CallPlan:
         """프로바이더 결정 → conversation resolve → messages 조립.
 
         Conversation 해석 우선순위:
@@ -541,10 +521,7 @@ class LLMClient:
           2. alias가 명시되면 (owner, alias)로 조회/생성
           3. 둘 다 없으면 신규 conversation
 
-        Returns:
-            (provider_id, provider_obj, conv, messages, fallback_messages,
-             session_id, model, created_conversation, resolved_alias,
-             alias_to_set, system_prompt_hash, force_new_session)
+        Returns a named CallPlan; lease holders refresh the complete plan.
         """
         if not provider:
             chain = self._registry.get_fallback_chain()
@@ -666,10 +643,12 @@ class LLMClient:
         # Fallback providers start fresh, so they must still receive the current
         # system instructions even when the primary session has already seen them.
         fallback_messages = build_messages(include_system_prompt=bool(system_prompt))
-        return (
-            provider, provider_obj, conv, messages, fallback_messages,
-            session_id, model, created_conversation, resolved_alias,
-            alias_to_set, system_prompt_hash, force_new_session,
+        return CallPlan(
+            provider=provider, provider_obj=provider_obj, conv=conv,
+            messages=messages, fallback_messages=fallback_messages,
+            session_id=session_id, model=model, created_conversation=created_conversation,
+            resolved_alias=resolved_alias, alias_to_set=alias_to_set,
+            system_prompt_hash=system_prompt_hash, force_new_session=force_new_session,
         )
 
     def _discard_failed_prepare(self, conv_id: str,
@@ -809,40 +788,36 @@ class LLMClient:
             system_prompt = _augment_system_prompt_with_schema(
                 system_prompt, output_schema)
         with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model,
-             created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
+            plan = self._prepare(
                 prompt, provider, model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
                 strict_model, reset_on_instruction_change, alias, cwd,
                 new_session)
-        conversation_id = conv.id
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         with self._sync_conversation_lock(conversation_id):
             with self._store_lock():
-                (provider, provider_obj, conv, messages, fallback_messages,
-                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
-                 system_prompt_hash, force_new_session) = self._prepare(
-                    prompt, provider, model, conversation_id, owner,
+                plan = self._prepare(
+                    prompt, plan.provider, plan.model, conversation_id, owner,
                     system_prompt, context_turns, agent, inject_context,
                     strict_model, reset_on_instruction_change, alias, cwd, new_session)
-                created_conversation = created_conversation or refreshed_created
-            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
+                created_conversation = created_conversation or plan.created_conversation
+            self._check_resume_policy(conversation_id, plan.provider_obj, plan.session_id, provider_options)
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
-                    provider, msgs, _corrected_fallback(messages, fallback_messages, msgs), model,
-                    timeout, session_id, cwd,
-                    alias=resolved_alias,
-                    resume_by_alias=not force_new_session,
+                    plan.provider, msgs, _corrected_fallback(plan.messages, plan.fallback_messages, msgs), plan.model,
+                    timeout, plan.session_id, cwd,
+                    alias=plan.resolved_alias,
+                    resume_by_alias=not plan.force_new_session,
                     allow_fallback=fallback, effort=effort,
                     thinking=thinking, provider_options=provider_options,
                     native_namespace=conversation_id)
 
             response = self._run_with_output_schema(
-                _dispatch, messages, output_schema, validator, schema_retries)
+                _dispatch, plan.messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -851,9 +826,9 @@ class LLMClient:
                     response.conversation_id = ""
                 return response
 
-            self._persist_success(conv, cwd, prompt, response, agent,
-                                  resolved_alias, alias_to_set,
-                                  system_prompt_hash, provider_options, force_new_session)
+            self._persist_success(plan.conv, cwd, prompt, response, agent,
+                                  plan.resolved_alias, plan.alias_to_set,
+                                  plan.system_prompt_hash, provider_options, plan.force_new_session)
             return response
 
     @staticmethod
@@ -1066,37 +1041,34 @@ class LLMClient:
             assert_supported_schema(output_schema)
             system_prompt = _augment_system_prompt_with_schema(
                 system_prompt, output_schema)
-        (provider, provider_obj, conv, messages, fallback_messages,
-         session_id, model, created_conversation, resolved_alias, alias_to_set,
-         system_prompt_hash, force_new_session) = await complete_in_thread(
+        plan = await complete_in_thread(
             self._locked_prepare, prompt, provider, model, conversation_id, owner,
             system_prompt, context_turns, agent, inject_context,
             strict_model, reset_on_instruction_change, alias, cwd, new_session)
-        conversation_id = conv.id
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         async with self._async_conversation_lock(conversation_id):
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model, refreshed_created, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = await complete_in_thread(
-                self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            plan = await complete_in_thread(
+                self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
                 strict_model, reset_on_instruction_change, alias, cwd, new_session)
-            created_conversation = created_conversation or refreshed_created
+            created_conversation = created_conversation or plan.created_conversation
             await complete_in_thread(self._check_resume_policy, conversation_id,
-                                     provider_obj, session_id, provider_options)
+                                     plan.provider_obj, plan.session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
-                    provider, msgs, _corrected_fallback(messages, fallback_messages, msgs), model,
-                    timeout, session_id, cwd,
-                    alias=resolved_alias,
-                    resume_by_alias=not force_new_session,
+                    plan.provider, msgs, _corrected_fallback(plan.messages, plan.fallback_messages, msgs), plan.model,
+                    timeout, plan.session_id, cwd,
+                    alias=plan.resolved_alias,
+                    resume_by_alias=not plan.force_new_session,
                     allow_fallback=fallback, effort=effort,
                     thinking=thinking, provider_options=provider_options,
                     native_namespace=conversation_id)
 
             response = await self._arun_with_output_schema(
-                _dispatch, messages, output_schema, validator, schema_retries)
+                _dispatch, plan.messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -1106,9 +1078,9 @@ class LLMClient:
                 return response
 
             # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
-            await _persist_in_thread(self._persist_success, conv, cwd, prompt,
-                                    response, agent, resolved_alias,
-                                    alias_to_set, system_prompt_hash, provider_options, force_new_session)
+            await _persist_in_thread(self._persist_success, plan.conv, cwd, prompt,
+                                    response, agent, plan.resolved_alias,
+                                    plan.alias_to_set, plan.system_prompt_hash, provider_options, plan.force_new_session)
             return response
 
     async def _invoke_async_with_fallback(self, provider_id: str,
@@ -1244,54 +1216,51 @@ class LLMClient:
             raise ValueError("wall_timeout must be nonnegative")
         deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
         await complete_in_thread(self._validate_call_options, provider, "stream_async", provider_options)
-        (provider, provider_obj, conv, messages, fallback_messages,
-         session_id, model, created_conversation, resolved_alias, alias_to_set,
-         system_prompt_hash, force_new_session) = await complete_in_thread(
+        plan = await complete_in_thread(
             self._locked_prepare, prompt, provider, model, conversation_id, owner,
             system_prompt, context_turns, agent, inject_context,
             strict_model, reset_on_instruction_change, alias, cwd, new_session)
-        conversation_id = conv.id
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
-        if provider_obj is None:
+        if plan.provider_obj is None:
             await complete_in_thread(self._discard_failed_prepare, conversation_id, created_conversation)
-            yield make_error_chunk(f"unknown provider: {provider}",
-                                   provider=provider)
+            yield make_error_chunk(f"unknown provider: {plan.provider}",
+                                   provider=plan.provider)
             yield StreamChunk(type="done", content="",
-                              data={"provider": provider, "model": model,
+                              data={"provider": plan.provider, "model": plan.model,
                                     "latency_ms": 0})
             return
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         # 스트림 소비가 끝날 때까지 같은 conversation 의 다른 호출은 대기한다.
         async with self._async_conversation_lock(conversation_id):
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model, refreshed_created, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = await complete_in_thread(
-                self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            plan = await complete_in_thread(
+                self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
                 strict_model, reset_on_instruction_change, alias, cwd, new_session)
-            created_conversation = created_conversation or refreshed_created
+            created_conversation = created_conversation or plan.created_conversation
             await complete_in_thread(self._check_resume_policy, conversation_id,
-                                     provider_obj, session_id, provider_options)
+                                     plan.provider_obj, plan.session_id, provider_options)
             attempts = [
-                (provider, provider_obj, messages, model, session_id,
-                 not force_new_session)
+                (plan.provider, plan.provider_obj, plan.messages, plan.model, plan.session_id,
+                 not plan.force_new_session)
             ]
             policy_blocked = False
             if fallback:
                 for next_id in self._registry.get_fallback_chain():
-                    if next_id == provider:
+                    if next_id == plan.provider:
                         continue
                     next_provider = self._registry.get(next_id)
                     if next_provider is None:
                         continue
-                    if not _fallback_preserves_policy(provider_obj, next_provider, provider_options):
+                    if not _fallback_preserves_policy(plan.provider_obj, next_provider, provider_options):
                         policy_blocked = True
                         logger.warning("[LLM] stream fallback blocked: incompatible execution policy")
                         continue
                     attempts.append(
-                        (next_id, next_provider, fallback_messages, "", "",
-                         not force_new_session))
+                        (next_id, next_provider, plan.fallback_messages, "", "",
+                         not plan.force_new_session))
 
             last_error: StreamChunk | None = None
             for attempt_index, (current_id, current_provider, current_messages,
@@ -1311,7 +1280,7 @@ class LLMClient:
                             current_provider, current_messages,
                             model=current_model, timeout=timeout,
                             session_id=current_sid, cwd=cwd,
-                            alias=resolved_alias,
+                            alias=plan.resolved_alias,
                             idle_timeout=idle_timeout,
                             wall_timeout=wall_timeout,
                             resume_by_alias=resume_by_alias,
@@ -1416,9 +1385,9 @@ class LLMClient:
                         latency_ms=latency_ms, session_id=final_sid,
                         conversation_id=conversation_id)
                     await _persist_in_thread(
-                        self._persist_success, conv, cwd, prompt, synthetic,
-                        agent, resolved_alias, alias_to_set,
-                        system_prompt_hash, provider_options, force_new_session)
+                        self._persist_success, plan.conv, cwd, prompt, synthetic,
+                        agent, plan.resolved_alias, plan.alias_to_set,
+                        plan.system_prompt_hash, provider_options, plan.force_new_session)
 
                     yield StreamChunk(
                         type="done", content=full_content,
