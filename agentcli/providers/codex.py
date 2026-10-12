@@ -531,103 +531,64 @@ class CodexProvider(LLMProvider):
                            thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
-        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
-        cmd = self._build_cmd(prompt, model, cwd, session_id,
-                              sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy,
-                              mcp_config=mcp_config,
-                              reasoning_args=reasoning_args,
-                              prompt_via_stdin=use_stdin)
-        if cmd is None:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                session_id=session_id,
-                error="codex CLI not found",
-                error_type=ERROR_BINARY_MISSING,
-                exit_code=127)
+        attempt_sid = session_id
+        total_usage = TokenUsage()
+        start = time.monotonic()
 
-        start = time.time()
-        try:
-            # use_stdin_devnull/input_bytes 는 상호 배타적(run_subprocess_async
-            # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
-            # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
-            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd, env=provider_environment("codex", build_env),
-                use_stdin_devnull=not use_stdin,
-                input_bytes=prompt_bytes if use_stdin else None)
-        except FileNotFoundError:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="codex CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
-        if timed_out:
-            logger.error("Codex 타임아웃 (%d초)", timeout)
-            if debug:
-                emit_invoke_debug("codex", cmd, 124,
-                                  int((time.time() - start) * 1000), "",
-                                  session_id=session_id, path=debug_log_path)
-            resp = LLMResponse(content="", provider=self.provider_id,
-                               model=model, session_id=session_id,
-                               error=f"timeout after {timeout}s",
-                               error_type="timeout",
-                               exit_code=124)
-            resp.reasoning = reasoning
-            return resp
-        latency = int((time.time() - start) * 1000)
-        stderr_txt = stderr_b.decode("utf-8", errors="replace")
-        if debug:
-            emit_invoke_debug("codex", cmd, rc, latency, stderr_txt,
-                              session_id=session_id, path=debug_log_path)
-
-        if rc != 0:
-            if session_id and _is_codex_stale(stderr_txt):
-                logger.warning(
-                    "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
-                return await self.invoke_async(
-                    messages, model=model, timeout=timeout,
-                    session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
-                    approval_policy=approval_policy, mcp_config=mcp_config,
-                    debug=debug, debug_log_path=debug_log_path,
-                    effort=effort, thinking=thinking)
-            msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Codex 실패 (code=%d, type=%s)", rc, classify_error(msg))
-            resp = LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                raw_stderr=stderr_txt, session_id=session_id,
-                error=msg, error_type=classify_error(msg),
-                exit_code=rc)
-            resp.reasoning = reasoning
-            return resp
-
-        stdout_txt = stdout_b.decode("utf-8", errors="replace")
-        parsed = _parse_output(stdout_txt, prompt)
-        if _needs_initial_greeting_retry(parsed, session_id):
-            response = await self.invoke_async(
-                messages, model=model, timeout=timeout,
-                session_id=parsed["thread_id"], cwd=cwd, sandbox_mode=sandbox_mode,
-                approval_policy=approval_policy, mcp_config=mcp_config,
-                debug=debug, debug_log_path=debug_log_path,
-                effort=effort, thinking=thinking)
-            response.tokens.accumulate(parsed["usage"])
-            response.latency_ms = int((time.time() - start) * 1000)
+        def finish(content="", *, error="", error_type="", code=0, sid="", stderr=""):
+            response = LLMResponse(
+                content=content, provider=self.provider_id, model=model,
+                tokens=total_usage, latency_ms=int((time.monotonic() - start) * 1000),
+                raw_stderr=stderr, session_id=sid, error=error,
+                error_type=error_type, exit_code=code)
+            response.reasoning = reasoning
             return response
-        err = parsed.get("error", "")
-        resp = LLMResponse(
-            content=parsed["text"] if not err else "",
-            provider=self.provider_id, model=model,
-            tokens=parsed["usage"], latency_ms=latency,
-            raw_stderr=stderr_txt,
-            session_id=parsed["thread_id"] or session_id,
-            error=err,
-            error_type=classify_error(err) if err else "",
-            exit_code=rc,
-        )
-        resp.reasoning = reasoning
-        return resp
+
+        # Stale and greeting recovery share one bounded native retry.
+        for attempt in range(2):
+            cmd = self._build_cmd(
+                prompt, model, cwd, attempt_sid, sandbox_mode=sandbox_mode,
+                approval_policy=approval_policy, mcp_config=mcp_config,
+                reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
+            if cmd is None:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
+            try:
+                stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                    cmd, timeout=timeout, cwd=cwd,
+                    env=provider_environment("codex", build_env),
+                    use_stdin_devnull=not use_stdin,
+                    input_bytes=prompt_bytes if use_stdin else None)
+            except FileNotFoundError:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            if debug:
+                emit_invoke_debug(
+                    "codex", cmd, 124 if timed_out else rc,
+                    int((time.monotonic() - start) * 1000), stderr,
+                    session_id=attempt_sid, path=debug_log_path)
+            if timed_out:
+                return finish(error=f"timeout after {timeout}s", error_type="timeout",
+                              code=124, sid=attempt_sid, stderr=stderr)
+            if rc != 0:
+                if attempt == 0 and attempt_sid and _is_codex_stale(stderr):
+                    attempt_sid = ""
+                    continue
+                error = stderr.strip()[:300] or f"exit={rc}"
+                return finish(error=error, error_type=classify_error(error),
+                              code=rc, sid=attempt_sid, stderr=stderr)
+            parsed = _parse_output(stdout_b.decode("utf-8", errors="replace"), prompt)
+            total_usage.accumulate(parsed["usage"])
+            if attempt == 0 and _needs_initial_greeting_retry(parsed, attempt_sid):
+                attempt_sid = parsed["thread_id"]
+                continue
+            error = parsed.get("error", "")
+            return finish(parsed["text"] if not error else "", error=error,
+                          error_type=classify_error(error) if error else "",
+                          code=rc, sid=parsed["thread_id"] or attempt_sid, stderr=stderr)
 
     # ---------- 스트리밍 ----------
 

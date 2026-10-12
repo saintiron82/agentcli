@@ -60,3 +60,18 @@ def test_greeting_after_tool_execution_is_not_reissued():
     from agentcli.providers.codex import _parse_jsonl_events, _needs_initial_greeting_retry
     parsed = _parse_jsonl_events("\n".join(map(json.dumps, events(True, tools=True))))
     assert not _needs_initial_greeting_retry(parsed, "")
+
+
+def test_async_greeting_stale_cycle_is_bounded(monkeypatch):
+    provider = CodexProvider()
+    monkeypatch.setattr(provider, "_find_binary", lambda: "fake")
+    monkeypatch.setattr("agentcli.providers.codex.build_env", lambda: {})
+    calls = []
+    async def native(cmd, **options):
+        calls.append(cmd)
+        if "resume" in cmd: return b"", b"no rollout found for thread id fake", 1, False
+        return "\n".join(map(json.dumps, events(True))).encode(), b"", 0, False
+    monkeypatch.setattr("agentcli.providers.codex.run_subprocess_async", native)
+    response = asyncio.run(provider.invoke_async([Message("user", "task")]))
+    assert len(calls) == 2 and not response.content and response.error
+    assert response.tokens.total_tokens == 110
