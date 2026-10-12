@@ -48,7 +48,8 @@ class ConversationStore(ABC):
     def delete(self, conversation_id: str) -> None: ...
 
     @abstractmethod
-    def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]: ...
+    def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]:
+        """List newest handles; limit <= 0 selects all matching handles."""
 
     @abstractmethod
     def set_metadata(self, conversation_id: str, key: str, value) -> None:

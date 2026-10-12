@@ -27,6 +27,7 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
                     TokenUsage, StreamChunk, make_error_chunk,
                     standardize_error_chunk)
 from .store.base import ConversationStore
+from .store.locking import reserved_turn, reserve_conversation, session_generation_matches
 from .coordination import ConversationLease, async_lease
 from .deadlines import request_budget, remaining_timeout, bounded_stream
 from .auth import AuthProfile, AuthProfileError
@@ -576,6 +577,7 @@ class LLMClient:
             if profile is not None:
                 self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
         resolved_alias = conv.alias or alias
+        reserve_conversation(self._store, conv)
         require_auth_method(conv, provider)
         alias_to_set = alias if alias and not conv.alias else ""
 
@@ -667,6 +669,13 @@ class LLMClient:
                          alias: str, alias_to_set: str = "",
                          system_prompt_hash: str = "", provider_options=None) -> None:
         with self._store_lock():
+            current = self._store.get(conv.id)
+            if current is None:
+                raise RuntimeError("Conversation disappeared before persistence")
+            if not session_generation_matches(self._store, current, response.provider):
+                self._persist(conv.id, prompt, response, agent, alias=alias,
+                              persist_session=False)
+                return
             profile = current_auth_profile()
             if profile is not None:
                 self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
@@ -695,7 +704,7 @@ class LLMClient:
 
     def _persist(self, conv_id: str, prompt: str,
                  response: LLMResponse, agent: str,
-                 alias: str = "") -> None:
+                 alias: str = "", persist_session: bool = True) -> None:
         """성공한 호출에 대해 usage 기록 + (비세션) 메시지 저장.
 
         세션 provider는 `add_message` 호출 없이 session_id만 metadata에 저장.
@@ -720,7 +729,7 @@ class LLMClient:
         actual_is_session = bool(p and p.supports_sessions)
 
         if actual_is_session:
-            if response.session_id:
+            if response.session_id and persist_session:
                 self._store.set_metadata(
                     conv_id,
                     SESSION_KEY_FMT.format(provider=response.provider),
@@ -747,6 +756,7 @@ class LLMClient:
 
     # ---------- 동기 chat ----------
 
+    @reserved_turn
     @auth_scoped
     @request_budget
     def chat(self, prompt: str, *,
@@ -1003,6 +1013,7 @@ class LLMClient:
 
     # ---------- 비동기 chat ----------
 
+    @reserved_turn
     @auth_scoped
     @request_budget
     async def chat_async(self, prompt: str, *,
@@ -1178,6 +1189,7 @@ class LLMClient:
                 "검증·교정 재시도는 완결 응답 전제. chat/chat_async 를 쓴다.")
         return self._chat_stream_impl(prompt, **kwargs)
 
+    @reserved_turn
     @auth_scoped
     async def _chat_stream_impl(self, prompt: str, *,
                                 provider: str = "", model: str = "",
@@ -1623,7 +1635,7 @@ class LLMClient:
         # owner 없을 때는 각 provider 세션 목록을 쓸 수 없음. 현재 API로는
         # list_by_owner를 owner별로 돌려야 함.
         if owner:
-            convs = self._store.list_by_owner(owner, limit=1000)
+            convs = self._store.list_by_owner(owner, limit=0)
         else:
             # store에 전체 순회 없음 — 알려진 캐시 conversation만 반환
             convs = []
@@ -1701,13 +1713,20 @@ class LLMClient:
                 conv = self._store.find_by_alias(owner, alias)
                 convs = [conv] if conv is not None else []
             else:
-                convs = self._store.list_by_owner(owner, limit=1000)
+                convs = self._store.list_by_owner(owner, limit=0)
 
             rows: list[dict] = []
             for conv in convs:
                 require_auth_scope(conv)
             for conv in convs:
                 keys_to_clear: list[str] = []
+                selected_providers = ({provider} if provider else
+                                      {conv.provider, *self._registry.get_fallback_chain(),
+                                       *_session_providers_from_metadata(conv.metadata)})
+                for pid in selected_providers - {""}:
+                    generation = "session_reset_generation:" + pid
+                    self._store.set_metadata(conv.id, generation,
+                                             conv.metadata.get(generation, 0) + 1)
                 for key, value in conv.metadata.items():
                     if not value:
                         continue

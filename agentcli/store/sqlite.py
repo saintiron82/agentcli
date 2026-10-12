@@ -19,8 +19,10 @@ from pathlib import Path
 import os
 from .base import ConversationStore
 from ..types import Conversation, Message
+from .locking import synchronized_store
 
 
+@synchronized_store
 class SQLiteStore(ConversationStore):
     def __init__(self, db_path: str = ":memory:"):
         self._lock = RLock()
@@ -239,7 +241,7 @@ class SQLiteStore(ConversationStore):
     def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]:
         rows = self._conn.execute(
             "SELECT * FROM conversations WHERE owner=? ORDER BY updated_at DESC LIMIT ?",
-            (owner, limit)).fetchall()
+            (owner, limit if limit > 0 else -1)).fetchall()
         return [self._row_to_conv(r) for r in rows]
 
     def set_metadata(self, conversation_id: str, key: str, value) -> None:
