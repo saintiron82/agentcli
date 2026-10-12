@@ -70,6 +70,16 @@ legacy sessions without a recorded policy must also start fresh. Resume under
 the same recorded policy preserves the native session. An additional regression
 test covers this boundary without model calls.
 
+## Step 5 — SEC-006: safe materialization
+
+Materialization accepts root filenames only and rejects symlinks/junctions below
+the workspace or in skill bundles. Unmanaged destination skills are skipped,
+not deleted. Managed skills use staging plus rename; failed copies leave the
+old skill intact, and failed rollback preserves the backup for manual recovery.
+Instruction ownership requires an exact first-line marker. Source/destination
+checks do not replace OS isolation against concurrent hostile filesystem actors.
+Relevant tests: 62 passed, including a real Windows junction and rollback failure.
+
 ## Remaining work
 
 | ID | Scope | Status |
@@ -78,7 +88,7 @@ test covers this boundary without model calls.
 | SEC-002 | Conversation and injected-context ownership | Fixed, regression tested |
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Fixed, regression tested |
-| SEC-006 | Materialization boundaries and user skill protection | Pending |
+| SEC-006 | Materialization boundaries and user skill protection | Fixed, regression tested |
 | SEC-007 | Explicit Kiro filesystem access policy | Pending |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
 | OPS-001 | Coordination of concurrent session callers | Pending |
