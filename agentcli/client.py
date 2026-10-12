@@ -277,9 +277,16 @@ def _augment_system_prompt_with_schema(system_prompt: str,
 def _accumulate_tokens(total: TokenUsage, add: TokenUsage) -> None:
     """스키마 재시도 전 호출의 usage 를 합산 — 시도 횟수만큼 쓴 토큰이 전부
     기록되어야 usage 회계가 참이다 (#72)."""
-    for f in ("prompt_tokens", "completion_tokens", "total_tokens",
-              "cached_tokens", "cache_creation_tokens"):
-        setattr(total, f, getattr(total, f, 0) + getattr(add, f, 0))
+    total.accumulate(add)
+
+
+def _validate_schema_retries(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("schema_retries must be a nonnegative integer")
+
+
+def _corrected_fallback(original, fallback, current):
+    return fallback if current is original else fallback + current[len(original):]
 
 
 def _schema_correction_messages(messages: list[Message], raw: str,
@@ -793,6 +800,7 @@ class LLMClient:
              validator=None,
              schema_retries: int = 1,
              ) -> LLMResponse:
+        _validate_schema_retries(schema_retries)
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
         self._validate_call_options(provider, "invoke", provider_options)
@@ -826,7 +834,7 @@ class LLMClient:
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
-                    provider, msgs, fallback_messages, model,
+                    provider, msgs, _corrected_fallback(messages, fallback_messages, msgs), model,
                     timeout, session_id, cwd,
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
@@ -1050,6 +1058,7 @@ class LLMClient:
                          validator=None,
                          schema_retries: int = 1,
                          ) -> LLMResponse:
+        _validate_schema_retries(schema_retries)
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
         await complete_in_thread(self._validate_call_options, provider, "invoke_async", provider_options)
@@ -1079,7 +1088,7 @@ class LLMClient:
                                      provider_obj, session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
-                    provider, msgs, fallback_messages, model,
+                    provider, msgs, _corrected_fallback(messages, fallback_messages, msgs), model,
                     timeout, session_id, cwd,
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
