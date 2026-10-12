@@ -126,3 +126,31 @@ installing the feature does not automatically isolate existing services. Migrate
 each service explicitly, test its configured identity, and keep accounts pinned.
 No remote authentication, real credential rotation or paid generation is part of
 the offline tests described here.
+
+## Validation record — 2026-10-12
+
+Code commit: `c6f1f79`; clean tracked-source snapshot: `5072c53`.
+
+- Service authentication tests: **46 passed**, including real fake-CLI child
+  processes for all three supported providers, sync/async/stream concurrency,
+  rotation during a request, disabled/missing credentials, session ownership,
+  quota routing and Windows junction rejection. These are not remote-account tests.
+- Full clean-source Windows suite: **1,066 passed, 39 skipped**. Platform-specific
+  POSIX checks, unavailable optional integrations and symlink privilege checks
+  remain unverified on this host. Linux/macOS CI was not run in this validation.
+- Isolated sdist and wheel builds, `twine check`, zero runtime dependencies,
+  packaged auth modules/tests/docs, paired UTF-8 documentation, local links and
+  Python example syntax checks passed.
+- Installed Claude **2.1.296** and Codex **0.161.0** passed offline `--version`
+  under a private profile with fake tokens. Codex also accepted the file-store
+  config override with `exec --help`. Copilot is not installed on this host.
+- A no-model/no-subprocess fake-provider benchmark of the legacy path measured
+  sync 186–201 µs / async 343–370 µs before this feature and sync 188–192 µs /
+  async 382–393 µs afterward. This small sample includes scheduling noise and is
+  not a model-throughput benchmark or proof of zero performance regression.
+
+No global login, actual account credentials or deployment were changed. No push,
+tag, PyPI upload or paid generation was performed. Build metadata remains 0.7.5
+for branch validation only; the published 0.7.5 does not contain this feature.
+Before rollout, test real account identity and failure/rotation behavior with
+each service's securely provisioned credentials and its installed CLI version.
