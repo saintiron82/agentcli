@@ -59,7 +59,7 @@ DRIFT_INSTRUCTION_FILES = (
 _DRIFT_HASH_CACHE: dict[str, tuple[float, str]] = {}
 
 
-def _compute_instructions_hashes(cwd: str | None) -> dict:
+def _compute_instructions_hashes(cwd: str | None, *, refresh: bool = False) -> dict:
     """cwd의 agent 지시 파일들 해시를 dict로 반환.
 
     (mtime_ns, size) 기반 캐시: 둘 다 이전과 같으면 재해시 스킵 → I/O 0.
@@ -84,7 +84,7 @@ def _compute_instructions_hashes(cwd: str | None) -> dict:
             key = str(f)
             sig = (stat.st_mtime_ns, stat.st_size)
             cached = _DRIFT_HASH_CACHE.get(key)
-            if cached and cached[0] == sig:
+            if not refresh and cached and cached[0] == sig:
                 result[fname] = cached[1]
             else:
                 data = f.read_bytes()
@@ -534,7 +534,8 @@ class LLMClient:
         alias_to_set = alias if alias and not conv.alias else ""
 
         is_session = bool(provider_obj and provider_obj.supports_sessions)
-        instruction_hashes = _compute_instructions_hashes(cwd)
+        instruction_hashes = _compute_instructions_hashes(
+            cwd, refresh=reset_on_instruction_change)
 
         session_id = ""
         prev_messages: list[Message] = []
