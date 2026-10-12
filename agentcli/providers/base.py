@@ -19,6 +19,7 @@ from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 from ..processes import attach_process_job, close_process_job
 from ..deadlines import remaining_timeout, has_budget
 from ..auth_context import service_auth_response
+from ..async_utils import complete_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +473,7 @@ class LLMProvider(ABC):
 
         진짜 async 서브프로세스가 필요한 provider는 이 메서드를 오버라이드.
         """
-        return await asyncio.to_thread(
+        return await complete_in_thread(
             self.invoke, messages,
             model=model, timeout=timeout,
             session_id=session_id, cwd=cwd)

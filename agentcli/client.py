@@ -28,6 +28,7 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
                     standardize_error_chunk)
 from .store.base import ConversationStore
 from .store.locking import reserved_turn, reserve_conversation, session_generation_matches
+from .async_utils import complete_in_thread
 from .coordination import ConversationLease, async_lease
 from .deadlines import request_budget, remaining_timeout, bounded_stream
 from .auth import AuthProfile, AuthProfileError
@@ -327,17 +328,7 @@ def _budget_expired(provider, model):
 
 async def _persist_in_thread(function, *args):
     """Keep the conversation lease until a started store write has finished."""
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-    result = task.result()
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await complete_in_thread(function, *args)
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
@@ -464,6 +455,10 @@ class LLMClient:
 
     def _async_conversation_lock(self, conv_id: str):
         return async_lease(self._sync_conversation_lock(conv_id))
+
+    def _locked_prepare(self, *args):
+        with self._store_lock():
+            return self._prepare(*args)
 
     def _refresh_session_id(self, conv_id: str, provider: str,
                             provider_obj, session_id: str,
@@ -1039,34 +1034,31 @@ class LLMClient:
                          ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
-        self._validate_call_options(provider, "invoke_async", provider_options)
+        await complete_in_thread(self._validate_call_options, provider, "invoke_async", provider_options)
         if output_schema is not None:
             from .schema import assert_supported_schema
             assert_supported_schema(output_schema)
             system_prompt = _augment_system_prompt_with_schema(
                 system_prompt, output_schema)
-        with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model,
-             created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
-                prompt, provider, model, conversation_id, owner,
-                system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd,
-                new_session)
+        (provider, provider_obj, conv, messages, fallback_messages,
+         session_id, model, created_conversation, resolved_alias, alias_to_set,
+         system_prompt_hash, force_new_session) = await complete_in_thread(
+            self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            system_prompt, context_turns, agent, inject_context,
+            strict_model, reset_on_instruction_change, alias, cwd, new_session)
         conversation_id = conv.id
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         async with self._async_conversation_lock(conversation_id):
-            with self._store_lock():
-                (provider, provider_obj, conv, messages, fallback_messages,
-                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
-                 system_prompt_hash, force_new_session) = self._prepare(
-                    prompt, provider, model, conversation_id, owner,
-                    system_prompt, context_turns, agent, inject_context,
-                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
-                created_conversation = created_conversation or refreshed_created
-            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
+            (provider, provider_obj, conv, messages, fallback_messages,
+             session_id, model, refreshed_created, resolved_alias, alias_to_set,
+             system_prompt_hash, force_new_session) = await complete_in_thread(
+                self._locked_prepare, prompt, provider, model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd, new_session)
+            created_conversation = created_conversation or refreshed_created
+            await complete_in_thread(self._check_resume_policy, conversation_id,
+                                     provider_obj, session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
                     provider, msgs, fallback_messages, model,
@@ -1082,8 +1074,8 @@ class LLMClient:
             response.conversation_id = conversation_id
 
             if not response.content:
-                if self._discard_failed_prepare(conversation_id,
-                                                created_conversation):
+                if await complete_in_thread(self._discard_failed_prepare, conversation_id,
+                                            created_conversation):
                     response.conversation_id = ""
                 return response
 
@@ -1222,22 +1214,20 @@ class LLMClient:
         """
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
-        self._validate_call_options(provider, "stream_async", provider_options)
         if wall_timeout is not None and wall_timeout < 0:
             raise ValueError("wall_timeout must be nonnegative")
         deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
-        with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model, created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
-                prompt, provider, model, conversation_id, owner,
-                system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd,
-                new_session)
+        await complete_in_thread(self._validate_call_options, provider, "stream_async", provider_options)
+        (provider, provider_obj, conv, messages, fallback_messages,
+         session_id, model, created_conversation, resolved_alias, alias_to_set,
+         system_prompt_hash, force_new_session) = await complete_in_thread(
+            self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            system_prompt, context_turns, agent, inject_context,
+            strict_model, reset_on_instruction_change, alias, cwd, new_session)
         conversation_id = conv.id
 
         if provider_obj is None:
-            self._discard_failed_prepare(conversation_id, created_conversation)
+            await complete_in_thread(self._discard_failed_prepare, conversation_id, created_conversation)
             yield make_error_chunk(f"unknown provider: {provider}",
                                    provider=provider)
             yield StreamChunk(type="done", content="",
@@ -1248,15 +1238,15 @@ class LLMClient:
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         # 스트림 소비가 끝날 때까지 같은 conversation 의 다른 호출은 대기한다.
         async with self._async_conversation_lock(conversation_id):
-            with self._store_lock():
-                (provider, provider_obj, conv, messages, fallback_messages,
-                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
-                 system_prompt_hash, force_new_session) = self._prepare(
-                    prompt, provider, model, conversation_id, owner,
-                    system_prompt, context_turns, agent, inject_context,
-                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
-                created_conversation = created_conversation or refreshed_created
-            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
+            (provider, provider_obj, conv, messages, fallback_messages,
+             session_id, model, refreshed_created, resolved_alias, alias_to_set,
+             system_prompt_hash, force_new_session) = await complete_in_thread(
+                self._locked_prepare, prompt, provider, model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd, new_session)
+            created_conversation = created_conversation or refreshed_created
+            await complete_in_thread(self._check_resume_policy, conversation_id,
+                                     provider_obj, session_id, provider_options)
             attempts = [
                 (provider, provider_obj, messages, model, session_id,
                  not force_new_session)
@@ -1360,7 +1350,7 @@ class LLMClient:
 
                 if saw_error:
                     if emitted_output:
-                        self._discard_failed_prepare(
+                        await complete_in_thread(self._discard_failed_prepare,
                             conversation_id, created_conversation)
                         yield StreamChunk(
                             type="done", content=full_content,
@@ -1374,7 +1364,7 @@ class LLMClient:
                             "[LLM] %s stream failed before output → fallback",
                             current_id)
                         continue
-                    self._discard_failed_prepare(
+                    await complete_in_thread(self._discard_failed_prepare,
                         conversation_id, created_conversation)
                     if last_error is not None:
                         yield last_error
@@ -1413,7 +1403,7 @@ class LLMClient:
                         current_id)
                     continue
 
-                self._discard_failed_prepare(
+                await complete_in_thread(self._discard_failed_prepare,
                     conversation_id, created_conversation)
                 yield empty_error
                 yield StreamChunk(

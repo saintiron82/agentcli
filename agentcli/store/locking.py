@@ -3,6 +3,7 @@ import contextvars
 import functools
 import inspect
 from contextlib import contextmanager
+from ..async_utils import complete_in_thread
 
 _reservations = contextvars.ContextVar("agentcli_turn_reservations", default=None)
 
@@ -79,7 +80,7 @@ def reserved_turn(function):
                     with _scope(state):
                         await iterator.aclose()
                 finally:
-                    _release(state)
+                    await complete_in_thread(_release, state)
         return streaming
     if inspect.iscoroutinefunction(function):
         @functools.wraps(function)
@@ -89,7 +90,7 @@ def reserved_turn(function):
                 with _scope(state):
                     return await function(self, *args, **kwargs)
             finally:
-                _release(state)
+                await complete_in_thread(_release, state)
         return asynchronous
     @functools.wraps(function)
     def synchronous(self, *args, **kwargs):
