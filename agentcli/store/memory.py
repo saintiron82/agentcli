@@ -138,7 +138,10 @@ class MemoryStore(ConversationStore):
         result = [c for c in self._conversations.values()
                   if c.owner == owner and not self._is_expired(c)]
         result.sort(key=lambda c: c.updated_at, reverse=True)
-        return result[:limit] if limit > 0 else result
+        return result[:limit]
+
+    def list_all_by_owner(self, owner: str) -> list[Conversation]:
+        return self.list_by_owner(owner, limit=len(self._conversations))
 
     def pin(self, conversation_id: str) -> None:
         self._pins[conversation_id] = self._pins.get(conversation_id, 0) + 1

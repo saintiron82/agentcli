@@ -282,8 +282,13 @@ class SQLiteStore(ConversationStore):
     def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]:
         rows = self._conn.execute(
             "SELECT * FROM conversations WHERE owner=? ORDER BY updated_at DESC LIMIT ?",
-            (owner, limit if limit > 0 else -1)).fetchall()
+            (owner, limit)).fetchall()
         return [self._row_to_conv(r) for r in rows]
+
+    def list_all_by_owner(self, owner: str) -> list[Conversation]:
+        rows = self._conn.execute(
+            "SELECT * FROM conversations WHERE owner=? ORDER BY updated_at DESC", (owner,)).fetchall()
+        return [self._row_to_conv(row) for row in rows]
 
     def set_metadata(self, conversation_id: str, key: str, value) -> None:
         row = self._conn.execute(

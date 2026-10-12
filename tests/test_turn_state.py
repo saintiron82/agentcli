@@ -118,7 +118,7 @@ def test_clear_all_is_not_truncated(tmp_path, sqlite):
         conv = store.create("o", "gate", alias=str(index))
         store.set_metadata(conv.id, "session_id:gate", "fake")
     assert len(client.clear_session_metadata(owner="o")) == 1200
-    assert all(not c.metadata["session_id:gate"] for c in store.list_by_owner("o", limit=0))
+    assert all(not c.metadata["session_id:gate"] for c in store.list_all_by_owner("o"))
     if sqlite: store.close()
 
 
@@ -134,6 +134,15 @@ def test_stats_and_create_are_intrinsically_synchronized():
         futures = [pool.submit(write), pool.submit(read)]
         for future in futures: future.result(timeout=10)
     assert store.get_token_stats(days=0)["total_calls"] == 500
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+def test_zero_list_limit_preserves_existing_behavior(sqlite):
+    store = SQLiteStore() if sqlite else MemoryStore()
+    store.create("o", "gate")
+    assert store.list_by_owner("o", limit=0) == []
+    assert len(store.list_all_by_owner("o")) == 1
+    if sqlite: store.close()
 
 
 @pytest.mark.parametrize("sqlite", [False, True])

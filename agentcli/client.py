@@ -1651,7 +1651,7 @@ class LLMClient:
         # owner 없을 때는 각 provider 세션 목록을 쓸 수 없음. 현재 API로는
         # list_by_owner를 owner별로 돌려야 함.
         if owner:
-            convs = self._store.list_by_owner(owner, limit=0)
+            convs = self._store.list_all_by_owner(owner)
         else:
             # store에 전체 순회 없음 — 알려진 캐시 conversation만 반환
             convs = []
@@ -1729,7 +1729,7 @@ class LLMClient:
                 conv = self._store.find_by_alias(owner, alias)
                 convs = [conv] if conv is not None else []
             else:
-                convs = self._store.list_by_owner(owner, limit=0)
+                convs = self._store.list_all_by_owner(owner)
 
             rows: list[dict] = []
             for conv in convs:
