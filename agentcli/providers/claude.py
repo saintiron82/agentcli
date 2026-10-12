@@ -14,6 +14,8 @@ import time
 import uuid
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from ..auth import AuthProfileError
+from ..auth_context import current_auth_profile, configured_health
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
@@ -367,6 +369,11 @@ class ClaudeProvider(LLMProvider):
           나타나지 않는다.
         원본 ``os.environ`` 은 변경하지 않는다.
         """
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or self._oauth_token is not None:
+                raise AuthProfileError("Service auth cannot be overridden by provider OAuth credentials")
+            return profile.environment("claude")
         token = self._resolve_oauth_token(oauth_token)
         extra: dict = {}
         if NONESSENTIAL_TRAFFIC_ENV_VAR not in os.environ:
@@ -385,6 +392,16 @@ class ClaudeProvider(LLMProvider):
                           oauth_token: str | None = None,
                           credentials_path: str | None = None) -> AccountUsage:
         from ..account_usage import claude_account_usage
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or credentials_path is not None or self._oauth_token is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            profile.validate("claude")
+            if profile.claude_api_key is not None:
+                return AccountUsage(provider="claude", status="unsupported_auth",
+                                    message="API-key billing usage is not supported")
+            return claude_account_usage(token=profile.claude_token(), timeout=timeout,
+                                        allow_probe=allow_probe)
         if oauth_token is not None and credentials_path is not None:
             raise ValueError("Choose oauth_token or credentials_path, not both.")
         token = None if credentials_path is not None else self._resolve_oauth_token(oauth_token)
@@ -406,7 +423,9 @@ class ClaudeProvider(LLMProvider):
             return False if session_id else None
         base = os.path.realpath(cwd if cwd is not None else os.getcwd())
         encoded = re.sub(r"[^a-zA-Z0-9]", "-", base)
-        path = (pathlib.Path.home() / ".claude" / "projects"
+        profile = current_auth_profile()
+        root = profile.directory("claude") if profile else pathlib.Path.home() / ".claude"
+        path = (root / "projects"
                 / encoded / f"{session_id}.jsonl")
         return path.exists()
 
@@ -421,8 +440,16 @@ class ClaudeProvider(LLMProvider):
                 error_type=ERROR_BINARY_MISSING,
                 message="Claude CLI not found")
 
-        version_proc = run_health_command([bin_path, "--version"], timeout=timeout)
+        profile = current_auth_profile()
+        auth_env = self._spawn_env(None) if profile else None
+        version_proc = run_health_command([bin_path, "--version"], timeout=timeout, env=auth_env)
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if profile is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
         auth_proc = run_health_command(
             [bin_path, "auth", "status"], timeout=timeout, cwd=cwd)
         auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()

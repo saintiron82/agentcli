@@ -16,6 +16,8 @@ from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
 from .base import _drain_stderr, _kill_process_group, _new_session_kwargs
 from ..processes import attach_process_job
+from ..auth_context import current_auth_profile, provider_environment
+from ..auth import AuthProfileError
 from ..filesystem import safe_workspace_path
 
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
@@ -178,7 +180,7 @@ class KiroProvider(LLMProvider):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd, env=build_env(), limit=8 * 1024 * 1024,
+                    cwd=cwd, env=provider_environment("kiro", build_env), limit=8 * 1024 * 1024,
                     **_new_session_kwargs())
                 attach_process_job(proc)
                 proc_box["proc"] = proc
@@ -225,6 +227,8 @@ class KiroProvider(LLMProvider):
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,
                      probe: bool = False) -> ProviderHealth:
+        if current_auth_profile() is not None:
+            raise AuthProfileError("Kiro service auth profiles are not supported")
         bin_path = shutil.which("kiro-cli")
         if not bin_path:
             return ProviderHealth(

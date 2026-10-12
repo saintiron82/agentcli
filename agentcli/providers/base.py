@@ -18,6 +18,7 @@ from ..utils import serialize_messages
 from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 from ..processes import attach_process_job, close_process_job
 from ..deadlines import remaining_timeout, has_budget
+from ..auth_context import service_auth_response
 
 logger = logging.getLogger(__name__)
 
@@ -1102,6 +1103,7 @@ def run_health_command(cmd: list[str], *, timeout: int = 10,
 
 def health_from_response(provider: str, resp: LLMResponse,
                          *, binary: str = "", version: str = "") -> ProviderHealth:
+    resp = service_auth_response(resp)
     if resp.content:
         return ProviderHealth(
             provider=provider, ok=True, status="ok", available=True,

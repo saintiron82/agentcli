@@ -21,6 +21,8 @@ import subprocess
 import time
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from ..auth import AuthProfileError
+from ..auth_context import current_auth_profile, provider_environment, configured_health
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
@@ -130,7 +132,7 @@ def _codex_run_kwargs(prompt: str, use_stdin: bool, *,
     지정한다(동기 경로만 다른 동작을 하지 않도록).
     """
     kwargs: dict = dict(capture_output=True, text=True, timeout=timeout,
-                        env=build_env(), cwd=cwd,
+                        env=provider_environment("codex", build_env), cwd=cwd,
                         encoding="utf-8", errors="replace")
     if use_stdin:
         kwargs["input"] = prompt
@@ -207,7 +209,8 @@ class CodexProvider(LLMProvider):
         """
         if not session_id:
             return None
-        root = pathlib.Path.home() / ".codex" / "sessions"
+        profile = current_auth_profile()
+        root = (profile.directory("codex") if profile else pathlib.Path.home() / ".codex") / "sessions"
         if not root.exists():
             return False
         # session_id 의 glob 메타문자(*,?,[)를 escape — 안 하면 '*' 가 아무 파일
@@ -219,6 +222,15 @@ class CodexProvider(LLMProvider):
                           oauth_token: str | None = None,
                           credentials_path: str | None = None) -> AccountUsage:
         from ..account_usage import codex_account_usage
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or credentials_path is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            profile.validate("codex")
+            if profile.codex_api_key is not None:
+                return AccountUsage(provider="codex", status="unsupported_auth",
+                                    message="API-key billing usage is not supported")
+            credentials_path = str(profile.directory("codex") / "auth.json")
         if oauth_token is not None:
             raise ValueError("Codex usage requires auth.json; use credentials_path.")
         return codex_account_usage(credentials_path=credentials_path, timeout=timeout)
@@ -234,11 +246,18 @@ class CodexProvider(LLMProvider):
                 error_type=ERROR_BINARY_MISSING,
                 message="codex CLI not found")
 
-        version_proc = run_health_command([bin_path, "--version"], timeout=timeout)
+        auth_env = provider_environment("codex", build_env)
+        version_proc = run_health_command([bin_path, "--version"], timeout=timeout, env=auth_env)
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if current_auth_profile() is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
         auth_proc = run_health_command(
             [bin_path, "login", "status"], timeout=timeout, cwd=cwd,
-            env=build_env())
+            env=provider_environment("codex", build_env))
         auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
         if auth_proc.returncode == 124:
             return ProviderHealth(
@@ -309,6 +328,8 @@ class CodexProvider(LLMProvider):
             mcp_args += ["-c", f"mcp_servers.{name}={_toml_inline(cfg)}"]
         prompt_arg = "-" if prompt_via_stdin else prompt
         cmd = [bin_path, "exec"]
+        if current_auth_profile() is not None:
+            cmd += ["-c", 'cli_auth_credentials_store="file"']
         if session_id:
             cmd += ["resume", "--json"]
             if self._skip_git:
@@ -535,7 +556,7 @@ class CodexProvider(LLMProvider):
             # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
             # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd, env=build_env(),
+                cmd, timeout=timeout, cwd=cwd, env=provider_environment("codex", build_env),
                 use_stdin_devnull=not use_stdin,
                 input_bytes=prompt_bytes if use_stdin else None)
         except FileNotFoundError:
@@ -666,7 +687,7 @@ class CodexProvider(LLMProvider):
             async for chunk in self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=build_env(), debug=debug, debug_log_path=debug_log_path,
+                    env=provider_environment("codex", build_env), debug=debug, debug_log_path=debug_log_path,
                     input_bytes=prompt_bytes if use_stdin else None):
                 if (attempt_sid and not emitted
                         and chunk.type == "error"

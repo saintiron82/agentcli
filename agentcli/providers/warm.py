@@ -72,6 +72,8 @@ from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
 from .base import _kill_process_group, _new_session_kwargs
 from ..processes import attach_process_job
+from ..auth import AuthProfile, AuthProfileError
+from ..auth_context import auth_scope
 
 from ..types import StreamChunk
 from .claude import NONESSENTIAL_TRAFFIC_ENV_VAR
@@ -410,6 +412,7 @@ async def open_warm(*, lean: bool = True,
                     resume_session_id: str = "",
                     cwd: str | None = None,
                     env: dict | None = None,
+                    auth_profile: AuthProfile | None = None,
                     binary: str | None = None,
                     turn_timeout: float = 300.0,
                     stream_limit: int = _DEFAULT_STREAM_LIMIT) -> WarmSession:
@@ -435,6 +438,15 @@ async def open_warm(*, lean: bool = True,
     Raises:
         WarmSessionError: claude CLI 를 찾지 못하면.
     """
+    if auth_profile is not None:
+        if env is not None:
+            raise AuthProfileError("Warm service auth cannot be combined with a custom environment")
+        env = auth_profile.environment("claude")
+        if resume_session_id:
+            from .claude import ClaudeProvider
+            with auth_scope(auth_profile):
+                if not ClaudeProvider().session_alive(resume_session_id, cwd=cwd):
+                    raise AuthProfileError("Warm resume history is unavailable in this service profile")
     resolved = binary or _find_claude()
     if not resolved:
         raise WarmSessionError("claude CLI not found on PATH")

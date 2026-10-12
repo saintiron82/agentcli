@@ -22,6 +22,7 @@ import subprocess
 import time
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from ..auth_context import current_auth_profile, provider_environment, configured_health
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
                    emit_invoke_debug, health_from_response, run_health_command,
@@ -120,13 +121,20 @@ class CopilotProvider(LLMProvider):
                 message="Copilot CLI or gh CLI not found")
 
         version_cmd = [bin_path, "copilot", "version"] if use_gh else [bin_path, "version"]
-        version_proc = run_health_command(version_cmd, timeout=timeout)
+        version_proc = run_health_command(version_cmd, timeout=timeout,
+                                          env=provider_environment("copilot", build_env))
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if current_auth_profile() is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
 
         if use_gh:
             auth_proc = run_health_command(
                 [bin_path, "auth", "status"], timeout=timeout, cwd=cwd,
-                env=build_env())
+                env=provider_environment("copilot", build_env))
             auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
             if auth_proc.returncode != 0:
                 return ProviderHealth(
@@ -261,7 +269,7 @@ class CopilotProvider(LLMProvider):
         try:
             result = run_owned_command(
                 cmd, capture_output=True, text=True, timeout=timeout,
-                stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
+                stdin=subprocess.DEVNULL, env=provider_environment("copilot", build_env), cwd=cwd)
             latency = int((time.time() - start) * 1000)
             if debug:
                 emit_invoke_debug("copilot", cmd, result.returncode, latency,
@@ -351,7 +359,7 @@ class CopilotProvider(LLMProvider):
         try:
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
                 cmd, timeout=timeout, cwd=cwd,
-                env=build_env(), use_stdin_devnull=True)
+                env=provider_environment("copilot", build_env), use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -460,7 +468,7 @@ class CopilotProvider(LLMProvider):
         async for chunk in self._run_stream_template(
                 cmd, state, model=model, cwd=cwd, timeout=timeout,
                 idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                env=build_env(), debug=debug, debug_log_path=debug_log_path):
+                env=provider_environment("copilot", build_env), debug=debug, debug_log_path=debug_log_path):
             yield chunk
 
     async def _dispatch_stream_event(self, evt: dict,

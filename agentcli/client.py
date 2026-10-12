@@ -29,6 +29,10 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
 from .store.base import ConversationStore
 from .coordination import ConversationLease, async_lease
 from .deadlines import request_budget, remaining_timeout, bounded_stream
+from .auth import AuthProfile, AuthProfileError
+from .auth_context import (AUTH_SCOPE_KEY, auth_scoped, current_auth_profile,
+                           require_auth_scope, require_auth_method, validate_auth_options,
+                           service_auth_response, SERVICE_AUTH_ACTION)
 from .providers.registry import ProviderRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
@@ -44,6 +48,7 @@ def _workspace_root(cwd: str | None) -> str:
 
 
 def _require_conversation_scope(conv, owner: str, cwd: str | None):
+    require_auth_scope(conv)
     if conv.owner != owner:
         raise PermissionError("Conversation does not belong to the supplied owner")
     bound = conv.metadata.get(WORKSPACE_KEY)
@@ -288,6 +293,11 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        effort=None, thinking=None,
                        provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke", provider_options)
+    try:
+        validate_auth_options(provider_obj.provider_id, provider_options)
+    except AuthProfileError as exc:
+        return service_auth_response(LLMResponse("", provider_obj.provider_id, model,
+                                                error=str(exc), error_type="auth"))
     timeout = remaining_timeout(timeout)
     if timeout <= 0:
         return _budget_expired(provider_obj.provider_id, model)
@@ -306,7 +316,7 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
         expired = _budget_expired(provider_obj.provider_id, model)
         expired.tokens, expired.raw_content = result.tokens, result.content
         return expired
-    return result
+    return service_auth_response(result)
 
 
 def _budget_expired(provider, model):
@@ -335,6 +345,11 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     effort=None, thinking=None,
                                     provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke_async", provider_options)
+    try:
+        validate_auth_options(provider_obj.provider_id, provider_options)
+    except AuthProfileError as exc:
+        return service_auth_response(LLMResponse("", provider_obj.provider_id, model,
+                                                error=str(exc), error_type="auth"))
     timeout = remaining_timeout(timeout)
     if timeout <= 0:
         return _budget_expired(provider_obj.provider_id, model)
@@ -351,9 +366,9 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
     try:
         # No budget: retain provider-native timeout behavior.
         if remaining_timeout(float("inf")) == float("inf"):
-            return await provider_obj.invoke_async(messages, **kwargs)
-        return await asyncio.wait_for(provider_obj.invoke_async(messages, **kwargs),
-                                      remaining_timeout(float("inf")))
+            return service_auth_response(await provider_obj.invoke_async(messages, **kwargs))
+        return service_auth_response(await asyncio.wait_for(
+            provider_obj.invoke_async(messages, **kwargs), remaining_timeout(float("inf"))))
     except asyncio.TimeoutError:
         return _budget_expired(provider_obj.provider_id, model)
 
@@ -364,6 +379,7 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         effort=None, thinking=None,
                         provider_options=None, native_namespace="", deadline=None):
     _validate_provider_options(provider_obj, "stream_async", provider_options)
+    validate_auth_options(provider_obj.provider_id, provider_options)
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -383,11 +399,15 @@ class LLMClient:
     def __init__(self, store: ConversationStore,
                  registry: ProviderRegistry | None = None,
                  fallback_order: list[str] | None = None,
-                 *, context_authorizer=None, session_lock_factory=None):
+                 *, context_authorizer=None, session_lock_factory=None,
+                 auth_profile: AuthProfile | None = None):
         self._store = store
         self._registry = registry or create_default_registry()
         self._context_authorizer = context_authorizer
         self._session_lock_factory = session_lock_factory
+        if auth_profile is not None and not isinstance(auth_profile, AuthProfile):
+            raise TypeError("auth_profile must be an AuthProfile")
+        self._auth_profile = auth_profile
         if fallback_order:
             self._registry.set_fallback_order(fallback_order)
 
@@ -395,14 +415,36 @@ class LLMClient:
         lock = getattr(self._store, "_lock", None)
         return lock if lock is not None else nullcontext()
 
+    @property
+    def auth_profile(self) -> AuthProfile | None:
+        """Immutable service profile; use public_dict() for non-secret identity."""
+        return self._auth_profile
+
+    def set_auth_profile(self, profile: AuthProfile):
+        """Rotate this client's credentials; in-flight calls retain their snapshot.
+
+        Account/root changes require a different profile/client and conversation.
+        The host must ensure a rotation still belongs to the same account.
+        """
+        if not isinstance(profile, AuthProfile):
+            raise TypeError("profile must be an AuthProfile")
+        if self._auth_profile is None or profile.binding != self._auth_profile.binding:
+            raise AuthProfileError("Rotation must preserve the service profile identity and root")
+        if any(profile.method(pid) != self._auth_profile.method(pid)
+               for pid in ("claude", "codex", "copilot")):
+            raise AuthProfileError("Rotation cannot change authentication methods")
+        profile._check_marker()
+        self._auth_profile = profile
+
     def _validate_call_options(self, provider: str, method: str, options):
-        if not options:
-            return
         if not provider:
             chain = self._registry.get_fallback_chain()
             provider = chain[0] if chain else ""
         selected = self._registry.get(provider)
         if selected is not None:
+            validate_auth_options(provider, options)
+            if current_auth_profile() is not None and getattr(selected, "_oauth_token", None) is not None:
+                raise AuthProfileError("Provider credentials conflict with the service auth profile")
             _validate_provider_options(selected, method, options)
 
     def _sync_conversation_lock(self, conv_id: str):
@@ -530,7 +572,11 @@ class LLMClient:
                                        alias=alias)
             created_conversation = alias_existing is None
             _require_conversation_scope(conv, owner, cwd)
+            profile = current_auth_profile()
+            if profile is not None:
+                self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
         resolved_alias = conv.alias or alias
+        require_auth_method(conv, provider)
         alias_to_set = alias if alias and not conv.alias else ""
 
         is_session = bool(provider_obj and provider_obj.supports_sessions)
@@ -621,6 +667,11 @@ class LLMClient:
                          alias: str, alias_to_set: str = "",
                          system_prompt_hash: str = "", provider_options=None) -> None:
         with self._store_lock():
+            profile = current_auth_profile()
+            if profile is not None:
+                self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
+                self._store.set_metadata(conv.id, "service_auth_method:" + response.provider,
+                                         profile.method(response.provider))
             if not conv.metadata.get(WORKSPACE_KEY):
                 self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
             if alias_to_set:
@@ -696,6 +747,7 @@ class LLMClient:
 
     # ---------- 동기 chat ----------
 
+    @auth_scoped
     @request_budget
     def chat(self, prompt: str, *,
              provider: str = "", model: str = "",
@@ -951,6 +1003,7 @@ class LLMClient:
 
     # ---------- 비동기 chat ----------
 
+    @auth_scoped
     @request_budget
     async def chat_async(self, prompt: str, *,
                          provider: str = "", model: str = "",
@@ -1125,6 +1178,7 @@ class LLMClient:
                 "검증·교정 재시도는 완결 응답 전제. chat/chat_async 를 쓴다.")
         return self._chat_stream_impl(prompt, **kwargs)
 
+    @auth_scoped
     async def _chat_stream_impl(self, prompt: str, *,
                                 provider: str = "", model: str = "",
                                 conversation_id: str = "", owner: str = "",
@@ -1252,6 +1306,8 @@ class LLMClient:
                             saw_error = True
                             err_chunk = standardize_error_chunk(
                                 raw_chunk, provider=current_id)
+                            if current_auth_profile() is not None and err_chunk.data.get("error_type") == "auth":
+                                err_chunk.data["suggested_action"] = SERVICE_AUTH_ACTION
                             if policy_blocked:
                                 err_chunk.data["fallback_blocked"] = True
                             last_error = err_chunk
@@ -1376,6 +1432,7 @@ class LLMClient:
         """`resolve_model()`의 의미가 드러나는 별칭."""
         return self.resolve_model(provider, model, strict=strict)
 
+    @auth_scoped
     def health_check(self, provider: str = "", *,
                      timeout: int = 10,
                      cwd: str | None = None,
@@ -1387,6 +1444,15 @@ class LLMClient:
         commands where available. `probe=True` performs a minimal model call to
         catch quota/usage-limit failures before production work starts.
         """
+        def check(p):
+            try:
+                validate_auth_options(p.provider_id)
+                return p.health_check(timeout=timeout, cwd=cwd, probe=probe)
+            except AuthProfileError as exc:
+                return ProviderHealth(provider=p.provider_id, ok=False, status="auth_required",
+                                      available=p.is_available(), auth_ok=False,
+                                      error_type="auth", message=str(exc),
+                                      suggested_action=SERVICE_AUTH_ACTION)
         if provider:
             p = self._registry.get(provider)
             if p is None:
@@ -1394,17 +1460,17 @@ class LLMClient:
                     provider=provider, ok=False, status="unknown_provider",
                     message=f"unknown provider: {provider}",
                     suggested_action="Register the provider before calling health_check().")
-            return p.health_check(timeout=timeout, cwd=cwd, probe=probe)
+            return check(p)
 
         result: dict[str, ProviderHealth] = {}
         for row in self._registry.list_providers():
             pid = row["id"]
             p = self._registry.get(pid)
             if p:
-                result[pid] = p.health_check(
-                    timeout=timeout, cwd=cwd, probe=probe)
+                result[pid] = check(p)
         return result
 
+    @auth_scoped
     def get_account_usage(self, provider: str, *, timeout: float = 15,
                           allow_probe: bool = False,
                           oauth_token: str | None = None,
@@ -1421,10 +1487,15 @@ class LLMClient:
         if p is None:
             return AccountUsage(provider=provider, status="unknown_provider",
                                 message="Register the provider before querying account usage.")
+        if current_auth_profile() is not None:
+            if oauth_token is not None or credentials_path is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            validate_auth_options(provider)
         return p.get_account_usage(timeout=timeout, allow_probe=allow_probe,
                                    oauth_token=oauth_token,
                                    credentials_path=credentials_path)
 
+    @auth_scoped
     async def get_account_usage_async(self, provider: str, *, timeout: float = 15,
                                       allow_probe: bool = False,
                                       oauth_token: str | None = None,
@@ -1435,6 +1506,7 @@ class LLMClient:
             allow_probe=allow_probe, oauth_token=oauth_token,
             credentials_path=credentials_path)
 
+    @auth_scoped
     def session_alive(self, provider: str, *, owner: str = "",
                       alias: str = "", conversation_id: str = "",
                       cwd: str | None = None) -> bool | None:
@@ -1572,6 +1644,7 @@ class LLMClient:
             })
         return rows
 
+    @auth_scoped
     def get_alias_status(self, owner: str, alias: str,
                          cwd: str | None = None) -> dict:
         """Return UI-ready session/instruction status for one alias."""
@@ -1592,6 +1665,7 @@ class LLMClient:
                 "updated_at": "",
             }
 
+        require_auth_scope(conv)
         stored_hashes = dict(conv.metadata.get(DRIFT_KEY, {}) or {})
         if current_hashes and stored_hashes:
             status = "fresh" if current_hashes == stored_hashes else "stale"
@@ -1612,6 +1686,7 @@ class LLMClient:
             "updated_at": conv.updated_at.isoformat(),
         }
 
+    @auth_scoped
     def clear_session_metadata(self, *, owner: str,
                                alias: str = "",
                                provider: str = "") -> list[dict]:
@@ -1629,6 +1704,8 @@ class LLMClient:
                 convs = self._store.list_by_owner(owner, limit=1000)
 
             rows: list[dict] = []
+            for conv in convs:
+                require_auth_scope(conv)
             for conv in convs:
                 keys_to_clear: list[str] = []
                 for key, value in conv.metadata.items():
