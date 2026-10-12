@@ -19,6 +19,9 @@ import logging
 import os
 import time
 import uuid
+import stat as stat_module
+import threading
+from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -64,7 +67,9 @@ DRIFT_INSTRUCTION_FILES = (
 
 # mtime 기반 해시 캐시 — 파일이 변경되지 않으면 재해시하지 않음.
 # {파일 절대경로: (mtime, hash16)}
-_DRIFT_HASH_CACHE: dict[str, tuple[float, str]] = {}
+_DRIFT_HASH_CACHE: OrderedDict[str, tuple[tuple[int, int], str]] = OrderedDict()
+_DRIFT_CACHE_LOCK = threading.Lock()
+_DRIFT_CACHE_LIMIT = 1024
 
 
 def _compute_instructions_hashes(cwd: str | None, *, refresh: bool = False) -> dict:
@@ -85,22 +90,33 @@ def _compute_instructions_hashes(cwd: str | None, *, refresh: bool = False) -> d
     result = {}
     for fname in DRIFT_INSTRUCTION_FILES:
         f = base / fname
-        if not f.exists() or not f.is_file():
-            continue
         try:
             stat = f.stat()
-            key = str(f)
+            if not stat_module.S_ISREG(stat.st_mode):
+                continue
+            key = str(f.absolute())
             sig = (stat.st_mtime_ns, stat.st_size)
-            cached = _DRIFT_HASH_CACHE.get(key)
+            with _DRIFT_CACHE_LOCK:
+                cached = _DRIFT_HASH_CACHE.get(key)
+                if cached is not None:
+                    _DRIFT_HASH_CACHE.move_to_end(key)
             if not refresh and cached and cached[0] == sig:
                 result[fname] = cached[1]
             else:
-                data = f.read_bytes()
-                h = hashlib.sha256(data).hexdigest()[:16]
-                _DRIFT_HASH_CACHE[key] = (sig, h)
+                digest = hashlib.sha256()
+                with f.open("rb") as source:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        digest.update(chunk)
+                h = digest.hexdigest()[:16]
+                with _DRIFT_CACHE_LOCK:
+                    _DRIFT_HASH_CACHE[key] = (sig, h)
+                    _DRIFT_HASH_CACHE.move_to_end(key)
+                    while len(_DRIFT_HASH_CACHE) > _DRIFT_CACHE_LIMIT:
+                        _DRIFT_HASH_CACHE.popitem(last=False)
                 result[fname] = h
         except OSError:
-            pass
+            with _DRIFT_CACHE_LOCK:
+                _DRIFT_HASH_CACHE.pop(str(f.absolute()), None)
     return result
 
 
@@ -489,9 +505,7 @@ class LLMClient:
         if not cwd:
             return
         new_hashes = _compute_instructions_hashes(cwd)
-        if not new_hashes:
-            return
-        prev = conv.metadata.get(DRIFT_KEY, {}) or {}
+        prev = conv.metadata.get(DRIFT_KEY)
         if prev and prev != new_hashes:
             diffs = {}
             for k in set(prev) | set(new_hashes):
@@ -609,12 +623,13 @@ class LLMClient:
         force_new_session = False
         if is_session and reset_on_instruction_change and session_id:
             prev_instruction_hashes = conv.metadata.get(DRIFT_KEY, {}) or {}
-            if (instruction_hashes and prev_instruction_hashes
+            if (DRIFT_KEY in conv.metadata
                     and instruction_hashes != prev_instruction_hashes):
                 force_new_session = True
             prev_system_hash = conv.metadata.get(
                 SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider), "")
-            if system_prompt_hash and prev_system_hash and prev_system_hash != system_prompt_hash:
+            if (SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider) in conv.metadata
+                    and prev_system_hash != system_prompt_hash):
                 force_new_session = True
             if force_new_session:
                 session_id = ""
@@ -663,7 +678,8 @@ class LLMClient:
     def _persist_success(self, conv, cwd: str | None, prompt: str,
                          response: LLMResponse, agent: str,
                          alias: str, alias_to_set: str = "",
-                         system_prompt_hash: str = "", provider_options=None) -> None:
+                         system_prompt_hash: str = "", provider_options=None,
+                         force_new_session: bool = False) -> None:
         with self._store_lock():
             current = self._store.get(conv.id)
             if current is None:
@@ -690,8 +706,9 @@ class LLMClient:
             policy = _codex_policy(response_provider, provider_options)
             if policy is not None:
                 self._store.set_metadata(conv.id, "codex_execution_policy", policy)
-            if (system_prompt_hash and response_provider
-                    and response_provider.supports_sessions):
+            system_key = SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=response.provider)
+            if (response_provider and response_provider.supports_sessions
+                    and (system_prompt_hash or force_new_session or system_key not in conv.metadata)):
                 self._store.set_metadata(
                     conv.id,
                     SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=response.provider),
@@ -829,7 +846,7 @@ class LLMClient:
 
             self._persist_success(conv, cwd, prompt, response, agent,
                                   resolved_alias, alias_to_set,
-                                  system_prompt_hash, provider_options)
+                                  system_prompt_hash, provider_options, force_new_session)
             return response
 
     @staticmethod
@@ -1083,7 +1100,7 @@ class LLMClient:
             # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
             await _persist_in_thread(self._persist_success, conv, cwd, prompt,
                                     response, agent, resolved_alias,
-                                    alias_to_set, system_prompt_hash, provider_options)
+                                    alias_to_set, system_prompt_hash, provider_options, force_new_session)
             return response
 
     async def _invoke_async_with_fallback(self, provider_id: str,
@@ -1393,7 +1410,7 @@ class LLMClient:
                     await _persist_in_thread(
                         self._persist_success, conv, cwd, prompt, synthetic,
                         agent, resolved_alias, alias_to_set,
-                        system_prompt_hash, provider_options)
+                        system_prompt_hash, provider_options, force_new_session)
 
                     yield StreamChunk(
                         type="done", content=full_content,
@@ -1686,7 +1703,7 @@ class LLMClient:
 
         require_auth_scope(conv)
         stored_hashes = dict(conv.metadata.get(DRIFT_KEY, {}) or {})
-        if current_hashes and stored_hashes:
+        if cwd and DRIFT_KEY in conv.metadata:
             status = "fresh" if current_hashes == stored_hashes else "stale"
         else:
             status = "unknown"
