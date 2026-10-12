@@ -67,10 +67,16 @@ class AcpConnection:
 
     async def _dispatch_request(self, msg: dict) -> None:
         result: dict = {}
-        if self._on_request is not None:
-            result = await self._on_request(msg["method"], msg.get("params") or {})
-        await self._write_line(json.dumps(
-            {"jsonrpc": "2.0", "id": msg["id"], "result": result}))
+        try:
+            if self._on_request is not None:
+                result = await self._on_request(msg["method"], msg.get("params") or {})
+        except PermissionError:
+            reply = {"error": {"code": -32001, "message": "File access denied"}}
+        except Exception:
+            reply = {"error": {"code": -32603, "message": "Client request failed"}}
+        else:
+            reply = {"result": result}
+        await self._write_line(json.dumps({"jsonrpc": "2.0", "id": msg["id"], **reply}))
 
     def _resolve(self, msg: dict) -> None:
         fut = self._pending.pop(msg.get("id"), None)

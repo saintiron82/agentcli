@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from ..filesystem import safe_workspace_path
 
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
 from ._acp import AcpConnection, AcpError
@@ -42,7 +43,10 @@ class KiroProvider(LLMProvider):
 
     def __init__(self, *, trust_all: bool = True,
                  trust_tools: list[str] | None = None,
-                 model: str = "", agent: str = ""):
+                 model: str = "", agent: str = "",
+                 allow_file_reads: bool = True,
+                 allow_file_writes: bool | None = None,
+                 max_file_bytes: int = 1024 * 1024):
         """
         Args:
             trust_all: session/request_permission 을 전부 자동 승인 (dev 기본).
@@ -55,6 +59,11 @@ class KiroProvider(LLMProvider):
         """
         self._trust_all = trust_all
         self._trust_tools = set(trust_tools or [])
+        self._allow_file_reads = allow_file_reads
+        self._allow_file_writes = trust_all if allow_file_writes is None else allow_file_writes
+        if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or max_file_bytes <= 0:
+            raise ValueError("max_file_bytes must be a positive integer")
+        self._max_file_bytes = max_file_bytes
         self._model = model
         self._agent = agent
 
@@ -248,7 +257,8 @@ class KiroProvider(LLMProvider):
                 await conn.request("initialize", {
                     "protocolVersion": _PROTOCOL_VERSION,
                     "clientCapabilities": {
-                        "fs": {"readTextFile": True, "writeTextFile": True},
+                        "fs": {"readTextFile": self._allow_file_reads,
+                               "writeTextFile": self._allow_file_writes},
                         "terminal": False},
                     "clientInfo": {"name": "agentcli", "version": "0"}})
                 if session_id:
@@ -374,30 +384,49 @@ class KiroProvider(LLMProvider):
             return None
         try:
             root = Path(cwd).resolve()
-            target = Path(path).resolve()
-            target.relative_to(root)  # cwd 밖이면 ValueError
-            return target
+            target = Path(path)
+            return safe_workspace_path(root, target if target.is_absolute() else root / target)
         except (ValueError, OSError):
             return None
 
     def _fs_read(self, params: dict, cwd: str | None) -> dict:
+        if not self._allow_file_reads:
+            raise PermissionError("File reads are disabled")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None or not target.is_file():
-            logger.warning("kiro fs/read 거부: %s", params.get("path"))
+            logger.warning("kiro fs/read 거부")
             return {"content": ""}
         try:
-            return {"content": target.read_text(encoding="utf-8", errors="replace")}
+            with target.open("rb") as source:
+                data = source.read(self._max_file_bytes + 1)
+            if len(data) > self._max_file_bytes:
+                raise ValueError("File exceeds max_file_bytes")
+            text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            line, limit = params.get("line", 1), params.get("limit")
+            if (isinstance(line, bool) or not isinstance(line, int) or line < 1
+                    or (limit is not None and (isinstance(limit, bool)
+                        or not isinstance(limit, int) or limit < 1))):
+                raise ValueError("Invalid file line/limit")
+            if line != 1 or limit is not None:
+                lines = text.splitlines(keepends=True)
+                text = "".join(lines[line - 1:line - 1 + limit if limit is not None else None])
+            return {"content": text}
         except OSError:
             return {"content": ""}
 
     def _fs_write(self, params: dict, cwd: str | None) -> dict:
+        if not self._allow_file_writes:
+            raise PermissionError("File writes are disabled")
+        content = params.get("content", "")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > self._max_file_bytes:
+            raise ValueError("File content exceeds max_file_bytes or is not text")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None:
-            logger.warning("kiro fs/write 거부: %s", params.get("path"))
+            logger.warning("kiro fs/write 거부")
             return {}
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(params.get("content", ""), encoding="utf-8")
+            target.write_text(content, encoding="utf-8")
         except OSError:
             pass
         return {}

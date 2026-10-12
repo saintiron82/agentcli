@@ -91,6 +91,17 @@ share this boundary. Argument tests include shell metacharacters, quotes, percen
 expansion and newlines. Relevant tests: 187 passed. Installed Claude 2.1.296 and
 Codex 0.161.0 version checks succeeded without model calls.
 
+## Step 7 — SEC-007: Kiro filesystem policy
+
+Filesystem capabilities are explicit: `allow_file_reads=True` and
+`allow_file_writes=None` (derive from `trust_all`). With `trust_all=False`, writes
+are denied unless explicitly enabled, independently of agent-supplied tool
+titles. Denial becomes a safe JSON-RPC error instead of crashing the transport.
+Reads/writes default to a 1 MiB cap (`max_file_bytes`), honor read line ranges,
+and reject workspace links. This is not an OS sandbox for native agent tools.
+Relevant tests: 35 passed; the existing privileged symlink test is excluded on
+this Windows host and real junction coverage is tested separately.
+
 ## Remaining work
 
 | ID | Scope | Status |
@@ -100,7 +111,7 @@ Codex 0.161.0 version checks succeeded without model calls.
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Fixed, regression tested |
 | SEC-006 | Materialization boundaries and user skill protection | Fixed, regression tested |
-| SEC-007 | Explicit Kiro filesystem access policy | Pending |
+| SEC-007 | Explicit Kiro filesystem access policy | Fixed, regression tested |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
 | OPS-001 | Coordination of concurrent session callers | Pending |
 | OPS-002 | Streaming pipe drainage and bounded teardown | Pending |
