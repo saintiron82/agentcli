@@ -55,6 +55,21 @@ sessions are derived from the app conversation ID, preventing identical aliases
 of different owners from resuming an account-global session. Relevant tests:
 121 passed, 6 platform skips. Supply the original owner when resuming by ID.
 
+## Step 4 — SEC-004: policy-preserving fallback
+
+Sync, async and stream fallback skip providers whose native execution policy
+cannot be verified equivalent. Explicit security/auth options or restrictive
+constructor settings require the same implementation and matching policy
+settings. Unrestricted fallback remains available. Blocked fallback is reported
+without launching the candidate; unsupported options cannot disappear silently.
+Relevant tests: 106 passed, including all three call paths.
+
+Codex also records the effective sandbox/approval policy on success. Resume
+cannot silently change it; use `new_session=True` to change policy. Restricted
+legacy sessions without a recorded policy must also start fresh. Resume under
+the same recorded policy preserves the native session. An additional regression
+test covers this boundary without model calls.
+
 ## Remaining work
 
 | ID | Scope | Status |
@@ -62,7 +77,7 @@ of different owners from resuming an account-global session. Relevant tests:
 | SEC-001 | Windows batch argument interpretation | Pending |
 | SEC-002 | Conversation and injected-context ownership | Fixed, regression tested |
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
-| SEC-004 | Permission preservation during fallback | Pending |
+| SEC-004 | Permission preservation during fallback | Fixed, regression tested |
 | SEC-006 | Materialization boundaries and user skill protection | Pending |
 | SEC-007 | Explicit Kiro filesystem access policy | Pending |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |

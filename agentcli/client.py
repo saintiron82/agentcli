@@ -115,7 +115,7 @@ _SECURITY_OPTIONS = frozenset({
     "permission_mode", "allowed_tools", "disallowed_tools", "sandbox_mode",
     "approval_policy", "mcp_config", "strict_mcp_config", "lean", "isolated",
     "env", "trust_all", "trust_tools", "allow_file_reads", "allow_file_writes",
-    "allow_all_tools", "available_tools", "allow_all_paths", "add_dirs",
+    "allow_all_tools", "available_tools", "allow_all_paths", "add_dirs", "oauth_token",
 })
 _RESERVED_OPTIONS = frozenset({
     "messages", "model", "timeout", "session_id", "cwd", "alias", "resume_by_alias",
@@ -134,6 +134,33 @@ def _validate_provider_options(provider_obj, method_name: str, options: dict | N
         raise ValueError(f"Unsupported security options: {sorted(unsupported)}")
 
 
+def _fallback_preserves_policy(primary, candidate, options: dict | None) -> bool:
+    """Do not guess equivalence between different native permission systems."""
+    attributes = tuple("_" + key for key in _SECURITY_OPTIONS)
+    explicit = bool(options and any(k in _SECURITY_OPTIONS and v is not None
+                                    for k, v in options.items()))
+    restricted = (
+        getattr(primary, "_sandbox_mode", "danger-full-access") != "danger-full-access"
+        or getattr(primary, "_permission_mode", "bypassPermissions") != "bypassPermissions"
+        or getattr(primary, "_allowed_tools", None) is not None
+        or bool(getattr(primary, "_disallowed_tools", None))
+        or bool(getattr(primary, "_available_tools", None))
+        or getattr(primary, "_allow_all_tools", True) is False
+        or getattr(primary, "_allow_all_paths", True) is False
+        or getattr(primary, "_trust_all", True) is False
+        or getattr(primary, "_allow_file_reads", True) is False
+        or getattr(primary, "_allow_file_writes", True) is False
+        or getattr(primary, "_approval_policy", None) is not None
+        or getattr(primary, "_oauth_token", None) is not None
+        or getattr(primary, "_env", None) in ("isolated", "lean")
+    )
+    if not explicit and not restricted:
+        return True
+    return type(primary) is type(candidate) and all(
+        getattr(primary, name, None) == getattr(candidate, name, None)
+        for name in attributes)
+
+
 def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bool:
     key = (type(provider_obj), method_name, param_name)
     cached = _PARAM_SUPPORT_CACHE.get(key)
@@ -146,6 +173,17 @@ def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bo
         p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     _PARAM_SUPPORT_CACHE[key] = result
     return result
+
+
+def _codex_policy(provider_obj, options=None):
+    if not provider_obj or provider_obj.provider_id != "codex":
+        return None
+    if not hasattr(provider_obj, "_sandbox_mode"):
+        return None
+    options = options or {}
+    return [options.get("sandbox_mode") or provider_obj._sandbox_mode,
+            options.get("approval_policy") if options.get("approval_policy") is not None
+            else provider_obj._approval_policy]
 
 
 def _supported_kwargs(provider_obj, method_name: str, kwargs: dict) -> dict:
@@ -341,6 +379,17 @@ class LLMClient:
                 lock = threading.Lock()
                 self._sync_conv_locks[conv_id] = lock
             return lock
+
+    def _check_resume_policy(self, conv_id, provider_obj, session_id, options):
+        policy = _codex_policy(provider_obj, options)
+        if not session_id or policy is None:
+            return
+        with self._store_lock():
+            conv = self._store.get(conv_id)
+            previous = conv.metadata.get("codex_execution_policy") if conv else None
+        if ((previous is not None and previous != policy)
+                or (previous is None and policy != ["danger-full-access", None])):
+            raise PermissionError("Codex resume cannot change/verify this execution policy; use new_session=True")
 
     def _async_conversation_lock(self, conv_id: str) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
@@ -551,7 +600,7 @@ class LLMClient:
     def _persist_success(self, conv, cwd: str | None, prompt: str,
                          response: LLMResponse, agent: str,
                          alias: str, alias_to_set: str = "",
-                         system_prompt_hash: str = "") -> None:
+                         system_prompt_hash: str = "", provider_options=None) -> None:
         with self._store_lock():
             self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
             if alias_to_set:
@@ -562,6 +611,9 @@ class LLMClient:
             self._check_drift(conv, cwd)
             response_provider = (
                 self._registry.get(response.provider) if response.provider else None)
+            policy = _codex_policy(response_provider, provider_options)
+            if policy is not None:
+                self._store.set_metadata(conv.id, "codex_execution_policy", policy)
             if (system_prompt_hash and response_provider
                     and response_provider.supports_sessions):
                 self._store.set_metadata(
@@ -669,6 +721,7 @@ class LLMClient:
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)
+            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
@@ -692,7 +745,7 @@ class LLMClient:
 
             self._persist_success(conv, cwd, prompt, response, agent,
                                   resolved_alias, alias_to_set,
-                                  system_prompt_hash)
+                                  system_prompt_hash, provider_options)
             return response
 
     @staticmethod
@@ -836,6 +889,11 @@ class LLMClient:
             np = self._registry.get(next_id)
             if not np:
                 continue
+            if not _fallback_preserves_policy(p, np, provider_options):
+                logger.warning("[LLM] fallback blocked: incompatible execution policy")
+                if last_resp is not None:
+                    last_resp.suggested_action += " Fallback blocked by execution policy."
+                continue
             logger.warning("[LLM] %s(%s) 실패 → %s fallback",
                            provider_id, primary_type or "no-content", next_id)
             # Fallback은 세션 연속성 포기 — session_id 전달 안 함. alias 유지.
@@ -912,6 +970,7 @@ class LLMClient:
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)
+            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
                     provider, msgs, fallback_messages, model,
@@ -935,7 +994,7 @@ class LLMClient:
             # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
             await asyncio.to_thread(self._persist_success, conv, cwd, prompt,
                                     response, agent, resolved_alias,
-                                    alias_to_set, system_prompt_hash)
+                                    alias_to_set, system_prompt_hash, provider_options)
             return response
 
     async def _invoke_async_with_fallback(self, provider_id: str,
@@ -986,6 +1045,11 @@ class LLMClient:
                 continue
             np = self._registry.get(next_id)
             if not np:
+                continue
+            if not _fallback_preserves_policy(p, np, provider_options):
+                logger.warning("[LLM] fallback blocked: incompatible execution policy")
+                if last_resp is not None:
+                    last_resp.suggested_action += " Fallback blocked by execution policy."
                 continue
             logger.warning("[LLM] %s(%s) 실패 → %s fallback (async)",
                            provider_id, primary_type or "no-content", next_id)
@@ -1086,16 +1150,22 @@ class LLMClient:
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)
+            self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
             attempts = [
                 (provider, provider_obj, messages, model, session_id,
                  not force_new_session)
             ]
+            policy_blocked = False
             if fallback:
                 for next_id in self._registry.get_fallback_chain():
                     if next_id == provider:
                         continue
                     next_provider = self._registry.get(next_id)
                     if next_provider is None:
+                        continue
+                    if not _fallback_preserves_policy(provider_obj, next_provider, provider_options):
+                        policy_blocked = True
+                        logger.warning("[LLM] stream fallback blocked: incompatible execution policy")
                         continue
                     attempts.append(
                         (next_id, next_provider, fallback_messages, "", "",
@@ -1140,6 +1210,8 @@ class LLMClient:
                             saw_error = True
                             err_chunk = standardize_error_chunk(
                                 raw_chunk, provider=current_id)
+                            if policy_blocked:
+                                err_chunk.data["fallback_blocked"] = True
                             last_error = err_chunk
                             if emitted_output:
                                 yield err_chunk
@@ -1203,7 +1275,7 @@ class LLMClient:
                     await asyncio.to_thread(
                         self._persist_success, conv, cwd, prompt, synthetic,
                         agent, resolved_alias, alias_to_set,
-                        system_prompt_hash)
+                        system_prompt_hash, provider_options)
 
                     yield StreamChunk(
                         type="done", content=full_content,

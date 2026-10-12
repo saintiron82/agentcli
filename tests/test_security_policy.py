@@ -6,6 +6,9 @@ import pytest
 from agentcli import AgentProfile, LLMClient, MemoryStore, ProviderRegistry
 from agentcli.providers.base import LLMProvider
 from agentcli.providers.copilot import CopilotProvider
+from agentcli.providers.claude import ClaudeProvider
+from agentcli.providers.codex import CodexProvider
+from agentcli.client import _fallback_preserves_policy
 from agentcli.types import LLMResponse, StreamChunk
 
 
@@ -97,3 +100,61 @@ def test_unsupported_security_options_fail_before_execution(mode):
         with pytest.raises(ValueError, match="Unsupported security"):
             asyncio.run(consume())
     assert client._store.list_by_owner("") == []
+
+
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+def test_restrictive_constructor_and_per_call_policy_do_not_fallback(mode):
+    class Restricted(Recorder):
+        provider_id = "restricted"
+        _sandbox_mode = "read-only"
+        def invoke(self, messages, *, model="", **kwargs):
+            return LLMResponse("", self.provider_id, model, error="fake authentication error")
+        async def stream_async(self, messages, **kwargs):
+            yield StreamChunk(type="error", content="fake authentication error")
+    primary, candidate = Restricted(), Recorder()
+    registry = ProviderRegistry()
+    registry.register(primary)
+    registry.register(candidate)
+    registry.set_fallback_order(["restricted", "record"])
+    client = LLMClient(MemoryStore(), registry=registry)
+    kwargs = {"provider": "restricted", "fallback": True}
+    if mode == "sync":
+        result = client.chat("test", **kwargs)
+        assert "Fallback blocked" in result.suggested_action
+    elif mode == "async":
+        result = asyncio.run(client.chat_async("test", **kwargs))
+        assert "Fallback blocked" in result.suggested_action
+    else:
+        async def consume():
+            return [c async for c in client.chat_stream("test", **kwargs)]
+        chunks = asyncio.run(consume())
+        assert any(c.data.get("fallback_blocked") for c in chunks if c.type == "error")
+    assert candidate.calls == []
+
+
+def test_native_policies_are_compared_without_launching_clis():
+    assert not _fallback_preserves_policy(CodexProvider(sandbox_mode="read-only"), ClaudeProvider(), None)
+    assert not _fallback_preserves_policy(CodexProvider(), ClaudeProvider(), {"sandbox_mode": "read-only"})
+    assert _fallback_preserves_policy(CodexProvider(sandbox_mode="read-only"), CodexProvider(sandbox_mode="read-only"), None)
+    assert not _fallback_preserves_policy(CodexProvider(sandbox_mode="read-only"), CodexProvider(), None)
+    assert _fallback_preserves_policy(Recorder(), Recorder(), None)
+
+
+def test_codex_resume_requires_explicit_fresh_session_for_policy_change():
+    class FakeCodex(CodexProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+        def invoke(self, messages, *, model="", session_id="", **kwargs):
+            self.calls += 1
+            return LLMResponse("ok", "codex", model, session_id=session_id or "fake-native")
+    provider = FakeCodex()
+    client = client_for(provider)
+    client.chat("one", provider="codex", alias="review")
+    with pytest.raises(PermissionError, match="new_session"):
+        client.chat("two", provider="codex", alias="review", provider_options={"sandbox_mode": "read-only"})
+    assert provider.calls == 1
+    client.chat("two", provider="codex", alias="review", new_session=True,
+                provider_options={"sandbox_mode": "read-only"})
+    client.chat("three", provider="codex", alias="review", provider_options={"sandbox_mode": "read-only"})
+    assert provider.calls == 3
