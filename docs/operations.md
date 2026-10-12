@@ -5,6 +5,9 @@
 Scope: unreleased hardening branch based on v0.7.5. This is a deployment template,
 not evidence that the user's servers satisfy it. Last reviewed: 2026-10-12.
 
+See the [code improvement record](code-improvements.md) for concurrency fixes,
+measured overhead, compatibility and remaining rollout gates.
+
 ## Trust and identity
 
 For services sharing a machine, bind separate

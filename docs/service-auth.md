@@ -53,6 +53,10 @@ binding needs a new conversation/alias; it is not silently adopted. Only profile
 ID, root and authentication method are stored, never credentials. New handles
 are bound before invocation, so cancellation cannot leave a borrowable handle.
 
+Profile roots must support hard links for atomic marker publication. The
+[code improvement record](code-improvements.md) supersedes the initial test and
+performance record below and explains request-local credential/path snapshots.
+
 ## Provider support
 
 | Provider | Profile input | Child state/auth directory |
