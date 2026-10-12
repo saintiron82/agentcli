@@ -471,10 +471,11 @@ def test_claude_build_cmd_includes_effort_via_reasoning_args(mock_find):
 
 @patch("agentcli.providers.claude.run_subprocess_sync")
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
-def test_invoke_timeout_debug_carries_partial_stderr(mock_find, mock_run, tmp_path):
-    """invoke() timeout 브랜치는 debug=True 일 때 합성 문자열 대신 부분 stderr를
-    debug trace 에 남겨야 한다 (commit 9305b69 회귀). 사용자 계약(error="timeout after 120s")
-    은 변하지 않는다."""
+def test_invoke_timeout_debug_records_partial_stderr_length(mock_find, mock_run, tmp_path):
+    """Schema 2 records partial stderr length, not its sensitive body.
+
+    The existing timeout response contract remains unchanged.
+    """
     import json as _json
     # timed_out=True 이고 real partial stderr 를 반환
     mock_run.return_value = (b"", b"DEBUG-MARKER partial stderr from claude", 124, True)
@@ -488,20 +489,20 @@ def test_invoke_timeout_debug_carries_partial_stderr(mock_find, mock_run, tmp_pa
     assert resp.error_type == "timeout"
     assert resp.exit_code == 124
 
-    # debug trace 검증: partial stderr 가 그대로 들어가야 함 (합성 string 아님)
+    # Partial output is represented by its length, not a synthetic timeout.
     assert trace.exists()
     rec = _json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["phase"] == "invoke"
     assert rec["returncode"] == 124
-    # 부분 stderr 가 그대로 들어가 있어야 함
-    assert "DEBUG-MARKER partial stderr from claude" in rec["stderr"]
+    assert rec["schema"] == 2
+    assert rec["stderr"] == f"<stderr:{len('DEBUG-MARKER partial stderr from claude')} chars>"
+    assert "DEBUG-MARKER" not in rec["stderr"]
     # "timeout after" 문자열은 debug trace 에 들어가면 안 됨
     assert "timeout after" not in rec["stderr"]
 
 
-def test_invoke_async_timeout_debug_carries_partial_stderr(tmp_path):
-    """invoke_async() timeout 브랜치도 debug=True 일 때 부분 stderr를
-    debug trace 에 남겨야 한다 (invoke 와 동일 계약). 사용자 계약은 변하지 않는다."""
+def test_invoke_async_timeout_debug_records_partial_stderr_length(tmp_path):
+    """Async timeout retains its response while omitting stderr in schema 2."""
     import asyncio
     import json as _json
     from unittest.mock import AsyncMock, patch
@@ -522,13 +523,14 @@ def test_invoke_async_timeout_debug_carries_partial_stderr(tmp_path):
         assert resp.error_type == "timeout"
         assert resp.exit_code == 124
 
-        # debug trace 검증: partial stderr 가 그대로 들어가야 함
+        # Preserve partial-output metadata, not its body.
         assert trace.exists()
         rec = _json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
         assert rec["phase"] == "invoke_async"
         assert rec["returncode"] == 124
-        # 부분 stderr 가 그대로 들어가 있어야 함
-        assert "DEBUG-MARKER async partial stderr" in rec["stderr"]
+        assert rec["schema"] == 2
+        assert rec["stderr"] == f"<stderr:{len('DEBUG-MARKER async partial stderr')} chars>"
+        assert "DEBUG-MARKER" not in rec["stderr"]
         # "timeout after" 문자열은 debug trace 에 들어가면 안 됨
         assert "timeout after" not in rec["stderr"]
 

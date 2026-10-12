@@ -129,7 +129,7 @@ def test_client_session_alive_resolves_and_delegates():
     prov = _FakeProvider()
     client = _client_with(prov)
     # 호출 한 번 → conv + 세션 메타데이터 생성
-    client.chat("hi", provider="fake", owner="o", alias="a")
+    client.chat("hi", provider="fake", owner="o", alias="a", cwd="/x")
     result = client.session_alive("fake", owner="o", alias="a", cwd="/x")
     assert result is True
     assert prov.asked == ("SID-1", "/x"), "저장된 sid 와 cwd 를 provider 에 전달"
@@ -168,7 +168,7 @@ def test_client_session_alive_via_conversation_id():
     client = _client_with(prov)
     client.chat("hi", provider="fake", owner="o", alias="a")
     conv = client._store.find_by_alias("o", "a")
-    assert client.session_alive("fake", conversation_id=conv.id) is True
+    assert client.session_alive("fake", owner="o", conversation_id=conv.id) is True
 
 
 def test_client_session_alive_none_passthrough():

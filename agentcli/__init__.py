@@ -21,6 +21,7 @@ from .types import (
     make_error_chunk, standardize_error_chunk,
 )
 from .client import LLMClient, ContextSession
+from .auth import AuthProfile, AuthProfileError
 from .providers.base import LLMProvider
 from .providers.registry import ProviderRegistry, create_default_registry
 from .store.base import ConversationStore
@@ -40,6 +41,7 @@ except PackageNotFoundError:
 __all__ = [
     "__version__",
     "LLMClient", "ContextSession",
+    "AuthProfile", "AuthProfileError",
     "LLMResponse", "Message", "Conversation", "TokenUsage", "ProviderHealth",
     "ProviderCapabilities",
     "AccountUsage", "UsageWindow",

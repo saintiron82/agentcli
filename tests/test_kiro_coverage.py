@@ -217,11 +217,8 @@ async def test_stream_async_cleanup_kills_live_process(tmp_path):
                       "content":{"type":"text","text":"x"}}}})
                 # block on stdin forever (no further output)
     '''), encoding="utf-8")
-    launcher = tmp_path / "kiro-cli"
-    launcher.write_text(
-        "#!/bin/sh\nexec {py} {s} \"$@\"\n".format(py=sys.executable, s=str(script)),
-        encoding="utf-8")
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    from tests._stream_helpers import write_fake_cli_launcher
+    launcher = write_fake_cli_launcher(tmp_path, script.read_text(encoding="utf-8"), name="loop-kiro")
 
     p = KiroProvider()
     with patch.object(KiroProvider, "_find_binary", return_value=str(launcher)):
@@ -515,9 +512,9 @@ async def test_fs_read_with_no_cwd_denied():
 @pytest.mark.asyncio
 async def test_fs_write_with_no_cwd_denied():
     p = KiroProvider()
-    res = await p._handle_agent_request(
-        "fs/write_text_file", {"path": "/tmp/whatever.txt", "content": "x"}, cwd=None)
-    assert res == {}
+    with pytest.raises(PermissionError):
+        await p._handle_agent_request(
+            "fs/write_text_file", {"path": "/tmp/whatever.txt", "content": "x"}, cwd=None)
 
 
 # ---------------------------------------------------------------------------
@@ -530,22 +527,22 @@ async def test_fs_read_oserror_returns_empty_content(tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("data", encoding="utf-8")
     p = KiroProvider()
-    with patch("pathlib.Path.read_text", side_effect=OSError("boom")):
+    with patch("pathlib.Path.open", side_effect=OSError("boom")):
         res = await p._handle_agent_request(
             "fs/read_text_file", {"path": str(f)}, cwd=str(tmp_path))
     assert res == {"content": ""}
 
 
 @pytest.mark.asyncio
-async def test_fs_write_oserror_swallowed(tmp_path):
-    """write_text raising OSError is swallowed; result is still {} (400-401)."""
+async def test_fs_write_oserror_is_not_reported_as_success(tmp_path):
+    """Write errors propagate to the safe ACP error boundary."""
     p = KiroProvider()
     out = str(tmp_path / "sub" / "out.txt")
     with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
-        res = await p._handle_agent_request(
-            "fs/write_text_file", {"path": out, "content": "hi"},
-            cwd=str(tmp_path))
-    assert res == {}
+        with pytest.raises(OSError):
+            await p._handle_agent_request(
+                "fs/write_text_file", {"path": out, "content": "hi"},
+                cwd=str(tmp_path))
 
 
 # ---------------------------------------------------------------------------

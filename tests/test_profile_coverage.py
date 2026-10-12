@@ -201,8 +201,8 @@ def test_materialize_empty_instructions_warns(tmpdir_path, caplog):
     assert result["hash"] == p.hash()
 
 
-def test_materialize_skills_overwrites_existing_dst(tmpdir_path):
-    """대상 .agents/skills/<name> 가 이미 있으면 rmtree 후 재복사 (line 208-209)."""
+def test_materialize_skills_preserves_unmanaged_dst(tmpdir_path):
+    """Existing unowned skill directories must not be replaced."""
     profile_root = tmpdir_path / "src"
     profile_root.mkdir()
     (profile_root / "AGENTS.md").write_text("지시", encoding="utf-8")
@@ -223,10 +223,10 @@ def test_materialize_skills_overwrites_existing_dst(tmpdir_path):
     result = p.materialize(target_cwd)
 
     dst = target_cwd / ".agents" / "skills" / "my-skill"
-    assert (dst / "SKILL.md").read_text(encoding="utf-8") == "새 버전"
-    # 잔여 파일은 rmtree 로 제거되어야 한다
-    assert not (dst / "OLD.md").exists()
-    assert len(result["skills_copied"]) == 1
+    assert not (dst / "SKILL.md").exists()
+    assert (dst / "OLD.md").read_text(encoding="utf-8") == "옛날 잔여 파일"
+    assert result["skills_copied"] == []
+    assert str(dst) in result["skipped"]
 
 
 def test_materialize_skips_skills_when_include_false(tmpdir_path):

@@ -28,6 +28,18 @@ class TokenUsage:
     prompt_tokens_reliable: bool = True
     prompt_tokens_source: str = "provider_reported"
 
+    def accumulate(self, other: "TokenUsage") -> None:
+        """Sum attempts without upgrading uncertain input-token accounting."""
+        pristine = self == TokenUsage()
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
+                     "cache_creation_tokens", "payload_prompt_tokens"):
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+        self.prompt_tokens_reliable = self.prompt_tokens_reliable and other.prompt_tokens_reliable
+        if pristine:
+            self.prompt_tokens_source = other.prompt_tokens_source
+        elif self.prompt_tokens_source != other.prompt_tokens_source:
+            self.prompt_tokens_source = "mixed"
+
 
 @dataclass
 class Message:

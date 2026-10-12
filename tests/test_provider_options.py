@@ -183,28 +183,27 @@ def test_chat_provider_options_reach_provider():
     assert rec.captured["permission_mode"] == "acceptEdits"
 
 
-def test_chat_claude_only_options_ignored_by_other_provider():
-    """정규화(#154): claude 전용 lean/debug/partial_messages 를 다른 provider 에
-    넘겨도 _supported_kwargs 가 걸러내 에러 없이 무시된다."""
+def test_chat_non_security_options_ignored_by_other_provider():
+    """Non-security diagnostic options may still be ignored."""
     rec = RecordingProvider()  # invoke 시그니처에 lean/debug/partial_messages 없음
     client = _client_with(rec)
     resp = client.chat("hi", provider="rec", owner="o",
-                       provider_options={"lean": True, "debug": True,
+                       provider_options={"debug": True,
                                          "partial_messages": True,
                                          "permission_mode": "plan"})
     assert resp.content == "ok"  # raise 없이 통과
     assert rec.captured["permission_mode"] == "plan"  # 받는 키는 정상 전달
 
 
-def test_chat_drops_provider_options_unsupported_by_provider():
+def test_chat_rejects_security_options_unsupported_by_provider():
     rec = RecordingProvider()
     client = _client_with(rec)
-    # 'sandbox_mode' isn't in RecordingProvider.invoke — must be dropped, no crash
-    resp = client.chat("hi", provider="rec", owner="o",
-                       provider_options={"sandbox_mode": "workspace-write",
-                                         "mcp_config": {"x": 1}})
-    assert resp.content == "ok"
-    assert rec.captured["mcp_config"] == {"x": 1}
+    import pytest
+    with pytest.raises(ValueError, match="Unsupported security"):
+        client.chat("hi", provider="rec", owner="o",
+                    provider_options={"sandbox_mode": "workspace-write", "mcp_config": {"x": 1}})
+    assert rec.captured is None
+    assert client._store.list_by_owner("o") == []
 
 
 # ===== remaining call paths thread overrides into _build_cmd =====

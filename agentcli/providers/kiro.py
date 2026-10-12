@@ -13,6 +13,12 @@ import shutil
 import time
 from pathlib import Path
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
+from .base import _drain_stderr, _kill_process_group, _new_session_kwargs
+from ..processes import attach_process_job
+from ..auth_context import current_auth_profile, provider_environment
+from ..auth import AuthProfileError
+from ..filesystem import safe_workspace_path
 
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
 from ._acp import AcpConnection, AcpError
@@ -41,7 +47,10 @@ class KiroProvider(LLMProvider):
 
     def __init__(self, *, trust_all: bool = True,
                  trust_tools: list[str] | None = None,
-                 model: str = "", agent: str = ""):
+                 model: str = "", agent: str = "",
+                 allow_file_reads: bool = True,
+                 allow_file_writes: bool | None = None,
+                 max_file_bytes: int = 1024 * 1024):
         """
         Args:
             trust_all: session/request_permission 을 전부 자동 승인 (dev 기본).
@@ -54,6 +63,11 @@ class KiroProvider(LLMProvider):
         """
         self._trust_all = trust_all
         self._trust_tools = set(trust_tools or [])
+        self._allow_file_reads = allow_file_reads
+        self._allow_file_writes = trust_all if allow_file_writes is None else allow_file_writes
+        if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or max_file_bytes <= 0:
+            raise ValueError("max_file_bytes must be a positive integer")
+        self._max_file_bytes = max_file_bytes
         self._model = model
         self._agent = agent
 
@@ -132,14 +146,16 @@ class KiroProvider(LLMProvider):
             box = state.get("proc_box") or {}
             rdr = box.get("reader")
             proc = box.get("proc")
-            if rdr and not rdr.done():
-                rdr.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await rdr
-            if proc is not None and proc.returncode is None:
+            if proc is not None:
                 with contextlib.suppress(Exception):
-                    proc.kill()
-                    await proc.wait()
+                    _kill_process_group(proc)
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+            for task in (rdr, box.get("stderr")):
+                if task:
+                    if not task.done():
+                        task.cancel()
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await task
 
     def _subprocess_conn_factory(self, model: str, cwd: str | None):
         """Return (factory, state) for spawning a real kiro-cli acp subprocess.
@@ -160,22 +176,30 @@ class KiroProvider(LLMProvider):
                 if "proc" in proc_box:
                     return proc_box["proc"]
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd,
+                    *prepare_subprocess_command(cmd),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd, env=build_env())
+                    cwd=cwd, env=provider_environment("kiro", build_env), limit=8 * 1024 * 1024,
+                    **_new_session_kwargs())
+                attach_process_job(proc)
                 proc_box["proc"] = proc
 
                 async def reader():
                     assert proc.stdout
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line:
-                            break
-                        await conn.handle_line(line.decode("utf-8", errors="replace"))
+                    try:
+                        while True:
+                            line = await proc.stdout.readline()
+                            if not line:
+                                break
+                            await conn.handle_line(line.decode("utf-8", errors="replace"))
+                    finally:
+                        conn.close()
 
                 proc_box["reader"] = asyncio.create_task(reader())
+                if proc.stderr is not None:
+                    proc_box["stderr"] = asyncio.create_task(
+                        _drain_stderr(proc.stderr, [], logger, self.provider_id, debug=False))
                 return proc
 
             async def write_line(line: str) -> None:
@@ -203,6 +227,8 @@ class KiroProvider(LLMProvider):
     def health_check(self, *, timeout: int = 10,
                      cwd: str | None = None,
                      probe: bool = False) -> ProviderHealth:
+        if current_auth_profile() is not None:
+            raise AuthProfileError("Kiro service auth profiles are not supported")
         bin_path = shutil.which("kiro-cli")
         if not bin_path:
             return ProviderHealth(
@@ -247,7 +273,8 @@ class KiroProvider(LLMProvider):
                 await conn.request("initialize", {
                     "protocolVersion": _PROTOCOL_VERSION,
                     "clientCapabilities": {
-                        "fs": {"readTextFile": True, "writeTextFile": True},
+                        "fs": {"readTextFile": self._allow_file_reads,
+                               "writeTextFile": self._allow_file_writes},
                         "terminal": False},
                     "clientInfo": {"name": "agentcli", "version": "0"}})
                 if session_id:
@@ -274,7 +301,7 @@ class KiroProvider(LLMProvider):
             except Exception as exc:  # noqa: BLE001
                 await queue.put((_DONE, exc))
 
-        start = time.time()
+        start = time.monotonic()
         wall_deadline = start + wall_timeout if wall_timeout is not None else None
         driver = asyncio.create_task(drive())
         idle = idle_timeout if idle_timeout is not None else timeout
@@ -283,7 +310,7 @@ class KiroProvider(LLMProvider):
             while True:
                 # Compute effective timeout: min(idle, remaining wall time).
                 if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
+                    remaining = wall_deadline - time.monotonic()
                     if remaining <= 0:
                         yield StreamChunk(type="error",
                                           content="wall timeout expired",
@@ -297,7 +324,7 @@ class KiroProvider(LLMProvider):
                     item = await asyncio.wait_for(queue.get(), timeout=effective)
                 except asyncio.TimeoutError:
                     # Determine whether wall or idle expired.
-                    if wall_deadline is not None and time.time() >= wall_deadline:
+                    if wall_deadline is not None and time.monotonic() >= wall_deadline:
                         yield StreamChunk(type="error",
                                           content="wall timeout expired",
                                           data={"error_type": "timeout",
@@ -327,7 +354,7 @@ class KiroProvider(LLMProvider):
                     type="done", content="".join(text_parts),
                     session_id=state["session_id"], usage=usage,
                     data={"provider": self.provider_id, "model": model,
-                          "latency_ms": int((time.time() - start) * 1000),
+                          "latency_ms": int((time.monotonic() - start) * 1000),
                           "stop_reason": payload})
                 return
         finally:
@@ -373,32 +400,48 @@ class KiroProvider(LLMProvider):
             return None
         try:
             root = Path(cwd).resolve()
-            target = Path(path).resolve()
-            target.relative_to(root)  # cwd 밖이면 ValueError
-            return target
+            target = Path(path)
+            return safe_workspace_path(root, target if target.is_absolute() else root / target)
         except (ValueError, OSError):
             return None
 
     def _fs_read(self, params: dict, cwd: str | None) -> dict:
+        if not self._allow_file_reads:
+            raise PermissionError("File reads are disabled")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None or not target.is_file():
-            logger.warning("kiro fs/read 거부: %s", params.get("path"))
+            logger.warning("kiro fs/read 거부")
             return {"content": ""}
         try:
-            return {"content": target.read_text(encoding="utf-8", errors="replace")}
+            with target.open("rb") as source:
+                data = source.read(self._max_file_bytes + 1)
+            if len(data) > self._max_file_bytes:
+                raise ValueError("File exceeds max_file_bytes")
+            text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            line, limit = params.get("line", 1), params.get("limit")
+            if (isinstance(line, bool) or not isinstance(line, int) or line < 1
+                    or (limit is not None and (isinstance(limit, bool)
+                        or not isinstance(limit, int) or limit < 1))):
+                raise ValueError("Invalid file line/limit")
+            if line != 1 or limit is not None:
+                lines = text.splitlines(keepends=True)
+                text = "".join(lines[line - 1:line - 1 + limit if limit is not None else None])
+            return {"content": text}
         except OSError:
             return {"content": ""}
 
     def _fs_write(self, params: dict, cwd: str | None) -> dict:
+        if not self._allow_file_writes:
+            raise PermissionError("File writes are disabled")
+        content = params.get("content", "")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > self._max_file_bytes:
+            raise ValueError("File content exceeds max_file_bytes or is not text")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None:
-            logger.warning("kiro fs/write 거부: %s", params.get("path"))
-            return {}
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(params.get("content", ""), encoding="utf-8")
-        except OSError:
-            pass
+            logger.warning("kiro fs/write 거부")
+            raise PermissionError("File write outside the workspace is denied")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
         return {}
 
 

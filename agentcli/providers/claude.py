@@ -13,6 +13,9 @@ import tempfile
 import time
 import uuid
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
+from ..auth import AuthProfileError
+from ..auth_context import current_auth_profile, configured_health
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
@@ -300,8 +303,9 @@ class ClaudeProvider(LLMProvider):
         return None
 
     def _find_binary(self) -> str | None:
-        executable = "claude.cmd" if platform.system() == "Windows" else "claude"
-        return shutil.which(executable) or shutil.which("claude")
+        if platform.system() == "Windows":
+            return shutil.which("claude.exe") or shutil.which("claude.cmd") or shutil.which("claude")
+        return shutil.which("claude")
 
     def is_available(self) -> bool:
         return self._find_binary() is not None
@@ -365,6 +369,12 @@ class ClaudeProvider(LLMProvider):
           나타나지 않는다.
         원본 ``os.environ`` 은 변경하지 않는다.
         """
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or self._oauth_token is not None:
+                raise AuthProfileError("Service auth cannot be overridden by provider OAuth credentials")
+            from ..auth_context import provider_environment
+            return provider_environment("claude", lambda: None)
         token = self._resolve_oauth_token(oauth_token)
         extra: dict = {}
         if NONESSENTIAL_TRAFFIC_ENV_VAR not in os.environ:
@@ -383,6 +393,18 @@ class ClaudeProvider(LLMProvider):
                           oauth_token: str | None = None,
                           credentials_path: str | None = None) -> AccountUsage:
         from ..account_usage import claude_account_usage
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or credentials_path is not None or self._oauth_token is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            from ..auth_context import service_credentials
+            credentials = service_credentials("claude")
+            if profile.claude_api_key is not None:
+                return AccountUsage(provider="claude", status="unsupported_auth",
+                                    message="API-key billing usage is not supported")
+            return claude_account_usage(token=credentials.get("accessToken"),
+                                        oauth_metadata=credentials, timeout=timeout,
+                                        allow_probe=allow_probe)
         if oauth_token is not None and credentials_path is not None:
             raise ValueError("Choose oauth_token or credentials_path, not both.")
         token = None if credentials_path is not None else self._resolve_oauth_token(oauth_token)
@@ -404,7 +426,9 @@ class ClaudeProvider(LLMProvider):
             return False if session_id else None
         base = os.path.realpath(cwd if cwd is not None else os.getcwd())
         encoded = re.sub(r"[^a-zA-Z0-9]", "-", base)
-        path = (pathlib.Path.home() / ".claude" / "projects"
+        profile = current_auth_profile()
+        root = profile.directory("claude") if profile else pathlib.Path.home() / ".claude"
+        path = (root / "projects"
                 / encoded / f"{session_id}.jsonl")
         return path.exists()
 
@@ -419,8 +443,16 @@ class ClaudeProvider(LLMProvider):
                 error_type=ERROR_BINARY_MISSING,
                 message="Claude CLI not found")
 
-        version_proc = run_health_command([bin_path, "--version"], timeout=timeout)
+        profile = current_auth_profile()
+        auth_env = self._spawn_env(None) if profile else None
+        version_proc = run_health_command([bin_path, "--version"], timeout=timeout, env=auth_env)
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if profile is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
         auth_proc = run_health_command(
             [bin_path, "auth", "status"], timeout=timeout, cwd=cwd)
         auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
@@ -603,7 +635,7 @@ class ClaudeProvider(LLMProvider):
         else:
             used_session_id = str(uuid.uuid4())
             cmd += ["--session-id", used_session_id]
-        return cmd, used_session_id
+        return prepare_subprocess_command(cmd), used_session_id
 
     def _reasoning_flags(self, effort, thinking):
         """resolve 된 effort/thinking → claude native 플래그 렌더링 (#38).
@@ -733,7 +765,7 @@ class ClaudeProvider(LLMProvider):
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             err_msg = stderr_txt.strip()[:300]
             msg = err_msg or f"exit={rc}"
-            logger.error("Claude 실패 (code=%d): %s", rc, msg)
+            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,
@@ -868,8 +900,8 @@ class ClaudeProvider(LLMProvider):
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token,
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
-            logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,

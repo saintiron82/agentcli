@@ -74,7 +74,7 @@ def test_parse_ignores_malformed_lines():
 
 # ===== invoke (신규 세션) =====
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -91,10 +91,11 @@ def test_invoke_debug_writes_invoke_trace(mock_find, mock_env, mock_run, tmp_pat
     rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["phase"] == "invoke" and rec["provider"] == "copilot"
     assert rec["returncode"] == 0
-    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+    assert rec["schema"] == 2 and len(rec["call_id"]) == 12
+    assert rec["stderr"] == f"<stderr:{len('cp dbg')} chars>"
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -117,7 +118,7 @@ def test_invoke_new_session_parses_result_sessionid(mock_find, mock_env, mock_ru
     assert not any(c.startswith("--resume") for c in cmd)
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -136,7 +137,7 @@ def test_invoke_resume_returns_real_session_id(mock_find, mock_env, mock_run):
     assert "--resume=SID-COPILOT-1" in cmd
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -151,7 +152,7 @@ def test_invoke_alias_becomes_name_and_resume(mock_find, mock_env, mock_run):
     assert "--resume=bull-agent" in cmd
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -165,7 +166,7 @@ def test_invoke_can_disable_alias_resume(mock_find, mock_env, mock_run):
     assert "--resume=bull-agent" not in cmd
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -188,7 +189,7 @@ def test_invoke_tools_and_cwd(mock_find, mock_env, mock_run):
     assert kwargs.get("cwd") == "/repo"
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -217,7 +218,7 @@ def test_invoke_not_found(mock_find):
     assert resp.error
 
 
-@patch("agentcli.providers.copilot.subprocess.run",
+@patch("agentcli.providers.copilot.run_owned_command",
        side_effect=subprocess.TimeoutExpired("cmd", 120))
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
@@ -280,7 +281,7 @@ def test_copilot_build_cmd_includes_reasoning_args(mock_find):
     assert "--enable-reasoning-summaries" in cmd
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
@@ -294,7 +295,7 @@ def test_invoke_constructor_effort_still_emits_flag(mock_find, mock_env, mock_ru
     assert resp.reasoning is not None and resp.reasoning.effort.applied == "medium"
 
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))

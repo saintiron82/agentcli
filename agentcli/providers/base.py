@@ -15,6 +15,11 @@ from typing import AsyncIterator
 from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
                      LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
 from ..utils import serialize_messages
+from ..launchers import prepare_subprocess_command, UnsafeLauncherError
+from ..processes import attach_process_job, close_process_job
+from ..deadlines import remaining_timeout, has_budget
+from ..auth_context import service_auth_response
+from ..async_utils import complete_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,7 @@ def _kill_process_group(proc) -> None:
     자식이 먼저 종료하면 race 로 실패하므로 ``proc.pid`` 를 PGID 로 직접 쓴다.
     그룹 kill 이 불가/실패하면 직속 kill 로 폴백.
     """
+    close_process_job(proc)
     pid = getattr(proc, "pid", None)
     if _POSIX and pid:
         try:
@@ -179,11 +185,20 @@ def estimate_payload_prompt_tokens(prompt: str) -> int:
 _CLAUDE_STDIN_MODE_NEXT_FLAG = "--output-format"
 
 
+def _redact_payload(value: str, label: str) -> str:
+    """Omit an opaque diagnostic payload; preserve existing length markers."""
+    prefix, suffix = f"<{label}:", " chars>"
+    if (value.startswith(prefix) and value.endswith(suffix)
+            and value[len(prefix):-len(suffix)].isdigit()):
+        return value
+    return f"{prefix}{len(value)}{suffix}"
+
+
 def redact_argv(cmd: list[str]) -> list[str]:
-    """Return argv with the `-p <prompt>` payload replaced by a length marker.
+    """Return a copy with prompt and configuration payloads omitted.
 
     Debug 로그/trace 에 50k 짜리 프롬프트 본문이나 민감 내용을 그대로 흘리지
-    않도록, ``-p`` 다음 인자만 ``<prompt:N chars>`` 로 치환한다.
+    않도록 프롬프트·시스템 지시문·설정 본문을 길이 표시로 치환한다.
 
     큰 프롬프트는 stdin 으로 전달되어 ``-p`` 뒤에 위치 인자가 아예 없을 수
     있다(issue #30) — 이때 ``-p`` 바로 다음 토큰이 stdin 모드의 리터럴 플래그
@@ -196,17 +211,29 @@ def redact_argv(cmd: list[str]) -> list[str]:
     n = len(cmd)
     while i < n:
         arg = cmd[i]
+        # Configuration can contain arbitrary bearer tokens, env values or
+        # command arguments. Omit the whole payload, even malformed JSON/TOML.
+        for flag, label in (("--mcp-config", "mcp-config"),
+                            ("--config", "config")):
+            if arg.startswith(flag + "="):
+                arg = flag + "=" + _redact_payload(arg[len(flag) + 1:], label)
+                break
         out.append(arg)
+        if arg in ("--mcp-config", "-c", "--config") and i + 1 < n:
+            label = "mcp-config" if arg == "--mcp-config" else "config"
+            out.append(_redact_payload(cmd[i + 1], label))
+            i += 2
+            continue
         if (arg == "-p" and i + 1 < n
                 and cmd[i + 1] != _CLAUDE_STDIN_MODE_NEXT_FLAG):
-            out.append(f"<prompt:{len(cmd[i + 1])} chars>")
+            out.append(_redact_payload(cmd[i + 1], "prompt"))
             i += 2
             continue
         # #51: system 블록 본문도 프롬프트와 같은 민감도 — trace 에 그대로
         # 흘리지 않는다 (파일 변형 ``--append-system-prompt-file`` 은 경로만
         # argv 에 실리므로 redact 불필요).
         if arg == "--append-system-prompt" and i + 1 < n:
-            out.append(f"<system-prompt:{len(cmd[i + 1])} chars>")
+            out.append(_redact_payload(cmd[i + 1], "system-prompt"))
             i += 2
             continue
         i += 1
@@ -217,12 +244,13 @@ def redact_argv(cmd: list[str]) -> list[str]:
     if "--" in out:
         sep = out.index("--")
         if len(out) > sep + 1 and out[-1] != "-":
-            out[-1] = f"<prompt:{len(out[-1])} chars>"
+            out[-1] = _redact_payload(out[-1], "prompt")
     return out
 
 
 # debug trace 포맷 버전 — 필드가 바뀌면 올린다(소비자가 분기 가능).
-DEBUG_TRACE_SCHEMA = 1
+# Schema 2 intentionally omits raw stderr and opaque configuration payloads.
+DEBUG_TRACE_SCHEMA = 2
 # 같은 파일에 여러 스레드(예: 병렬 sync invoke)가 append 할 때 라인 깨짐 방지.
 _TRACE_LOCK = threading.Lock()
 
@@ -238,13 +266,26 @@ def write_debug_trace(path: str, record: dict) -> None:
     rec = {**record, "schema": DEBUG_TRACE_SCHEMA}
     rec.setdefault("call_id", uuid.uuid4().hex[:12])
     try:
+        # Last boundary before persistence, including direct helper callers.
+        if "argv" in rec:
+            argv = rec["argv"]
+            rec["argv"] = (redact_argv(list(argv))
+                           if isinstance(argv, (list, tuple))
+                           and all(isinstance(arg, str) for arg in argv)
+                           else "<argv:omitted>")
+        if "stderr" in rec:
+            stderr = rec["stderr"]
+            if isinstance(stderr, str):
+                rec["stderr"] = _redact_payload(stderr, "stderr") if stderr else ""
+            else:
+                rec["stderr"] = "<stderr:omitted>"
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         with _TRACE_LOCK:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
-            "debug trace 기록 실패 (%s): %s", path, exc)
+            "debug trace 기록 실패 (%s)", type(exc).__name__)
 
 
 def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
@@ -258,14 +299,14 @@ def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
     log = logging.getLogger(f"agentcli.providers.{provider_id}")
     log.info("[debug] %s %s rc=%s latency=%dms argv=%s",
              provider_id, phase, rc, latency_ms, redact_argv(cmd))
-    tail = (stderr or "").strip()
-    if tail:
-        log.info("[debug] %s stderr tail:\n%s", provider_id, tail[-2000:])
+    if stderr:
+        log.info("[debug] %s stderr: %s", provider_id,
+                 _redact_payload(stderr, "stderr"))
     if path:
         write_debug_trace(path, {
             "provider": provider_id, "phase": phase, "returncode": rc,
             "latency_ms": latency_ms, "argv": redact_argv(cmd),
-            "session_id": session_id, "stderr": (stderr or "")[-20000:],
+            "session_id": session_id, "stderr": stderr or "",
         })
 
 
@@ -293,22 +334,28 @@ async def _write_stdin_payload(stdin_stream, payload: bytes) -> None:
         pass
 
 
-async def _drain_stderr(stream, sink: list[str], logger, provider_id: str) -> None:
+async def _drain_stderr(stream, sink: list[str], logger, provider_id: str,
+                        debug: bool = True) -> None:
     """Concurrently drain a subprocess stderr pipe into ``sink``.
 
     ``--debug`` 는 stderr 를 대량 출력하는데, 이를 빼주지 않으면 OS 파이프
     버퍼가 차서 subprocess 가 stderr write 에서 블록 → 행이 걸린다. 디버그
     스트리밍에서 이 task 로 stderr 를 계속 읽어 데드락을 막고, 동시에 각 줄을
-    DEBUG 로그로 흘린다.
+    DEBUG 로그에는 본문 대신 길이만 남긴다.
     """
     try:
         while True:
-            line_b = await stream.readline()
+            line_b = await stream.read(8192)
             if not line_b:
                 break
-            text = line_b.decode("utf-8", errors="replace").rstrip("\n")
+            text = line_b.decode("utf-8", errors="replace")
             sink.append(text)
-            logger.debug("[debug] %s stderr: %s", provider_id, text)
+            # Keep at most 64 KiB, including a single unusually large block.
+            joined = "".join(sink)[-65536:]
+            sink[:] = [joined]
+            if debug:
+                logger.debug("[debug] %s stderr: %s", provider_id,
+                             _redact_payload(text, "stderr"))
     except Exception:  # noqa: BLE001 — drain 실패는 본 스트림에 영향 주지 않음
         pass
 
@@ -426,7 +473,7 @@ class LLMProvider(ABC):
 
         진짜 async 서브프로세스가 필요한 provider는 이 메서드를 오버라이드.
         """
-        return await asyncio.to_thread(
+        return await complete_in_thread(
             self.invoke, messages,
             model=model, timeout=timeout,
             session_id=session_id, cwd=cwd)
@@ -493,7 +540,7 @@ class LLMProvider(ABC):
         추가 task 없음) — byte-identical 하위호환.
         """
         logger = logging.getLogger(self.__class__.__module__)
-        start = time.time()
+        start = time.monotonic()
         proc = None
         timed_out = False
         last_activity = start
@@ -510,6 +557,7 @@ class LLMProvider(ABC):
                          if wall_timeout is not None else None)
 
         kwargs: dict = {
+            "limit": 8 * 1024 * 1024,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             # input_bytes 지정 시에만 PIPE 로 열어 아래에서 별도 task 로 쓴다 —
@@ -529,7 +577,8 @@ class LLMProvider(ABC):
         # subprocess cleanup 이 실행되지 않아 좀비 프로세스가 남는다.
         # ``try/finally`` 로 어떤 종료 경로에서도 그룹 kill 보장.
         try:
-            proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+            proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
+            attach_process_job(proc)
             assert proc.stdout
             if input_bytes is not None:
                 assert proc.stdin
@@ -543,14 +592,14 @@ class LLMProvider(ABC):
                             self.provider_id, redact_argv(cmd))
                 # stderr 동시 드레인 — --debug 의 대량 stderr 로 인한 파이프
                 # 데드락 방지 (위 _drain_stderr docstring 참고).
-                if proc.stderr is not None:
-                    stderr_task = asyncio.create_task(
-                        _drain_stderr(proc.stderr, debug_stderr,
-                                      logger, self.provider_id))
+            if proc.stderr is not None:
+                stderr_task = asyncio.create_task(
+                    _drain_stderr(proc.stderr, debug_stderr,
+                                  logger, self.provider_id, debug=debug))
             while True:
                 read_timeout = idle_limit
                 if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
+                    remaining = wall_deadline - time.monotonic()
                     if remaining <= 0:
                         _kill_process_group(proc)
                         yield StreamChunk(
@@ -566,10 +615,10 @@ class LLMProvider(ABC):
                         proc.stdout.readline(), timeout=read_timeout)
                 except asyncio.TimeoutError:
                     _kill_process_group(proc)
-                    idle = int(time.time() - last_activity)
+                    idle = int(time.monotonic() - last_activity)
                     timeout_kind = (
                         "wall" if wall_deadline is not None
-                        and time.time() >= wall_deadline else "idle")
+                        and time.monotonic() >= wall_deadline else "idle")
                     logger.error("%s %s timeout (%ds since last chunk)",
                                  self.provider_id, timeout_kind, idle)
                     content = (
@@ -584,7 +633,7 @@ class LLMProvider(ABC):
                     break
                 if not line_b:
                     break
-                last_activity = time.time()
+                last_activity = time.monotonic()
                 line = line_b.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -601,7 +650,7 @@ class LLMProvider(ABC):
 
                 async for chunk in self._dispatch_stream_event(evt, state):
                     if debug:
-                        t = time.time() - start
+                        t = time.monotonic() - start
                         entry = {"t": round(t, 3), "type": chunk.type}
                         # Claude --debug 정보는 stderr 가 아니라 stdout event 로
                         # 흘러나오므로, 청크 type 만으론 툴 루프를 못 읽는다.
@@ -616,7 +665,8 @@ class LLMProvider(ABC):
                             for k in ("subtype", "name"):
                                 if data.get(k):
                                     entry[k] = data[k]
-                        debug_chunks.append(entry)
+                        if len(debug_chunks) < 10000:
+                            debug_chunks.append(entry)
                         logger.info(
                             "[debug] %s +%.2fs %s%s", self.provider_id, t,
                             chunk.type,
@@ -625,26 +675,24 @@ class LLMProvider(ABC):
 
             if timed_out:
                 if proc and proc.returncode is None:
-                    await proc.wait()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
                 return
 
-            rc = await proc.wait()
-            if debug and stderr_task is not None:
+            # EOF is not a promise that the process has exited.
+            exit_timeout = idle_limit
+            if wall_deadline is not None:
+                exit_timeout = min(exit_timeout, max(0, wall_deadline - time.monotonic()))
+            rc = await asyncio.wait_for(proc.wait(), timeout=exit_timeout)
+            _kill_process_group(proc)  # Release pipes held by owned descendants.
+            if stderr_task is not None:
                 try:
-                    await stderr_task
+                    await asyncio.wait_for(stderr_task, timeout=5)
                 # CancelledError 는 BaseException 이라 Exception 그물을
                 # 빠져나간다 — stdin_task 정리와 같은 계약 (#46).
                 except (Exception, asyncio.CancelledError):  # noqa: BLE001
                     pass
-            if rc != 0 and not state.text_parts:
-                if debug:
-                    # stderr 는 드레인 task 가 이미 소진 → 누적분 사용.
-                    err_text = "\n".join(debug_stderr)
-                else:
-                    err_b = b""
-                    if proc.stderr:
-                        err_b = await proc.stderr.read()
-                    err_text = err_b.decode("utf-8", errors="replace")
+            if rc != 0:
+                err_text = "".join(debug_stderr)
                 yield StreamChunk(
                     type="error",
                     content=err_text[:500],
@@ -658,13 +706,18 @@ class LLMProvider(ABC):
                 session_id=state.final_session_id,
                 usage=state.final_usage,
                 data={"provider": self.provider_id, "model": model,
-                      "latency_ms": int((time.time() - start) * 1000)})
+                      "latency_ms": int((time.monotonic() - start) * 1000)})
+        except asyncio.TimeoutError:
+            timed_out = True
+            yield StreamChunk(type="error", content="Process exit timeout",
+                              data={"error_type": "timeout"})
         except FileNotFoundError:
             yield StreamChunk(
                 type="error",
                 content=f"{self.provider_id} CLI not found")
         except Exception as exc:  # noqa: BLE001 — error chunk 만 yield, cleanup 은 finally
-            logger.exception("%s stream 예외", self.provider_id)
+            # Exception messages/tracebacks may echo argv and credentials.
+            logger.error("%s stream 예외 (%s)", self.provider_id, type(exc).__name__)
             yield StreamChunk(type="error", content=str(exc))
         finally:
             # issue #44: stdin writer task 는 정상 종료/timeout/GeneratorExit
@@ -692,23 +745,19 @@ class LLMProvider(ABC):
                 try:
                     _kill_process_group(proc)
                     if proc.returncode is None:
-                        await proc.wait()
+                        await asyncio.wait_for(proc.wait(), timeout=5)
                 except Exception:
                     # cleanup 실패는 silent — 더 이상 할 수 있는 게 없음
                     pass
             # debug: GeneratorExit/timeout/error/done 어떤 경로든 trace 마감.
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except (Exception, asyncio.CancelledError):
+                    pass
             if debug:
-                if stderr_task is not None and not stderr_task.done():
-                    stderr_task.cancel()
-                    try:
-                        await stderr_task
-                    # 방금 우리가 요청한 취소의 결과가 CancelledError 로
-                    # 돌아온다 — 여기서 새면 진행 중인 GeneratorExit 를
-                    # 대체해 aclose 가 예외로 끝나고, 아래 trace 마감까지
-                    # 건너뛴다 (#46; stdin_task 정리와 같은 계약).
-                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
-                        pass
-                elapsed_ms = int((time.time() - start) * 1000)
+                elapsed_ms = int((time.monotonic() - start) * 1000)
                 logger.info(
                     "[debug] %s stream 종료: chunks=%d elapsed=%dms",
                     self.provider_id, len(debug_chunks), elapsed_ms)
@@ -722,7 +771,7 @@ class LLMProvider(ABC):
                         "session_id": state.final_session_id,
                         # timeout/early-break 면 stderr·chunks 가 부분 데이터다.
                         "truncated": not reached_done,
-                        "stderr": "\n".join(debug_stderr)[-20000:],
+                        "stderr": "".join(debug_stderr).rstrip("\n"),
                     })
 
     async def _dispatch_stream_event(
@@ -874,7 +923,11 @@ async def run_subprocess_async(
     if cwd is not None:
         kwargs["cwd"] = cwd
 
-    proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0 and has_budget():
+        return b"", b"", 124, True
+    proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
+    attach_process_job(proc)
     # communicate() 를 별도 Task 로 감싼다 — asyncio.wait_for(proc.communicate(),
     # timeout) 은 타임아웃 시 communicate task 자체를 취소해 그때까지 버퍼링된
     # stdout/stderr 를 통째로 잃는다. asyncio.wait() 는 task 를 취소하지 않으므로
@@ -902,8 +955,8 @@ async def run_subprocess_async(
                 # 그룹 kill 로도 안 풀리는 병적인 손자(파이프를 계속 문 채)
                 # 대비 — sync 경로의 10s reap bound 와 동일한 방어.
                 logger.warning(
-                    "post-kill communicate retry failed (%r); returning "
-                    "empty output", exc)
+                    "post-kill communicate retry failed (%s); returning "
+                    "empty output", type(exc).__name__)
                 stdout_b, stderr_b = b"", b""
     finally:
         # 호출 task 취소(CancelledError)·정상완료 포함 모든 종료 경로에서 그룹
@@ -914,8 +967,14 @@ async def run_subprocess_async(
         try:
             _kill_process_group(proc)
             if proc.returncode is None:
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=5)
         except Exception:
+            pass
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (Exception, asyncio.CancelledError):
             pass
     if timed_out:
         return stdout_b or b"", stderr_b or b"", 124, True
@@ -962,7 +1021,11 @@ def run_subprocess_sync(
     if env is not None:
         kwargs["env"] = env
 
-    proc = subprocess.Popen(cmd, **kwargs)
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0 and has_budget():
+        return b"", b"", 124, True
+    proc = subprocess.Popen(prepare_subprocess_command(cmd), **kwargs)
+    attach_process_job(proc)
     timed_out = False
     reap_attempted = False
     try:
@@ -984,8 +1047,8 @@ def run_subprocess_sync(
             stdout_b, stderr_b = proc.communicate(timeout=10)
         except Exception as exc:
             logger.warning(
-                "post-kill communicate retry failed (%r); returning "
-                "empty output", exc)
+                "post-kill communicate retry failed (%s); returning "
+                "empty output", type(exc).__name__)
             stdout_b, stderr_b = b"", b""
     finally:
         # 정상완료 포함 모든 경로에서 그룹 kill 은 무조건 수행 — 떨어져나간
@@ -1003,14 +1066,30 @@ def run_subprocess_sync(
     return stdout_b or b"", stderr_b or b"", proc.returncode or 0, False
 
 
+def run_owned_command(cmd, *, capture_output=True, text=True, timeout=120,
+                      cwd=None, env=None, input=None, stdin=None,
+                      encoding="utf-8", errors="replace"):
+    """CompletedProcess-compatible CLI runner with owned-tree cleanup."""
+    if not capture_output or stdin not in (None, subprocess.DEVNULL):
+        raise ValueError("Only captured, non-interactive commands are supported")
+    payload = input.encode(encoding, errors) if isinstance(input, str) else input
+    out, err, rc, expired = run_subprocess_sync(
+        cmd, timeout=timeout, cwd=cwd, env=env, input_bytes=payload)
+    if text:
+        out, err = out.decode(encoding, errors), err.decode(encoding, errors)
+    if expired:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, rc, out, err)
+
+
 def run_health_command(cmd: list[str], *, timeout: int = 10,
                        cwd: str | None = None,
                        env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a health command and normalize timeout into a CompletedProcess."""
     try:
-        return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=cwd, env=env)
+        return run_owned_command(
+            prepare_subprocess_command(cmd), capture_output=True, text=True, timeout=timeout,
+            cwd=cwd, env=env, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(
             cmd, 124,
@@ -1019,10 +1098,13 @@ def run_health_command(cmd: list[str], *, timeout: int = 10,
     except FileNotFoundError:
         return subprocess.CompletedProcess(
             cmd, 127, stdout="", stderr="command not found")
+    except UnsafeLauncherError as exc:
+        return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
 
 
 def health_from_response(provider: str, resp: LLMResponse,
                          *, binary: str = "", version: str = "") -> ProviderHealth:
+    resp = service_auth_response(resp)
     if resp.content:
         return ProviderHealth(
             provider=provider, ok=True, status="ok", available=True,

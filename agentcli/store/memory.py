@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from threading import RLock
 from .base import ConversationStore
 from ..types import Conversation, Message
+from .locking import synchronized_store
 
 
 _BUCKET_KEYS = (
@@ -48,6 +49,7 @@ def _group_key(row: dict, axis: str) -> str:
     return "unknown"
 
 
+@synchronized_store
 class MemoryStore(ConversationStore):
     def __init__(self, max_conversations: int = 200, ttl_hours: int = 24):
         self._lock = RLock()
@@ -56,14 +58,13 @@ class MemoryStore(ConversationStore):
         self._usage: dict[str, list[dict]] = {}
         # (owner, alias) → conversation_id 인덱스
         self._alias_index: dict[tuple[str, str], str] = {}
+        self._pins: dict[str, int] = {}
         self._max = max(1, int(max_conversations))
         self._ttl = timedelta(hours=ttl_hours) if ttl_hours > 0 else None
 
     def create(self, owner: str, provider: str, model: str = "",
                *, conversation_id: str = "",
                alias: str = "") -> Conversation:
-        self._evict_if_needed()
-
         # alias로 이미 존재하는 conversation이 있으면 반환
         if alias:
             existing = self.find_by_alias(owner, alias)
@@ -73,11 +74,14 @@ class MemoryStore(ConversationStore):
         conv_id = conversation_id or str(uuid.uuid4())
         existing = self._conversations.get(conv_id)
         if existing and not self._is_expired(existing):
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
             # 기존 conversation에 alias가 비어 있으면 지금 부여
             if alias and not existing.alias:
                 self._set_alias_internal(existing, alias)
             return existing
 
+        self._evict_if_needed()
         now = datetime.now()
         conv = Conversation(id=conv_id, owner=owner, provider=provider,
                             model=model, created_at=now, updated_at=now,
@@ -135,6 +139,19 @@ class MemoryStore(ConversationStore):
                   if c.owner == owner and not self._is_expired(c)]
         result.sort(key=lambda c: c.updated_at, reverse=True)
         return result[:limit]
+
+    def list_all_by_owner(self, owner: str) -> list[Conversation]:
+        return self.list_by_owner(owner, limit=len(self._conversations))
+
+    def pin(self, conversation_id: str) -> None:
+        self._pins[conversation_id] = self._pins.get(conversation_id, 0) + 1
+
+    def unpin(self, conversation_id: str) -> None:
+        count = self._pins.get(conversation_id, 0)
+        if count > 1:
+            self._pins[conversation_id] = count - 1
+        else:
+            self._pins.pop(conversation_id, None)
 
     def set_metadata(self, conversation_id: str, key: str, value) -> None:
         conv = self._conversations.get(conversation_id)
@@ -252,7 +269,7 @@ class MemoryStore(ConversationStore):
         return rows
 
     def _is_expired(self, conv: Conversation) -> bool:
-        if self._ttl is None:
+        if self._ttl is None or self._pins.get(conv.id):
             return False
         return datetime.now() - conv.updated_at > self._ttl
 
@@ -263,6 +280,10 @@ class MemoryStore(ConversationStore):
             for cid in expired:
                 self.delete(cid)
         while len(self._conversations) >= self._max:
-            oldest_id = min(self._conversations.items(),
+            candidates = [(cid, conv) for cid, conv in self._conversations.items()
+                          if not self._pins.get(cid)]
+            if not candidates:
+                break  # Capacity is a soft bound while turns are active/queued.
+            oldest_id = min(candidates,
                             key=lambda kv: kv[1].updated_at)[0]
             self.delete(oldest_id)

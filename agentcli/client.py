@@ -14,11 +14,12 @@
 
 import asyncio
 import hashlib
-import itertools
 import logging
+import os
+import time
+import stat as stat_module
 import threading
-import uuid
-import weakref
+from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,17 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
                     TokenUsage, StreamChunk, make_error_chunk,
                     standardize_error_chunk)
 from .store.base import ConversationStore
+from .store.locking import reserved_turn, reserve_conversation, session_generation_matches
+from .async_utils import complete_in_thread
+from .context_session import ContextSession
+from .planning import CallPlan
+from .coordination import ConversationLease, async_lease
+from .deadlines import request_budget, remaining_timeout, bounded_stream
+from .auth import AuthProfile, AuthProfileError
+from .auth_context import (AUTH_SCOPE_KEY, auth_scoped, current_auth_profile,
+                           require_auth_scope, require_auth_method, validate_auth_options,
+                           validate_auth_options_async,
+                           service_auth_response, SERVICE_AUTH_ACTION)
 from .providers.registry import ProviderRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
@@ -34,15 +46,33 @@ logger = logging.getLogger(__name__)
 SESSION_KEY_FMT = "session_id:{provider}"
 SYSTEM_PROMPT_HASH_KEY_FMT = "system_prompt_hash:{provider}"
 DRIFT_KEY = "instructions_hashes"
+WORKSPACE_KEY = "workspace_root"
+
+
+def _workspace_root(cwd: str | None) -> str:
+    return os.path.normcase(str(Path(cwd or os.getcwd()).expanduser().resolve()))
+
+
+def _require_conversation_scope(conv, owner: str, cwd: str | None):
+    require_auth_scope(conv)
+    if conv.owner != owner:
+        raise PermissionError("Conversation does not belong to the supplied owner")
+    bound = conv.metadata.get(WORKSPACE_KEY)
+    if bound and bound != _workspace_root(cwd):
+        raise PermissionError("Conversation workspace mismatch; use a different alias")
+
+
 DRIFT_INSTRUCTION_FILES = (
     "AGENTS.md", "CLAUDE.md", "GUIDE.md", "AGENTS.override.md")
 
 # mtime 기반 해시 캐시 — 파일이 변경되지 않으면 재해시하지 않음.
 # {파일 절대경로: (mtime, hash16)}
-_DRIFT_HASH_CACHE: dict[str, tuple[float, str]] = {}
+_DRIFT_HASH_CACHE: OrderedDict[str, tuple[tuple[int, int], str]] = OrderedDict()
+_DRIFT_CACHE_LOCK = threading.Lock()
+_DRIFT_CACHE_LIMIT = 1024
 
 
-def _compute_instructions_hashes(cwd: str | None) -> dict:
+def _compute_instructions_hashes(cwd: str | None, *, refresh: bool = False) -> dict:
     """cwd의 agent 지시 파일들 해시를 dict로 반환.
 
     (mtime_ns, size) 기반 캐시: 둘 다 이전과 같으면 재해시 스킵 → I/O 0.
@@ -60,22 +90,33 @@ def _compute_instructions_hashes(cwd: str | None) -> dict:
     result = {}
     for fname in DRIFT_INSTRUCTION_FILES:
         f = base / fname
-        if not f.exists() or not f.is_file():
-            continue
         try:
             stat = f.stat()
-            key = str(f)
+            if not stat_module.S_ISREG(stat.st_mode):
+                continue
+            key = str(f.absolute())
             sig = (stat.st_mtime_ns, stat.st_size)
-            cached = _DRIFT_HASH_CACHE.get(key)
-            if cached and cached[0] == sig:
+            with _DRIFT_CACHE_LOCK:
+                cached = _DRIFT_HASH_CACHE.get(key)
+                if cached is not None:
+                    _DRIFT_HASH_CACHE.move_to_end(key)
+            if not refresh and cached and cached[0] == sig:
                 result[fname] = cached[1]
             else:
-                data = f.read_bytes()
-                h = hashlib.sha256(data).hexdigest()[:16]
-                _DRIFT_HASH_CACHE[key] = (sig, h)
+                digest = hashlib.sha256()
+                with f.open("rb") as source:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        digest.update(chunk)
+                h = digest.hexdigest()[:16]
+                with _DRIFT_CACHE_LOCK:
+                    _DRIFT_HASH_CACHE[key] = (sig, h)
+                    _DRIFT_HASH_CACHE.move_to_end(key)
+                    while len(_DRIFT_HASH_CACHE) > _DRIFT_CACHE_LIMIT:
+                        _DRIFT_HASH_CACHE.popitem(last=False)
                 result[fname] = h
         except OSError:
-            pass
+            with _DRIFT_CACHE_LOCK:
+                _DRIFT_HASH_CACHE.pop(str(f.absolute()), None)
     return result
 
 
@@ -96,6 +137,56 @@ def _session_providers_from_metadata(metadata: dict) -> list[str]:
 # provider 클래스는 런타임에 바뀌지 않으므로 1회 계산 후 캐시.
 _PARAM_SUPPORT_CACHE: dict[tuple[type, str, str], bool] = {}
 
+# These options change execution boundaries and must never be silently dropped.
+_SECURITY_OPTIONS = frozenset({
+    "permission_mode", "allowed_tools", "disallowed_tools", "sandbox_mode",
+    "approval_policy", "mcp_config", "strict_mcp_config", "lean", "isolated",
+    "env", "trust_all", "trust_tools", "allow_file_reads", "allow_file_writes",
+    "allow_all_tools", "available_tools", "allow_all_paths", "add_dirs", "oauth_token",
+})
+_RESERVED_OPTIONS = frozenset({
+    "messages", "model", "timeout", "session_id", "cwd", "alias", "resume_by_alias",
+})
+
+
+def _validate_provider_options(provider_obj, method_name: str, options: dict | None):
+    if not options:
+        return
+    if _RESERVED_OPTIONS.intersection(options):
+        raise ValueError("provider_options cannot override routing/execution arguments")
+    unsupported = [name for name in _SECURITY_OPTIONS.intersection(options)
+                   if options[name] is not None
+                   and not _method_accepts_param(provider_obj, method_name, name)]
+    if unsupported:
+        raise ValueError(f"Unsupported security options: {sorted(unsupported)}")
+
+
+def _fallback_preserves_policy(primary, candidate, options: dict | None) -> bool:
+    """Do not guess equivalence between different native permission systems."""
+    attributes = tuple("_" + key for key in _SECURITY_OPTIONS)
+    explicit = bool(options and any(k in _SECURITY_OPTIONS and v is not None
+                                    for k, v in options.items()))
+    restricted = (
+        getattr(primary, "_sandbox_mode", "danger-full-access") != "danger-full-access"
+        or getattr(primary, "_permission_mode", "bypassPermissions") != "bypassPermissions"
+        or getattr(primary, "_allowed_tools", None) is not None
+        or bool(getattr(primary, "_disallowed_tools", None))
+        or bool(getattr(primary, "_available_tools", None))
+        or getattr(primary, "_allow_all_tools", True) is False
+        or getattr(primary, "_allow_all_paths", True) is False
+        or getattr(primary, "_trust_all", True) is False
+        or getattr(primary, "_allow_file_reads", True) is False
+        or getattr(primary, "_allow_file_writes", True) is False
+        or getattr(primary, "_approval_policy", None) is not None
+        or getattr(primary, "_oauth_token", None) is not None
+        or getattr(primary, "_env", None) in ("isolated", "lean")
+    )
+    if not explicit and not restricted:
+        return True
+    return type(primary) is type(candidate) and all(
+        getattr(primary, name, None) == getattr(candidate, name, None)
+        for name in attributes)
+
 
 def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bool:
     key = (type(provider_obj), method_name, param_name)
@@ -111,6 +202,17 @@ def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bo
     return result
 
 
+def _codex_policy(provider_obj, options=None):
+    if not provider_obj or provider_obj.provider_id != "codex":
+        return None
+    if not hasattr(provider_obj, "_sandbox_mode"):
+        return None
+    options = options or {}
+    return [options.get("sandbox_mode") or provider_obj._sandbox_mode,
+            options.get("approval_policy") if options.get("approval_policy") is not None
+            else provider_obj._approval_policy]
+
+
 def _supported_kwargs(provider_obj, method_name: str, kwargs: dict) -> dict:
     return {
         key: value
@@ -123,8 +225,8 @@ def _merge_options(base: dict, provider_options: dict | None) -> dict:
     """provider_options(호출 시점 옵션)를 base kwargs 에 병합 — provider_options 우선.
 
     실제로 provider 의 메서드가 받는 키만 호출 직전 ``_supported_kwargs`` 가
-    걸러내므로, 한 provider 전용 옵션(예: claude mcp_config)을 다른 provider
-    로 fallback 해도 안전하게 무시된다 (#154)."""
+    걸러낸다. 비보안 미지원 옵션은 무시하되 보안 제어는 검증 단계에서 거부하고
+    fallback 정책도 별도로 확인한다."""
     if provider_options:
         base.update(provider_options)
     return base
@@ -175,9 +277,16 @@ def _augment_system_prompt_with_schema(system_prompt: str,
 def _accumulate_tokens(total: TokenUsage, add: TokenUsage) -> None:
     """스키마 재시도 전 호출의 usage 를 합산 — 시도 횟수만큼 쓴 토큰이 전부
     기록되어야 usage 회계가 참이다 (#72)."""
-    for f in ("prompt_tokens", "completion_tokens", "total_tokens",
-              "cached_tokens", "cache_creation_tokens"):
-        setattr(total, f, getattr(total, f, 0) + getattr(add, f, 0))
+    total.accumulate(add)
+
+
+def _validate_schema_retries(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("schema_retries must be a nonnegative integer")
+
+
+def _corrected_fallback(original, fallback, current):
+    return fallback if current is original else fallback + current[len(original):]
 
 
 def _schema_correction_messages(messages: list[Message], raw: str,
@@ -198,122 +307,191 @@ def _schema_correction_messages(messages: list[Message], raw: str,
     ]
 
 
+def _native_alias(provider_obj, alias: str, namespace: str) -> str:
+    # Copilot's named sessions are account-global, not keyed by app owner.
+    if provider_obj.provider_id == "copilot" and alias and namespace:
+        return "agentcli-" + hashlib.sha256(namespace.encode()).hexdigest()[:32]
+    return alias
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
                        effort=None, thinking=None,
-                       provider_options=None):
+                       provider_options=None, native_namespace=""):
+    _validate_provider_options(provider_obj, "invoke", provider_options)
+    try:
+        validate_auth_options(provider_obj.provider_id, provider_options)
+    except AuthProfileError as exc:
+        return service_auth_response(LLMResponse("", provider_obj.provider_id, model,
+                                                error=str(exc), error_type="auth"))
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return _budget_expired(provider_obj.provider_id, model)
     kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "resume_by_alias": resume_by_alias,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return provider_obj.invoke(messages, **kwargs)
+    result = provider_obj.invoke(messages, **kwargs)
+    if remaining_timeout(1) <= 0:
+        expired = _budget_expired(provider_obj.provider_id, model)
+        expired.tokens, expired.raw_content = result.tokens, result.content
+        return expired
+    return service_auth_response(result)
+
+
+def _budget_expired(provider, model):
+    return LLMResponse(content="", provider=provider, model=model,
+                       error="wall timeout expired", error_type="timeout", exit_code=124)
+
+
+async def _persist_in_thread(function, *args):
+    """Keep the conversation lease until a started store write has finished."""
+    return await complete_in_thread(function, *args)
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     session_id, cwd, alias,
                                     resume_by_alias=True,
                                     effort=None, thinking=None,
-                                    provider_options=None):
+                                    provider_options=None, native_namespace=""):
+    _validate_provider_options(provider_obj, "invoke_async", provider_options)
+    try:
+        await validate_auth_options_async(provider_obj.provider_id, provider_options)
+    except AuthProfileError as exc:
+        return service_auth_response(LLMResponse("", provider_obj.provider_id, model,
+                                                error=str(exc), error_type="auth"))
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return _budget_expired(provider_obj.provider_id, model)
     kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "resume_by_alias": resume_by_alias,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return await provider_obj.invoke_async(messages, **kwargs)
+    try:
+        # No budget: retain provider-native timeout behavior.
+        if remaining_timeout(float("inf")) == float("inf"):
+            return service_auth_response(await provider_obj.invoke_async(messages, **kwargs))
+        return service_auth_response(await asyncio.wait_for(
+            provider_obj.invoke_async(messages, **kwargs), remaining_timeout(float("inf"))))
+    except asyncio.TimeoutError:
+        return _budget_expired(provider_obj.provider_id, model)
 
 
 def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         session_id, cwd, alias, idle_timeout=None,
                         wall_timeout=None, resume_by_alias=True,
                         effort=None, thinking=None,
-                        provider_options=None):
+                        provider_options=None, native_namespace="", deadline=None):
+    _validate_provider_options(provider_obj, "stream_async", provider_options)
+    validate_auth_options(provider_obj.provider_id, provider_options)
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "idle_timeout": idle_timeout,
         "wall_timeout": wall_timeout,
         "resume_by_alias": resume_by_alias,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return provider_obj.stream_async(messages, **kwargs)
+    return bounded_stream(provider_obj.stream_async(messages, **kwargs), deadline)
 
 
 class LLMClient:
     def __init__(self, store: ConversationStore,
                  registry: ProviderRegistry | None = None,
-                 fallback_order: list[str] | None = None):
+                 fallback_order: list[str] | None = None,
+                 *, context_authorizer=None, session_lock_factory=None,
+                 auth_profile: AuthProfile | None = None):
         self._store = store
         self._registry = registry or create_default_registry()
+        self._context_authorizer = context_authorizer
+        self._session_lock_factory = session_lock_factory
+        if auth_profile is not None and not isinstance(auth_profile, AuthProfile):
+            raise TypeError("auth_profile must be an AuthProfile")
+        self._auth_profile = auth_profile
         if fallback_order:
             self._registry.set_fallback_order(fallback_order)
-        # 같은 conversation 에 대한 동시 호출 직렬화 (in-process).
-        # 직렬화 없이는 두 호출이 같은 session_id 를 읽고 각자 CLI 세션을
-        # 분기시킨 뒤 마지막 쓰기가 다른 쪽을 덮어쓴다.
-        self._conv_locks_guard = threading.Lock()
-        self._sync_conv_locks: dict[str, threading.Lock] = {}
-        # asyncio.Lock 은 event loop 에 묶이므로 루프별로 분리. 루프가
-        # 소멸하면 WeakKeyDictionary 가 잠금 사전을 함께 회수한다.
-        self._async_conv_locks: "weakref.WeakKeyDictionary" = (
-            weakref.WeakKeyDictionary())
 
     def _store_lock(self):
         lock = getattr(self._store, "_lock", None)
         return lock if lock is not None else nullcontext()
 
-    def _sync_conversation_lock(self, conv_id: str) -> threading.Lock:
-        with self._conv_locks_guard:
-            lock = self._sync_conv_locks.get(conv_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._sync_conv_locks[conv_id] = lock
-            return lock
+    def _store_write(self):
+        transaction = getattr(self._store, "transaction", None)
+        return transaction() if transaction is not None else self._store_lock()
 
-    def _async_conversation_lock(self, conv_id: str) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        with self._conv_locks_guard:
-            per_loop = self._async_conv_locks.get(loop)
-            if per_loop is None:
-                per_loop = {}
-                self._async_conv_locks[loop] = per_loop
-            lock = per_loop.get(conv_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                per_loop[conv_id] = lock
-            return lock
+    @property
+    def auth_profile(self) -> AuthProfile | None:
+        """Immutable service profile; use public_dict() for non-secret identity."""
+        return self._auth_profile
 
-    def _refresh_session_id(self, conv_id: str, provider: str,
-                            provider_obj, session_id: str,
-                            force_new_session: bool) -> str:
-        """conversation 잠금 획득 후 최신 session_id 재조회.
+    def set_auth_profile(self, profile: AuthProfile):
+        """Rotate this client's credentials; in-flight calls retain their snapshot.
 
-        _prepare 와 잠금 획득 사이에 동시 호출이 새 세션을 만들었을 수 있다.
-        같은 모드(sync↔sync, async↔async) 내 동시 호출만 직렬화된다.
+        Account/root changes require a different profile/client and conversation.
+        The host must ensure a rotation still belongs to the same account.
         """
-        if force_new_session or not (
-                provider_obj and provider_obj.supports_sessions):
-            return session_id
+        if not isinstance(profile, AuthProfile):
+            raise TypeError("profile must be an AuthProfile")
+        if self._auth_profile is None or profile.binding != self._auth_profile.binding:
+            raise AuthProfileError("Rotation must preserve the service profile identity and root")
+        if any(profile.method(pid) != self._auth_profile.method(pid)
+               for pid in ("claude", "codex", "copilot")):
+            raise AuthProfileError("Rotation cannot change authentication methods")
+        profile._check_marker()
+        self._auth_profile = profile
+
+    def _validate_call_options(self, provider: str, method: str, options):
+        if not provider:
+            chain = self._registry.get_fallback_chain()
+            provider = chain[0] if chain else ""
+        selected = self._registry.get(provider)
+        if selected is not None:
+            validate_auth_options(provider, options)
+            if current_auth_profile() is not None and getattr(selected, "_oauth_token", None) is not None:
+                raise AuthProfileError("Provider credentials conflict with the service auth profile")
+            _validate_provider_options(selected, method, options)
+
+    def _sync_conversation_lock(self, conv_id: str):
+        return ConversationLease(self._store, conv_id, self._session_lock_factory)
+
+    def _check_resume_policy(self, conv_id, provider_obj, session_id, options):
+        policy = _codex_policy(provider_obj, options)
+        if not session_id or policy is None:
+            return
         with self._store_lock():
             conv = self._store.get(conv_id)
-        if conv is None:
-            return session_id
-        # 저장값을 그대로 반환 — 동시 clear_session_metadata("") 도 존중한다.
-        return conv.metadata.get(
-            SESSION_KEY_FMT.format(provider=provider), "")
+            previous = conv.metadata.get("codex_execution_policy") if conv else None
+        if ((previous is not None and previous != policy)
+                or (previous is None and policy != ["danger-full-access", None])):
+            raise PermissionError("Codex resume cannot change/verify this execution policy; use new_session=True")
+
+    def _async_conversation_lock(self, conv_id: str):
+        return async_lease(self._sync_conversation_lock(conv_id))
+
+    def _locked_prepare(self, *args, method=None, options=None, check_policy=False):
+        if method is not None:
+            self._validate_call_options(args[1], method, options)
+        with self._store_lock():
+            plan = self._prepare(*args)
+        if check_policy:
+            self._check_resume_policy(plan.conv.id, plan.provider_obj, plan.session_id, options)
+        return plan
 
     # ---------- 공용 준비/저장 로직 (sync/async 공유) ----------
 
@@ -322,9 +500,7 @@ class LLMClient:
         if not cwd:
             return
         new_hashes = _compute_instructions_hashes(cwd)
-        if not new_hashes:
-            return
-        prev = conv.metadata.get(DRIFT_KEY, {}) or {}
+        prev = conv.metadata.get(DRIFT_KEY)
         if prev and prev != new_hashes:
             diffs = {}
             for k in set(prev) | set(new_hashes):
@@ -346,7 +522,7 @@ class LLMClient:
                  reset_on_instruction_change: bool = False,
                  alias: str = "",
                  cwd: str | None = None,
-                 new_session: bool = False):
+                 new_session: bool = False) -> CallPlan:
         """프로바이더 결정 → conversation resolve → messages 조립.
 
         Conversation 해석 우선순위:
@@ -354,10 +530,7 @@ class LLMClient:
           2. alias가 명시되면 (owner, alias)로 조회/생성
           3. 둘 다 없으면 신규 conversation
 
-        Returns:
-            (provider_id, provider_obj, conv, messages, fallback_messages,
-             session_id, model, created_conversation, resolved_alias,
-             alias_to_set, system_prompt_hash, force_new_session)
+        Returns a named CallPlan; lease holders refresh the complete plan.
         """
         if not provider:
             chain = self._registry.get_fallback_chain()
@@ -382,17 +555,37 @@ class LLMClient:
         elif alias_existing is not None:
             conv = alias_existing
 
+        if conv is not None:
+            _require_conversation_scope(conv, owner, cwd)
+        # Validate all sources before creating or mutating the target handle.
+        if inject_context:
+            for ctx in inject_context:
+                source = self._store.get(ctx["conversation_id"])
+                if source is None:
+                    raise LookupError("Injected context conversation is unavailable")
+                if source is not None and source.owner != owner:
+                    if (self._context_authorizer is None
+                            or self._context_authorizer(owner, source) is not True):
+                        raise PermissionError("Injected context is not authorized for this owner")
+
         created_conversation = False
         if conv is None:
             conv = self._store.create(owner, provider, model,
                                        conversation_id=conversation_id,
                                        alias=alias)
             created_conversation = alias_existing is None
+            _require_conversation_scope(conv, owner, cwd)
+            profile = current_auth_profile()
+            if profile is not None:
+                self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
         resolved_alias = conv.alias or alias
+        reserve_conversation(self._store, conv)
+        require_auth_method(conv, provider)
         alias_to_set = alias if alias and not conv.alias else ""
 
         is_session = bool(provider_obj and provider_obj.supports_sessions)
-        instruction_hashes = _compute_instructions_hashes(cwd)
+        instruction_hashes = _compute_instructions_hashes(
+            cwd, refresh=reset_on_instruction_change)
 
         session_id = ""
         prev_messages: list[Message] = []
@@ -422,12 +615,13 @@ class LLMClient:
         force_new_session = False
         if is_session and reset_on_instruction_change and session_id:
             prev_instruction_hashes = conv.metadata.get(DRIFT_KEY, {}) or {}
-            if (instruction_hashes and prev_instruction_hashes
+            if (DRIFT_KEY in conv.metadata
                     and instruction_hashes != prev_instruction_hashes):
                 force_new_session = True
             prev_system_hash = conv.metadata.get(
                 SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider), "")
-            if system_prompt_hash and prev_system_hash and prev_system_hash != system_prompt_hash:
+            if (SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=provider) in conv.metadata
+                    and prev_system_hash != system_prompt_hash):
                 force_new_session = True
             if force_new_session:
                 session_id = ""
@@ -458,10 +652,12 @@ class LLMClient:
         # Fallback providers start fresh, so they must still receive the current
         # system instructions even when the primary session has already seen them.
         fallback_messages = build_messages(include_system_prompt=bool(system_prompt))
-        return (
-            provider, provider_obj, conv, messages, fallback_messages,
-            session_id, model, created_conversation, resolved_alias,
-            alias_to_set, system_prompt_hash, force_new_session,
+        return CallPlan(
+            provider=provider, provider_obj=provider_obj, conv=conv,
+            messages=messages, fallback_messages=fallback_messages,
+            session_id=session_id, model=model, created_conversation=created_conversation,
+            resolved_alias=resolved_alias, alias_to_set=alias_to_set,
+            system_prompt_hash=system_prompt_hash, force_new_session=force_new_session,
         )
 
     def _discard_failed_prepare(self, conv_id: str,
@@ -469,15 +665,38 @@ class LLMClient:
         """Remove a conversation created only for a failed call."""
         if not created_conversation:
             return False
-        with self._store_lock():
+        with self._store_write():
+            current = self._store.get(conv_id)
+            if current is None:
+                return True
+            if (current.metadata.get("has_successful_turn")
+                    or current.metadata.get(WORKSPACE_KEY)
+                    or _session_providers_from_metadata(current.metadata)):
+                return False
             self._store.delete(conv_id)
         return True
 
     def _persist_success(self, conv, cwd: str | None, prompt: str,
                          response: LLMResponse, agent: str,
                          alias: str, alias_to_set: str = "",
-                         system_prompt_hash: str = "") -> None:
-        with self._store_lock():
+                         system_prompt_hash: str = "", provider_options=None,
+                         force_new_session: bool = False) -> None:
+        with self._store_write():
+            current = self._store.get(conv.id)
+            if current is None:
+                raise RuntimeError("Conversation disappeared before persistence")
+            self._store.set_metadata(conv.id, "has_successful_turn", True)
+            if not session_generation_matches(self._store, current, response.provider):
+                self._persist(conv.id, prompt, response, agent, alias=alias,
+                              persist_session=False)
+                return
+            profile = current_auth_profile()
+            if profile is not None:
+                self._store.set_metadata(conv.id, AUTH_SCOPE_KEY, profile.binding)
+                self._store.set_metadata(conv.id, "service_auth_method:" + response.provider,
+                                         profile.method(response.provider))
+            if not conv.metadata.get(WORKSPACE_KEY):
+                self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
             if alias_to_set:
                 self._store.set_alias(conv.id, alias_to_set)
                 conv.alias = alias_to_set
@@ -486,8 +705,12 @@ class LLMClient:
             self._check_drift(conv, cwd)
             response_provider = (
                 self._registry.get(response.provider) if response.provider else None)
-            if (system_prompt_hash and response_provider
-                    and response_provider.supports_sessions):
+            policy = _codex_policy(response_provider, provider_options)
+            if policy is not None:
+                self._store.set_metadata(conv.id, "codex_execution_policy", policy)
+            system_key = SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=response.provider)
+            if (response_provider and response_provider.supports_sessions
+                    and (system_prompt_hash or force_new_session or system_key not in conv.metadata)):
                 self._store.set_metadata(
                     conv.id,
                     SYSTEM_PROMPT_HASH_KEY_FMT.format(provider=response.provider),
@@ -496,7 +719,7 @@ class LLMClient:
 
     def _persist(self, conv_id: str, prompt: str,
                  response: LLMResponse, agent: str,
-                 alias: str = "") -> None:
+                 alias: str = "", persist_session: bool = True) -> None:
         """성공한 호출에 대해 usage 기록 + (비세션) 메시지 저장.
 
         세션 provider는 `add_message` 호출 없이 session_id만 metadata에 저장.
@@ -521,7 +744,7 @@ class LLMClient:
         actual_is_session = bool(p and p.supports_sessions)
 
         if actual_is_session:
-            if response.session_id:
+            if response.session_id and persist_session:
                 self._store.set_metadata(
                     conv_id,
                     SESSION_KEY_FMT.format(provider=response.provider),
@@ -548,6 +771,9 @@ class LLMClient:
 
     # ---------- 동기 chat ----------
 
+    @reserved_turn
+    @auth_scoped
+    @request_budget
     def chat(self, prompt: str, *,
              provider: str = "", model: str = "",
              conversation_id: str = "", owner: str = "",
@@ -569,41 +795,46 @@ class LLMClient:
              validator=None,
              schema_retries: int = 1,
              ) -> LLMResponse:
+        _validate_schema_retries(schema_retries)
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        self._validate_call_options(provider, "invoke", provider_options)
         if output_schema is not None:
             from .schema import assert_supported_schema
             assert_supported_schema(output_schema)   # 재시도 비용 전에 터뜨림
             system_prompt = _augment_system_prompt_with_schema(
                 system_prompt, output_schema)
         with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model,
-             created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
+            plan = self._prepare(
                 prompt, provider, model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
                 strict_model, reset_on_instruction_change, alias, cwd,
                 new_session)
-        conversation_id = conv.id
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         with self._sync_conversation_lock(conversation_id):
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+            with self._store_lock():
+                plan = self._prepare(
+                    prompt, plan.provider, plan.model, conversation_id, owner,
+                    system_prompt, context_turns, agent, inject_context,
+                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                created_conversation = created_conversation or plan.created_conversation
+            self._check_resume_policy(conversation_id, plan.provider_obj, plan.session_id, provider_options)
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
-                    provider, msgs, fallback_messages, model,
-                    wall_timeout or timeout, session_id, cwd,
-                    alias=resolved_alias,
-                    resume_by_alias=not force_new_session,
+                    plan.provider, msgs, _corrected_fallback(plan.messages, plan.fallback_messages, msgs), plan.model,
+                    timeout, plan.session_id, cwd,
+                    alias=plan.resolved_alias,
+                    resume_by_alias=not plan.force_new_session,
                     allow_fallback=fallback, effort=effort,
-                    thinking=thinking, provider_options=provider_options)
+                    thinking=thinking, provider_options=provider_options,
+                    native_namespace=conversation_id)
 
             response = self._run_with_output_schema(
-                _dispatch, messages, output_schema, validator, schema_retries)
+                _dispatch, plan.messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
@@ -612,9 +843,9 @@ class LLMClient:
                     response.conversation_id = ""
                 return response
 
-            self._persist_success(conv, cwd, prompt, response, agent,
-                                  resolved_alias, alias_to_set,
-                                  system_prompt_hash)
+            self._persist_success(plan.conv, cwd, prompt, response, agent,
+                                  plan.resolved_alias, plan.alias_to_set,
+                                  plan.system_prompt_hash, provider_options, plan.force_new_session)
             return response
 
     @staticmethod
@@ -718,7 +949,8 @@ class LLMClient:
                               allow_fallback: bool = False,
                               effort: str | None = None,
                               thinking: str | None = None,
-                              provider_options: dict | None = None) -> LLMResponse:
+                              provider_options: dict | None = None,
+                              native_namespace: str = "") -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         # 1) primary 시도
@@ -729,7 +961,7 @@ class LLMClient:
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -757,6 +989,11 @@ class LLMClient:
             np = self._registry.get(next_id)
             if not np:
                 continue
+            if not _fallback_preserves_policy(p, np, provider_options):
+                logger.warning("[LLM] fallback blocked: incompatible execution policy")
+                if last_resp is not None:
+                    last_resp.suggested_action += " Fallback blocked by execution policy."
+                continue
             logger.warning("[LLM] %s(%s) 실패 → %s fallback",
                            provider_id, primary_type or "no-content", next_id)
             # Fallback은 세션 연속성 포기 — session_id 전달 안 함. alias 유지.
@@ -765,7 +1002,7 @@ class LLMClient:
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -782,12 +1019,15 @@ class LLMClient:
     @staticmethod
     def _log_provider_failure(provider_id: str, resp: LLMResponse) -> None:
         if resp.error:
-            logger.warning("[LLM] %s 실패(%s): %s",
+            logger.warning("[LLM] %s 실패(%s), exit_code=%s, error_chars=%d",
                            provider_id, resp.error_type or "?",
-                           resp.error[:200])
+                           resp.exit_code, len(resp.error))
 
     # ---------- 비동기 chat ----------
 
+    @reserved_turn
+    @auth_scoped
+    @request_budget
     async def chat_async(self, prompt: str, *,
                          provider: str = "", model: str = "",
                          conversation_id: str = "", owner: str = "",
@@ -809,6 +1049,7 @@ class LLMClient:
                          validator=None,
                          schema_retries: int = 1,
                          ) -> LLMResponse:
+        _validate_schema_retries(schema_retries)
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
         if output_schema is not None:
@@ -816,45 +1057,46 @@ class LLMClient:
             assert_supported_schema(output_schema)
             system_prompt = _augment_system_prompt_with_schema(
                 system_prompt, output_schema)
-        with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model,
-             created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
-                prompt, provider, model, conversation_id, owner,
-                system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd,
-                new_session)
-        conversation_id = conv.id
+        plan = await complete_in_thread(
+            self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            system_prompt, context_turns, agent, inject_context,
+            strict_model, reset_on_instruction_change, alias, cwd, new_session,
+            method="invoke_async", options=provider_options)
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         async with self._async_conversation_lock(conversation_id):
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+            plan = await complete_in_thread(
+                self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd, new_session,
+                options=provider_options, check_policy=True)
+            created_conversation = created_conversation or plan.created_conversation
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
-                    provider, msgs, fallback_messages, model,
-                    wall_timeout or timeout, session_id, cwd,
-                    alias=resolved_alias,
-                    resume_by_alias=not force_new_session,
+                    plan.provider, msgs, _corrected_fallback(plan.messages, plan.fallback_messages, msgs), plan.model,
+                    timeout, plan.session_id, cwd,
+                    alias=plan.resolved_alias,
+                    resume_by_alias=not plan.force_new_session,
                     allow_fallback=fallback, effort=effort,
-                    thinking=thinking, provider_options=provider_options)
+                    thinking=thinking, provider_options=provider_options,
+                    native_namespace=conversation_id)
 
             response = await self._arun_with_output_schema(
-                _dispatch, messages, output_schema, validator, schema_retries)
+                _dispatch, plan.messages, output_schema, validator, schema_retries)
             response.conversation_id = conversation_id
 
             if not response.content:
-                if self._discard_failed_prepare(conversation_id,
-                                                created_conversation):
+                if await complete_in_thread(self._discard_failed_prepare, conversation_id,
+                                            created_conversation):
                     response.conversation_id = ""
                 return response
 
             # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
-            await asyncio.to_thread(self._persist_success, conv, cwd, prompt,
-                                    response, agent, resolved_alias,
-                                    alias_to_set, system_prompt_hash)
+            await _persist_in_thread(self._persist_success, plan.conv, cwd, prompt,
+                                    response, agent, plan.resolved_alias,
+                                    plan.alias_to_set, plan.system_prompt_hash, provider_options, plan.force_new_session)
             return response
 
     async def _invoke_async_with_fallback(self, provider_id: str,
@@ -868,7 +1110,8 @@ class LLMClient:
                                           allow_fallback: bool = False,
                                           effort: str | None = None,
                                           thinking: str | None = None,
-                              provider_options: dict | None = None) -> LLMResponse:
+                                          provider_options: dict | None = None,
+                                          native_namespace: str = "") -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         p = self._registry.get(provider_id)
@@ -878,7 +1121,7 @@ class LLMClient:
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -905,6 +1148,11 @@ class LLMClient:
             np = self._registry.get(next_id)
             if not np:
                 continue
+            if not _fallback_preserves_policy(p, np, provider_options):
+                logger.warning("[LLM] fallback blocked: incompatible execution policy")
+                if last_resp is not None:
+                    last_resp.suggested_action += " Fallback blocked by execution policy."
+                continue
             logger.warning("[LLM] %s(%s) 실패 → %s fallback (async)",
                            provider_id, primary_type or "no-content", next_id)
             resp = await _invoke_async_with_alias(
@@ -912,7 +1160,7 @@ class LLMClient:
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -947,6 +1195,8 @@ class LLMClient:
                 "검증·교정 재시도는 완결 응답 전제. chat/chat_async 를 쓴다.")
         return self._chat_stream_impl(prompt, **kwargs)
 
+    @reserved_turn
+    @auth_scoped
     async def _chat_stream_impl(self, prompt: str, *,
                                 provider: str = "", model: str = "",
                                 conversation_id: str = "", owner: str = "",
@@ -978,45 +1228,54 @@ class LLMClient:
         """
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
-        with self._store_lock():
-            (provider, provider_obj, conv, messages, fallback_messages,
-             session_id, model, created_conversation, resolved_alias, alias_to_set,
-             system_prompt_hash, force_new_session) = self._prepare(
-                prompt, provider, model, conversation_id, owner,
-                system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd,
-                new_session)
-        conversation_id = conv.id
+        if wall_timeout is not None and wall_timeout < 0:
+            raise ValueError("wall_timeout must be nonnegative")
+        deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
+        plan = await complete_in_thread(
+            self._locked_prepare, prompt, provider, model, conversation_id, owner,
+            system_prompt, context_turns, agent, inject_context,
+            strict_model, reset_on_instruction_change, alias, cwd, new_session,
+            method="stream_async", options=provider_options)
+        conversation_id = plan.conv.id
+        created_conversation = plan.created_conversation
 
-        if provider_obj is None:
-            self._discard_failed_prepare(conversation_id, created_conversation)
-            yield make_error_chunk(f"unknown provider: {provider}",
-                                   provider=provider)
+        if plan.provider_obj is None:
+            await complete_in_thread(self._discard_failed_prepare, conversation_id, created_conversation)
+            yield make_error_chunk(f"unknown provider: {plan.provider}",
+                                   provider=plan.provider)
             yield StreamChunk(type="done", content="",
-                              data={"provider": provider, "model": model,
+                              data={"provider": plan.provider, "model": plan.model,
                                     "latency_ms": 0})
             return
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         # 스트림 소비가 끝날 때까지 같은 conversation 의 다른 호출은 대기한다.
         async with self._async_conversation_lock(conversation_id):
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+            plan = await complete_in_thread(
+                self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
+                system_prompt, context_turns, agent, inject_context,
+                strict_model, reset_on_instruction_change, alias, cwd, new_session,
+                options=provider_options, check_policy=True)
+            created_conversation = created_conversation or plan.created_conversation
             attempts = [
-                (provider, provider_obj, messages, model, session_id,
-                 not force_new_session)
+                (plan.provider, plan.provider_obj, plan.messages, plan.model, plan.session_id,
+                 not plan.force_new_session)
             ]
+            policy_blocked = False
             if fallback:
                 for next_id in self._registry.get_fallback_chain():
-                    if next_id == provider:
+                    if next_id == plan.provider:
                         continue
                     next_provider = self._registry.get(next_id)
                     if next_provider is None:
                         continue
+                    if not _fallback_preserves_policy(plan.provider_obj, next_provider, provider_options):
+                        policy_blocked = True
+                        logger.warning("[LLM] stream fallback blocked: incompatible execution policy")
+                        continue
                     attempts.append(
-                        (next_id, next_provider, fallback_messages, "", "",
-                         not force_new_session))
+                        (next_id, next_provider, plan.fallback_messages, "", "",
+                         not plan.force_new_session))
 
             last_error: StreamChunk | None = None
             for attempt_index, (current_id, current_provider, current_messages,
@@ -1028,18 +1287,22 @@ class LLMClient:
                 latency_ms = 0
                 saw_error = False
                 emitted_output = False
+                current_stream = None
 
                 try:
-                    async for raw_chunk in _stream_with_alias(
+                    await validate_auth_options_async(current_id, provider_options)
+                    current_stream = _stream_with_alias(
                             current_provider, current_messages,
                             model=current_model, timeout=timeout,
                             session_id=current_sid, cwd=cwd,
-                            alias=resolved_alias,
+                            alias=plan.resolved_alias,
                             idle_timeout=idle_timeout,
                             wall_timeout=wall_timeout,
                             resume_by_alias=resume_by_alias,
                             effort=effort, thinking=thinking,
-                            provider_options=provider_options):
+                            provider_options=provider_options,
+                            native_namespace=conversation_id, deadline=deadline)
+                    async for raw_chunk in current_stream:
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
 
@@ -1056,6 +1319,10 @@ class LLMClient:
                             saw_error = True
                             err_chunk = standardize_error_chunk(
                                 raw_chunk, provider=current_id)
+                            if current_auth_profile() is not None and err_chunk.data.get("error_type") == "auth":
+                                err_chunk.data["suggested_action"] = SERVICE_AUTH_ACTION
+                            if policy_blocked:
+                                err_chunk.data["fallback_blocked"] = True
                             last_error = err_chunk
                             if emitted_output:
                                 yield err_chunk
@@ -1073,19 +1340,35 @@ class LLMClient:
                         if raw_chunk.type == "text":
                             text_parts.append(raw_chunk.content)
                         yield raw_chunk
+                except AuthProfileError as exc:
+                    saw_error = True
+                    last_error = make_error_chunk(str(exc), provider=current_id,
+                                                  error_type="auth",
+                                                  suggested_action=SERVICE_AUTH_ACTION)
+                    if emitted_output:
+                        yield last_error
+                except asyncio.TimeoutError:
+                    saw_error = True
+                    last_error = make_error_chunk("wall timeout expired", provider=current_id,
+                                                  error_type="timeout")
+                    if emitted_output:
+                        yield last_error
                 except Exception as exc:
                     saw_error = True
                     err_chunk = make_error_chunk(str(exc), provider=current_id)
                     last_error = err_chunk
                     if emitted_output:
                         yield err_chunk
+                finally:
+                    if current_stream is not None:
+                        await current_stream.aclose()
 
                 full_content = "".join(text_parts)
                 has_more_attempts = attempt_index < len(attempts) - 1
 
                 if saw_error:
                     if emitted_output:
-                        self._discard_failed_prepare(
+                        await complete_in_thread(self._discard_failed_prepare,
                             conversation_id, created_conversation)
                         yield StreamChunk(
                             type="done", content=full_content,
@@ -1099,7 +1382,7 @@ class LLMClient:
                             "[LLM] %s stream failed before output → fallback",
                             current_id)
                         continue
-                    self._discard_failed_prepare(
+                    await complete_in_thread(self._discard_failed_prepare,
                         conversation_id, created_conversation)
                     if last_error is not None:
                         yield last_error
@@ -1116,10 +1399,10 @@ class LLMClient:
                         model=current_model, tokens=final_usage,
                         latency_ms=latency_ms, session_id=final_sid,
                         conversation_id=conversation_id)
-                    await asyncio.to_thread(
-                        self._persist_success, conv, cwd, prompt, synthetic,
-                        agent, resolved_alias, alias_to_set,
-                        system_prompt_hash)
+                    await _persist_in_thread(
+                        self._persist_success, plan.conv, cwd, prompt, synthetic,
+                        agent, plan.resolved_alias, plan.alias_to_set,
+                        plan.system_prompt_hash, provider_options, plan.force_new_session)
 
                     yield StreamChunk(
                         type="done", content=full_content,
@@ -1138,7 +1421,7 @@ class LLMClient:
                         current_id)
                     continue
 
-                self._discard_failed_prepare(
+                await complete_in_thread(self._discard_failed_prepare,
                     conversation_id, created_conversation)
                 yield empty_error
                 yield StreamChunk(
@@ -1169,6 +1452,7 @@ class LLMClient:
         """`resolve_model()`의 의미가 드러나는 별칭."""
         return self.resolve_model(provider, model, strict=strict)
 
+    @auth_scoped
     def health_check(self, provider: str = "", *,
                      timeout: int = 10,
                      cwd: str | None = None,
@@ -1180,6 +1464,15 @@ class LLMClient:
         commands where available. `probe=True` performs a minimal model call to
         catch quota/usage-limit failures before production work starts.
         """
+        def check(p):
+            try:
+                validate_auth_options(p.provider_id)
+                return p.health_check(timeout=timeout, cwd=cwd, probe=probe)
+            except AuthProfileError as exc:
+                return ProviderHealth(provider=p.provider_id, ok=False, status="auth_required",
+                                      available=p.is_available(), auth_ok=False,
+                                      error_type="auth", message=str(exc),
+                                      suggested_action=SERVICE_AUTH_ACTION)
         if provider:
             p = self._registry.get(provider)
             if p is None:
@@ -1187,17 +1480,17 @@ class LLMClient:
                     provider=provider, ok=False, status="unknown_provider",
                     message=f"unknown provider: {provider}",
                     suggested_action="Register the provider before calling health_check().")
-            return p.health_check(timeout=timeout, cwd=cwd, probe=probe)
+            return check(p)
 
         result: dict[str, ProviderHealth] = {}
         for row in self._registry.list_providers():
             pid = row["id"]
             p = self._registry.get(pid)
             if p:
-                result[pid] = p.health_check(
-                    timeout=timeout, cwd=cwd, probe=probe)
+                result[pid] = check(p)
         return result
 
+    @auth_scoped
     def get_account_usage(self, provider: str, *, timeout: float = 15,
                           allow_probe: bool = False,
                           oauth_token: str | None = None,
@@ -1214,10 +1507,23 @@ class LLMClient:
         if p is None:
             return AccountUsage(provider=provider, status="unknown_provider",
                                 message="Register the provider before querying account usage.")
+        if current_auth_profile() is not None:
+            if oauth_token is not None or credentials_path is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            if provider not in {"claude", "codex", "copilot"}:
+                return AccountUsage(provider=provider, status="unsupported",
+                                    message="Provider does not support service authentication")
+            try:
+                validate_auth_options(provider)
+            except AuthProfileError as exc:
+                return AccountUsage(provider=provider, status="auth_required",
+                                    error_type="auth", message=str(exc),
+                                    suggested_action=SERVICE_AUTH_ACTION)
         return p.get_account_usage(timeout=timeout, allow_probe=allow_probe,
                                    oauth_token=oauth_token,
                                    credentials_path=credentials_path)
 
+    @auth_scoped
     async def get_account_usage_async(self, provider: str, *, timeout: float = 15,
                                       allow_probe: bool = False,
                                       oauth_token: str | None = None,
@@ -1228,6 +1534,7 @@ class LLMClient:
             allow_probe=allow_probe, oauth_token=oauth_token,
             credentials_path=credentials_path)
 
+    @auth_scoped
     def session_alive(self, provider: str, *, owner: str = "",
                       alias: str = "", conversation_id: str = "",
                       cwd: str | None = None) -> bool | None:
@@ -1250,6 +1557,7 @@ class LLMClient:
                 conv = self._store.find_by_alias(owner, alias)
         if conv is None:
             return False  # 추적 중인 세션 없음
+        _require_conversation_scope(conv, owner, cwd)
         sid = conv.metadata.get(SESSION_KEY_FMT.format(provider=provider), "")
         if not sid:
             return False
@@ -1343,7 +1651,7 @@ class LLMClient:
         # owner 없을 때는 각 provider 세션 목록을 쓸 수 없음. 현재 API로는
         # list_by_owner를 owner별로 돌려야 함.
         if owner:
-            convs = self._store.list_by_owner(owner, limit=1000)
+            convs = self._store.list_all_by_owner(owner)
         else:
             # store에 전체 순회 없음 — 알려진 캐시 conversation만 반환
             convs = []
@@ -1364,6 +1672,7 @@ class LLMClient:
             })
         return rows
 
+    @auth_scoped
     def get_alias_status(self, owner: str, alias: str,
                          cwd: str | None = None) -> dict:
         """Return UI-ready session/instruction status for one alias."""
@@ -1384,8 +1693,9 @@ class LLMClient:
                 "updated_at": "",
             }
 
+        require_auth_scope(conv)
         stored_hashes = dict(conv.metadata.get(DRIFT_KEY, {}) or {})
-        if current_hashes and stored_hashes:
+        if cwd and DRIFT_KEY in conv.metadata:
             status = "fresh" if current_hashes == stored_hashes else "stale"
         else:
             status = "unknown"
@@ -1404,6 +1714,7 @@ class LLMClient:
             "updated_at": conv.updated_at.isoformat(),
         }
 
+    @auth_scoped
     def clear_session_metadata(self, *, owner: str,
                                alias: str = "",
                                provider: str = "") -> list[dict]:
@@ -1413,16 +1724,25 @@ class LLMClient:
         `session_id:<provider>` and matching `system_prompt_hash:<provider>` keys
         in the configured store so the next call starts a fresh CLI session.
         """
-        with self._store_lock():
+        with self._store_write():
             if alias:
                 conv = self._store.find_by_alias(owner, alias)
                 convs = [conv] if conv is not None else []
             else:
-                convs = self._store.list_by_owner(owner, limit=1000)
+                convs = self._store.list_all_by_owner(owner)
 
             rows: list[dict] = []
             for conv in convs:
+                require_auth_scope(conv)
+            for conv in convs:
                 keys_to_clear: list[str] = []
+                selected_providers = ({provider} if provider else
+                                      {conv.provider, *self._registry.get_fallback_chain(),
+                                       *_session_providers_from_metadata(conv.metadata)})
+                for pid in selected_providers - {""}:
+                    generation = "session_reset_generation:" + pid
+                    self._store.set_metadata(conv.id, generation,
+                                             conv.metadata.get(generation, 0) + 1)
                 for key, value in conv.metadata.items():
                     if not value:
                         continue
@@ -1445,160 +1765,3 @@ class LLMClient:
                         "cleared_keys": keys_to_clear,
                     })
             return rows
-
-
-class ContextSession:
-    """큰 컨텍스트를 1회 주입하고 그 위에서 여러 질의를 던지는 핸들.
-
-    ``LLMClient.pin_context(...)`` 가 생성. 두 가지 방식:
-
-    - ``refine(prompt)`` — **이어가기**: 같은 세션을 resume 하여 이전 답을 본다.
-      세션이 살아있으면 전사록을 재전송하지 않고 지시만 보낸다(효율). 시간이
-      지났거나/프로세스 재시작/세션 만료로 세션이 죽었으면 ``session_alive`` 로
-      판정해 **자동으로 전사록을 재시드**한다 — "잠시 있다가 다시 요청" 대응.
-    - ``fork(prompt)`` — **독립 변형**: 매번 전사록을 새 세션에 재시드하여 변형
-      끼리 섞이지 않는다(예: 같은 전사록으로 격식 회의록 / 액션아이템 / 캐주얼
-      요약을 따로). 효율은 provider 의 프롬프트 캐싱에 의존.
-
-    라이브러리는 세션 id 만 저장하므로(설계 불변식), 전사록 본문은 호스트(이
-    객체)가 들고 있다. 나중에 같은 ``alias`` 로 다시 ``pin_context`` 하면 살아
-    있으면 resume, 죽었으면 재시드한다.
-
-    각 메서드는 sync/async/stream 3종: ``refine``/``refine_async``/
-    ``refine_stream``, ``fork``/``fork_async``/``fork_stream``. 순차 사용 전제.
-    """
-
-    def __init__(self, client: "LLMClient", context: str, *,
-                 provider: str = "", owner: str = "", alias: str = "",
-                 cwd: str | None = None, model: str = "",
-                 separator: str = "\n\n---\n", **chat_kwargs):
-        if not context:
-            raise ValueError("context must be a non-empty string")
-        self._client = client
-        self._context = context
-        self._provider = provider
-        self._owner = owner
-        self._alias = alias or f"ctx-{uuid.uuid4().hex[:8]}"
-        self._cwd = cwd
-        self._model = model
-        self._sep = separator
-        self._chat_kwargs = chat_kwargs
-        self._seeded = False
-        # itertools.count().__next__ 는 GIL/이벤트루프 인터리빙 모두에서 원자적
-        # (읽기-수정-쓰기 3단계 아님) — 동기 fork()/향후 스레드 유입 대비 하드닝.
-        self._fork_n = itertools.count(1)
-
-    @property
-    def alias(self) -> str:
-        return self._alias
-
-    def is_alive(self) -> bool | None:
-        """pin 된 세션이 현재 재개 가능한지 (LLM 호출 없이)."""
-        return self._client.session_alive(
-            self._provider, owner=self._owner, alias=self._alias, cwd=self._cwd)
-
-    def _seed_prompt(self, prompt: str) -> str:
-        return f"{self._context}{self._sep}{prompt}"
-
-    def _opts(self, alias: str, kw: dict) -> dict:
-        opts = dict(provider=self._provider, owner=self._owner, alias=alias,
-                    cwd=self._cwd, model=self._model)
-        opts.update(self._chat_kwargs)
-        opts.update(kw)
-        return opts
-
-    def _refine(self, prompt: str) -> tuple[str, dict]:
-        """세션 생존 여부로 전사록 재시드 결정. ``(prompt, extra_kwargs)`` 반환.
-
-        살아있음(True) → 지시만(전사록 이미 세션에 있음), resume. 죽음/없음(False)
-        → 전사록 재시드 + ``new_session=True``(죽은 sid 에 의존하지 않고 새 세션을
-        명시적으로 시작). 판단불가(None, 예: copilot) → 이 프로세스에서 시드한 적
-        있으면 신뢰(resume), 아니면 안전하게 재시드.
-        """
-        alive = self.is_alive()
-        need_seed = (alive is False) or (alive is None and not self._seeded)
-        self._seeded = True
-        if need_seed:
-            return self._seed_prompt(prompt), {"new_session": True}
-        return prompt, {}
-
-    # ---- refine: 이어가기 (resume; 죽었으면 새 세션에 재시드) ----
-    def refine(self, prompt: str, **kw):
-        p, extra = self._refine(prompt)
-        return self._client.chat(p, **self._opts(self._alias, {**extra, **kw}))
-
-    async def refine_async(self, prompt: str, **kw):
-        p, extra = self._refine(prompt)
-        return await self._client.chat_async(
-            p, **self._opts(self._alias, {**extra, **kw}))
-
-    def refine_stream(self, prompt: str, **kw):
-        p, extra = self._refine(prompt)
-        return self._client.chat_stream(
-            p, **self._opts(self._alias, {**extra, **kw}))
-
-    # ---- fork: 독립 변형 (매번 새 세션에 전사록 재시드) ----
-    def _fork_target(self, prompt: str, label: str) -> tuple[str, str]:
-        n = next(self._fork_n)
-        return (self._seed_prompt(prompt),
-                f"{self._alias}#fork:{label or n}")
-
-    def fork(self, prompt: str, *, label: str = "", **kw):
-        p, a = self._fork_target(prompt, label)
-        return self._client.chat(p, new_session=True, **self._opts(a, kw))
-
-    async def fork_async(self, prompt: str, *, label: str = "", **kw):
-        p, a = self._fork_target(prompt, label)
-        return await self._client.chat_async(
-            p, new_session=True, **self._opts(a, kw))
-
-    def fork_stream(self, prompt: str, *, label: str = "", **kw):
-        p, a = self._fork_target(prompt, label)
-        return self._client.chat_stream(p, new_session=True, **self._opts(a, kw))
-
-    async def fork_many(self, prompts, *, concurrency: int = 4,
-                        labels=None, **kw):
-        """여러 독립 변형을 **병렬** 실행 (동시 개수 상한). 결과는 입력 순서대로.
-
-        출력도 큰 복수 결과를 동시에 뽑을 때 — 각 변형은 전사록을 자기 세션에
-        재시드(서로 안 섞임)하고, ``concurrency`` 로 동시 서브프로세스 수를
-        제한한다(각 ``claude -p`` 가 무겁기 때문). wall-time 은 (상한 내에서)
-        가장 느린 변형으로 수렴한다.
-
-        labels 가 없으면 인덱스를 라벨로 써 alias 가 결정적·고유해진다(공유
-        카운터 race 회피). 큰 출력을 파일로 흘리려면 대신 ``fork_stream`` 을
-        항목별로 쓰거나, lean 을 끄고 에이전트에게 직접 파일을 쓰게 한다.
-
-        실패 의미론: 어떤 fork 가 예외를 던지면 진행 중인 형제 fork 들은
-        **취소**되고, 원래 예외 타입이 그대로 재전파된다 (동시 다중 실패 시
-        첫 예외가 전파되며, 나머지는 ``__cause__`` 의 ExceptionGroup 에서
-        확인 가능).
-        """
-        prompts = list(prompts)
-        if labels is None:
-            labels = [str(i) for i in range(len(prompts))]
-        elif len(labels) != len(prompts):
-            # 길이 불일치면 zip 이 조용히 잘라 prompt 를 누락시킨다 → 명시적 거부.
-            raise ValueError(
-                f"labels length ({len(labels)}) must match prompts "
-                f"({len(prompts)})")
-        sem = asyncio.Semaphore(max(1, concurrency))
-
-        async def _one(prompt, label):
-            async with sem:
-                return await self.fork_async(prompt, label=label, **kw)
-
-        # gather(..., return_exceptions=False) 는 한 fork 가 예외를 던지면 그
-        # 예외만 전파하고 나머지 in-flight fork(실제 서브프로세스)는 취소하지
-        # 않은 채 계속 돈다 → TaskGroup 으로 교체해 형제 취소를 보장한다.
-        # TaskGroup 은 실패를 ExceptionGroup 으로 감싸므로, gather 시절과 같은
-        # "원본 예외 타입을 그대로 캐치" 하는 호출자 계약을 지키기 위해 첫 번째
-        # 예외만 풀어서 재전파한다.
-        tasks: list[asyncio.Task] = []
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tasks = [tg.create_task(_one(p, lbl))
-                         for p, lbl in zip(prompts, labels)]
-        except* BaseException as eg:
-            raise eg.exceptions[0] from eg
-        return [t.result() for t in tasks]

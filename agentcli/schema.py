@@ -44,16 +44,39 @@ def assert_supported_schema(schema, path: str = "$") -> None:
             f"{sorted(_SUPPORTED_KEYS)} 뿐이다. 더 넓은 검증은 validator= "
             f"callable 로.")
     t = schema.get("type")
-    if t is not None and t not in _TYPE_MAP:
+    if "type" in schema and (not isinstance(t, str) or t not in _TYPE_MAP):
         raise ValueError(f"{path}.type: 알 수 없는 타입 {t!r} "
                          f"(지원: {sorted(_TYPE_MAP)})")
-    props = schema.get("properties") or {}
+    props = schema.get("properties", {})
     if not isinstance(props, dict):
         raise ValueError(f"{path}.properties: dict 여야 한다")
     for name, sub in props.items():
         assert_supported_schema(sub, f"{path}.{name}")
     if "items" in schema:
         assert_supported_schema(schema["items"], f"{path}[]")
+    if "required" in schema:
+        required = schema["required"]
+        if (not isinstance(required, list) or not all(isinstance(name, str) for name in required)
+                or len(set(required)) != len(required)):
+            raise ValueError(f"{path}.required: unique string list required")
+    if "enum" in schema:
+        values = schema["enum"]
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"{path}.enum: nonempty JSON value list required")
+        try:
+            json.dumps(values, allow_nan=False)
+        except (TypeError, ValueError):
+            raise ValueError(f"{path}.enum: JSON values required") from None
+
+
+def _json_equal(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def validate(instance, schema: dict, path: str = "$") -> list[str]:
@@ -70,7 +93,7 @@ def validate(instance, schema: dict, path: str = "$") -> list[str]:
             return [f"{path}: {t} 이어야 하는데 boolean"]
         if not isinstance(instance, _TYPE_MAP[t]):
             return [f"{path}: {t} 이어야 하는데 {type(instance).__name__}"]
-    if "enum" in schema and instance not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(instance, value) for value in schema["enum"]):
         errs.append(f"{path}: 허용값 {schema['enum']} 밖의 {instance!r}")
     if isinstance(instance, dict):
         for req in schema.get("required", ()):

@@ -180,7 +180,12 @@ async def test_fs_read_symlink_escape_denied(tmp_path):
     target_outside = tmp_path.parent / "outside.txt"
     target_outside.write_text("secret", encoding="utf-8")
     link = tmp_path / "link.txt"
-    os.symlink(target_outside, link)
+    try:
+        os.symlink(target_outside, link)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable; junction covered separately")
+        raise
     p = KiroProvider()
     res = await p._handle_agent_request(
         "fs/read_text_file", {"path": str(link)}, cwd=str(tmp_path))
@@ -452,9 +457,10 @@ async def test_fs_write_outside_cwd_denied(tmp_path):
     """fs/write_text_file outside cwd must be denied — no file created."""
     p = KiroProvider()
     evil_path = str(tmp_path.parent / "evil.txt")
-    await p._handle_agent_request(
-        "fs/write_text_file", {"path": evil_path, "content": "bad"},
-        cwd=str(tmp_path))
+    with pytest.raises(PermissionError):
+        await p._handle_agent_request(
+            "fs/write_text_file", {"path": evil_path, "content": "bad"},
+            cwd=str(tmp_path))
     import pathlib
     assert not pathlib.Path(evil_path).exists(), (
         "File outside cwd must NOT be created")
