@@ -133,6 +133,8 @@ class SQLiteStore(ConversationStore):
         conv_id = conversation_id or str(uuid.uuid4())
         existing = self.get(conv_id)
         if existing is not None:
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
             if alias and not existing.alias:
                 self.set_alias(conv_id, alias)
                 existing = self.get(conv_id)

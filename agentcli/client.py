@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import itertools
 import logging
+import os
 import threading
 import uuid
 import weakref
@@ -34,6 +35,19 @@ logger = logging.getLogger(__name__)
 SESSION_KEY_FMT = "session_id:{provider}"
 SYSTEM_PROMPT_HASH_KEY_FMT = "system_prompt_hash:{provider}"
 DRIFT_KEY = "instructions_hashes"
+WORKSPACE_KEY = "workspace_root"
+
+
+def _workspace_root(cwd: str | None) -> str:
+    return os.path.normcase(str(Path(cwd or os.getcwd()).expanduser().resolve()))
+
+
+def _require_conversation_scope(conv, owner: str, cwd: str | None):
+    if conv.owner != owner:
+        raise PermissionError("Conversation does not belong to the supplied owner")
+    bound = conv.metadata.get(WORKSPACE_KEY)
+    if bound and bound != _workspace_root(cwd):
+        raise PermissionError("Conversation workspace mismatch; use a different alias")
 DRIFT_INSTRUCTION_FILES = (
     "AGENTS.md", "CLAUDE.md", "GUIDE.md", "AGENTS.override.md")
 
@@ -221,17 +235,24 @@ def _schema_correction_messages(messages: list[Message], raw: str,
     ]
 
 
+def _native_alias(provider_obj, alias: str, namespace: str) -> str:
+    # Copilot's named sessions are account-global, not keyed by app owner.
+    if provider_obj.provider_id == "copilot" and alias and namespace:
+        return "agentcli-" + hashlib.sha256(namespace.encode()).hexdigest()[:32]
+    return alias
+
+
 def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
                        effort=None, thinking=None,
-                       provider_options=None):
+                       provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke", provider_options)
     kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "resume_by_alias": resume_by_alias,
         "effort": effort,
         "thinking": thinking,
@@ -243,14 +264,14 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     session_id, cwd, alias,
                                     resume_by_alias=True,
                                     effort=None, thinking=None,
-                                    provider_options=None):
+                                    provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke_async", provider_options)
     kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "resume_by_alias": resume_by_alias,
         "effort": effort,
         "thinking": thinking,
@@ -262,14 +283,14 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         session_id, cwd, alias, idle_timeout=None,
                         wall_timeout=None, resume_by_alias=True,
                         effort=None, thinking=None,
-                        provider_options=None):
+                        provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "stream_async", provider_options)
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
         "timeout": timeout,
         "session_id": session_id,
         "cwd": cwd,
-        "alias": alias,
+        "alias": _native_alias(provider_obj, alias, native_namespace),
         "idle_timeout": idle_timeout,
         "wall_timeout": wall_timeout,
         "resume_by_alias": resume_by_alias,
@@ -282,9 +303,11 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
 class LLMClient:
     def __init__(self, store: ConversationStore,
                  registry: ProviderRegistry | None = None,
-                 fallback_order: list[str] | None = None):
+                 fallback_order: list[str] | None = None,
+                 *, context_authorizer=None):
         self._store = store
         self._registry = registry or create_default_registry()
+        self._context_authorizer = context_authorizer
         if fallback_order:
             self._registry.set_fallback_order(fallback_order)
         # 같은 conversation 에 대한 동시 호출 직렬화 (in-process).
@@ -334,18 +357,20 @@ class LLMClient:
 
     def _refresh_session_id(self, conv_id: str, provider: str,
                             provider_obj, session_id: str,
-                            force_new_session: bool) -> str:
+                            force_new_session: bool, *, owner=None, cwd=None) -> str:
         """conversation 잠금 획득 후 최신 session_id 재조회.
 
         _prepare 와 잠금 획득 사이에 동시 호출이 새 세션을 만들었을 수 있다.
         같은 모드(sync↔sync, async↔async) 내 동시 호출만 직렬화된다.
         """
-        if force_new_session or not (
-                provider_obj and provider_obj.supports_sessions):
-            return session_id
         with self._store_lock():
             conv = self._store.get(conv_id)
         if conv is None:
+            return session_id
+        if owner is not None:
+            _require_conversation_scope(conv, owner, cwd)
+        if force_new_session or not (
+                provider_obj and provider_obj.supports_sessions):
             return session_id
         # 저장값을 그대로 반환 — 동시 clear_session_metadata("") 도 존중한다.
         return conv.metadata.get(
@@ -418,12 +443,26 @@ class LLMClient:
         elif alias_existing is not None:
             conv = alias_existing
 
+        if conv is not None:
+            _require_conversation_scope(conv, owner, cwd)
+        # Validate all sources before creating or mutating the target handle.
+        if inject_context:
+            for ctx in inject_context:
+                source = self._store.get(ctx["conversation_id"])
+                if source is None:
+                    raise LookupError("Injected context conversation is unavailable")
+                if source is not None and source.owner != owner:
+                    if (self._context_authorizer is None
+                            or self._context_authorizer(owner, source) is not True):
+                        raise PermissionError("Injected context is not authorized for this owner")
+
         created_conversation = False
         if conv is None:
             conv = self._store.create(owner, provider, model,
                                        conversation_id=conversation_id,
                                        alias=alias)
             created_conversation = alias_existing is None
+        _require_conversation_scope(conv, owner, cwd)
         resolved_alias = conv.alias or alias
         alias_to_set = alias if alias and not conv.alias else ""
 
@@ -514,6 +553,7 @@ class LLMClient:
                          alias: str, alias_to_set: str = "",
                          system_prompt_hash: str = "") -> None:
         with self._store_lock():
+            self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
             if alias_to_set:
                 self._store.set_alias(conv.id, alias_to_set)
                 conv.alias = alias_to_set
@@ -628,7 +668,7 @@ class LLMClient:
         with self._sync_conversation_lock(conversation_id):
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+                session_id, force_new_session, owner=owner, cwd=cwd)
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
@@ -637,7 +677,8 @@ class LLMClient:
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
                     allow_fallback=fallback, effort=effort,
-                    thinking=thinking, provider_options=provider_options)
+                    thinking=thinking, provider_options=provider_options,
+                    native_namespace=conversation_id)
 
             response = self._run_with_output_schema(
                 _dispatch, messages, output_schema, validator, schema_retries)
@@ -755,7 +796,8 @@ class LLMClient:
                               allow_fallback: bool = False,
                               effort: str | None = None,
                               thinking: str | None = None,
-                              provider_options: dict | None = None) -> LLMResponse:
+                              provider_options: dict | None = None,
+                              native_namespace: str = "") -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         # 1) primary 시도
@@ -766,7 +808,7 @@ class LLMClient:
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -802,7 +844,7 @@ class LLMClient:
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -869,7 +911,7 @@ class LLMClient:
         async with self._async_conversation_lock(conversation_id):
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+                session_id, force_new_session, owner=owner, cwd=cwd)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
                     provider, msgs, fallback_messages, model,
@@ -877,7 +919,8 @@ class LLMClient:
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
                     allow_fallback=fallback, effort=effort,
-                    thinking=thinking, provider_options=provider_options)
+                    thinking=thinking, provider_options=provider_options,
+                    native_namespace=conversation_id)
 
             response = await self._arun_with_output_schema(
                 _dispatch, messages, output_schema, validator, schema_retries)
@@ -906,7 +949,8 @@ class LLMClient:
                                           allow_fallback: bool = False,
                                           effort: str | None = None,
                                           thinking: str | None = None,
-                              provider_options: dict | None = None) -> LLMResponse:
+                                         provider_options: dict | None = None,
+                                         native_namespace: str = "") -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         p = self._registry.get(provider_id)
@@ -916,7 +960,7 @@ class LLMClient:
                 session_id=session_id, cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -950,7 +994,7 @@ class LLMClient:
                 session_id="", cwd=cwd, alias=alias,
                 resume_by_alias=resume_by_alias,
                 effort=effort, thinking=thinking,
-                provider_options=provider_options)
+                provider_options=provider_options, native_namespace=native_namespace)
             if resp.content:
                 return resp
             last_resp = resp
@@ -1041,7 +1085,7 @@ class LLMClient:
         async with self._async_conversation_lock(conversation_id):
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
-                session_id, force_new_session)
+                session_id, force_new_session, owner=owner, cwd=cwd)
             attempts = [
                 (provider, provider_obj, messages, model, session_id,
                  not force_new_session)
@@ -1078,7 +1122,8 @@ class LLMClient:
                             wall_timeout=wall_timeout,
                             resume_by_alias=resume_by_alias,
                             effort=effort, thinking=thinking,
-                            provider_options=provider_options):
+                            provider_options=provider_options,
+                            native_namespace=conversation_id):
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
 
@@ -1289,6 +1334,7 @@ class LLMClient:
                 conv = self._store.find_by_alias(owner, alias)
         if conv is None:
             return False  # 추적 중인 세션 없음
+        _require_conversation_scope(conv, owner, cwd)
         sid = conv.metadata.get(SESSION_KEY_FMT.format(provider=provider), "")
         if not sid:
             return False

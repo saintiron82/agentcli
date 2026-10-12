@@ -42,17 +42,30 @@ in `provider_options` fail before creating a conversation or launching a CLI.
 Ordinary unsupported diagnostic options remain ignorable. Relevant tests: 126
 passed; all three profile call paths are covered.
 
+## Step 3 — SEC-002 / SEC-008: conversation scope
+
+Explicit conversation lookup and liveness checks require matching `owner`.
+Cross-owner context injection requires a host `context_authorizer(owner, source)`
+returning exactly `True`; unavailable context is rejected before target creation.
+Successful conversations bind to the canonical working directory. A different
+directory requires another alias, not a silent session reset. Legacy handles
+without a binding acquire it on first successful use; verify legacy history or
+start a new session before adopting an unverified handle. Copilot native named
+sessions are derived from the app conversation ID, preventing identical aliases
+of different owners from resuming an account-global session. Relevant tests:
+121 passed, 6 platform skips. Supply the original owner when resuming by ID.
+
 ## Remaining work
 
 | ID | Scope | Status |
 | --- | --- | --- |
 | SEC-001 | Windows batch argument interpretation | Pending |
-| SEC-002 | Conversation and injected-context ownership | Pending |
+| SEC-002 | Conversation and injected-context ownership | Fixed, regression tested |
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Pending |
 | SEC-006 | Materialization boundaries and user skill protection | Pending |
 | SEC-007 | Explicit Kiro filesystem access policy | Pending |
-| SEC-008 | Workspace/session binding | Pending |
+| SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
 | OPS-001 | Coordination of concurrent session callers | Pending |
 | OPS-002 | Streaming pipe drainage and bounded teardown | Pending |
 

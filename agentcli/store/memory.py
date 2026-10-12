@@ -73,6 +73,8 @@ class MemoryStore(ConversationStore):
         conv_id = conversation_id or str(uuid.uuid4())
         existing = self._conversations.get(conv_id)
         if existing and not self._is_expired(existing):
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
             # 기존 conversation에 alias가 비어 있으면 지금 부여
             if alias and not existing.alias:
                 self._set_alias_internal(existing, alias)
