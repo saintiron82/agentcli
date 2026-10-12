@@ -261,8 +261,8 @@ class CopilotProvider(LLMProvider):
 
             if result.returncode != 0:
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
-                logger.error("Copilot 실패 (code=%d): %s",
-                             result.returncode, msg)
+                logger.error("Copilot 실패 (code=%d, type=%s)",
+                             result.returncode, classify_error(msg))
                 resp = LLMResponse(
                     content="", provider=self.provider_id, model=model,
                     raw_stderr=result.stderr,
@@ -369,7 +369,7 @@ class CopilotProvider(LLMProvider):
 
         if rc != 0:
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Copilot 실패 (code=%d): %s", rc, msg)
+            logger.error("Copilot 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt,

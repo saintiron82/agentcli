@@ -733,7 +733,7 @@ class ClaudeProvider(LLMProvider):
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
             err_msg = stderr_txt.strip()[:300]
             msg = err_msg or f"exit={rc}"
-            logger.error("Claude 실패 (code=%d): %s", rc, msg)
+            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,
@@ -868,8 +868,8 @@ class ClaudeProvider(LLMProvider):
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token,
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
-            logger.error("Claude 실패 (code=%d): %s", rc, stderr_txt[:300])
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
+            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=used_sid,

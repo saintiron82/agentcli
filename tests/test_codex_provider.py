@@ -109,8 +109,9 @@ def test_invoke_debug_writes_invoke_trace(mock_env, mock_run, mock_find, tmp_pat
     rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["phase"] == "invoke" and rec["provider"] == "codex"
     assert rec["returncode"] == 0
-    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
-    assert "codex debug stderr" in rec["stderr"]
+    assert rec["schema"] == 2 and len(rec["call_id"]) == 12
+    assert rec["stderr"] == f"<stderr:{len('codex debug stderr')} chars>"
+    assert "codex debug stderr" not in rec["stderr"]
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")

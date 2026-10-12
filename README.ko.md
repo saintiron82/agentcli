@@ -395,9 +395,9 @@ client.chat(report_text, provider="claude",
 ```
 
 호출이 이유 없이 느리면 `debug=True`(필요 시 `debug_log_path` 와 함께)가 Claude
-의 `--debug` 를 붙이고, 프롬프트가 redact 된 argv 를 로깅하며, 스트리밍에서는
+의 `--debug` 를 붙이고, 민감한 payload가 가려진 argv 를 로깅하며, 스트리밍에서는
 청크별 타임라인을 기록해 툴 루프나 init 지연을 보이게 한다. `debug_log_path` 를
-주면 JSON Lines trace(argv·청크 타임라인·stderr·총 소요)가 append 되어, 느린
+주면 JSON Lines trace(argv·청크 타임라인·stderr 길이·총 소요)가 append 되어, 느린
 호출을 재현한 뒤 들여다볼 수 있다.
 
 ```python
@@ -571,9 +571,17 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | claude 전용 옵션 | `env`(티어), `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
-타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr trace 를 남긴다.
+타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr 길이 trace 를 남긴다.
 `debug_log_path` 는 JSON-Lines 레코드를 append 한다(각 레코드에 `schema` 버전 +
 `call_id` stamp). kiro(ACP)는 debug 계측이 없다.
+
+보안 수정 브랜치의 trace schema 2는 프롬프트·시스템 지시문·MCP/config 본문과
+stderr 원문을 길이 표시로 바꾼다. 자동 provider 실패 로그에는 오류 본문 대신
+오류 분류와 종료 코드를 남긴다. 실제 CLI 인자, 응답 반환값, 오류 분류 동작은
+유지된다. `LLMResponse.error`, `raw_stderr`, 오류 청크는 비공개 진단 데이터이므로
+자동으로 공개하거나 로깅하지 않는다. trace에는 세션 ID·경로·도구/이벤트 이름이
+남으므로 접근을 제한한다. 기존 schema 1 로그를 자동으로 고치지는 않는다.
+진행 상태는 [보안 수정 기록](docs/security-hardening.ko.md)을 참고한다.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|

@@ -179,11 +179,20 @@ def estimate_payload_prompt_tokens(prompt: str) -> int:
 _CLAUDE_STDIN_MODE_NEXT_FLAG = "--output-format"
 
 
+def _redact_payload(value: str, label: str) -> str:
+    """Omit an opaque diagnostic payload; preserve existing length markers."""
+    prefix, suffix = f"<{label}:", " chars>"
+    if (value.startswith(prefix) and value.endswith(suffix)
+            and value[len(prefix):-len(suffix)].isdigit()):
+        return value
+    return f"{prefix}{len(value)}{suffix}"
+
+
 def redact_argv(cmd: list[str]) -> list[str]:
-    """Return argv with the `-p <prompt>` payload replaced by a length marker.
+    """Return a copy with prompt and configuration payloads omitted.
 
     Debug 로그/trace 에 50k 짜리 프롬프트 본문이나 민감 내용을 그대로 흘리지
-    않도록, ``-p`` 다음 인자만 ``<prompt:N chars>`` 로 치환한다.
+    않도록 프롬프트·시스템 지시문·설정 본문을 길이 표시로 치환한다.
 
     큰 프롬프트는 stdin 으로 전달되어 ``-p`` 뒤에 위치 인자가 아예 없을 수
     있다(issue #30) — 이때 ``-p`` 바로 다음 토큰이 stdin 모드의 리터럴 플래그
@@ -196,17 +205,29 @@ def redact_argv(cmd: list[str]) -> list[str]:
     n = len(cmd)
     while i < n:
         arg = cmd[i]
+        # Configuration can contain arbitrary bearer tokens, env values or
+        # command arguments. Omit the whole payload, even malformed JSON/TOML.
+        for flag, label in (("--mcp-config", "mcp-config"),
+                            ("--config", "config")):
+            if arg.startswith(flag + "="):
+                arg = flag + "=" + _redact_payload(arg[len(flag) + 1:], label)
+                break
         out.append(arg)
+        if arg in ("--mcp-config", "-c", "--config") and i + 1 < n:
+            label = "mcp-config" if arg == "--mcp-config" else "config"
+            out.append(_redact_payload(cmd[i + 1], label))
+            i += 2
+            continue
         if (arg == "-p" and i + 1 < n
                 and cmd[i + 1] != _CLAUDE_STDIN_MODE_NEXT_FLAG):
-            out.append(f"<prompt:{len(cmd[i + 1])} chars>")
+            out.append(_redact_payload(cmd[i + 1], "prompt"))
             i += 2
             continue
         # #51: system 블록 본문도 프롬프트와 같은 민감도 — trace 에 그대로
         # 흘리지 않는다 (파일 변형 ``--append-system-prompt-file`` 은 경로만
         # argv 에 실리므로 redact 불필요).
         if arg == "--append-system-prompt" and i + 1 < n:
-            out.append(f"<system-prompt:{len(cmd[i + 1])} chars>")
+            out.append(_redact_payload(cmd[i + 1], "system-prompt"))
             i += 2
             continue
         i += 1
@@ -217,12 +238,13 @@ def redact_argv(cmd: list[str]) -> list[str]:
     if "--" in out:
         sep = out.index("--")
         if len(out) > sep + 1 and out[-1] != "-":
-            out[-1] = f"<prompt:{len(out[-1])} chars>"
+            out[-1] = _redact_payload(out[-1], "prompt")
     return out
 
 
 # debug trace 포맷 버전 — 필드가 바뀌면 올린다(소비자가 분기 가능).
-DEBUG_TRACE_SCHEMA = 1
+# Schema 2 intentionally omits raw stderr and opaque configuration payloads.
+DEBUG_TRACE_SCHEMA = 2
 # 같은 파일에 여러 스레드(예: 병렬 sync invoke)가 append 할 때 라인 깨짐 방지.
 _TRACE_LOCK = threading.Lock()
 
@@ -238,13 +260,26 @@ def write_debug_trace(path: str, record: dict) -> None:
     rec = {**record, "schema": DEBUG_TRACE_SCHEMA}
     rec.setdefault("call_id", uuid.uuid4().hex[:12])
     try:
+        # Last boundary before persistence, including direct helper callers.
+        if "argv" in rec:
+            argv = rec["argv"]
+            rec["argv"] = (redact_argv(list(argv))
+                           if isinstance(argv, (list, tuple))
+                           and all(isinstance(arg, str) for arg in argv)
+                           else "<argv:omitted>")
+        if "stderr" in rec:
+            stderr = rec["stderr"]
+            if isinstance(stderr, str):
+                rec["stderr"] = _redact_payload(stderr, "stderr") if stderr else ""
+            else:
+                rec["stderr"] = "<stderr:omitted>"
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         with _TRACE_LOCK:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
-            "debug trace 기록 실패 (%s): %s", path, exc)
+            "debug trace 기록 실패 (%s)", type(exc).__name__)
 
 
 def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
@@ -258,14 +293,14 @@ def emit_invoke_debug(provider_id: str, cmd: list[str], rc, latency_ms: int,
     log = logging.getLogger(f"agentcli.providers.{provider_id}")
     log.info("[debug] %s %s rc=%s latency=%dms argv=%s",
              provider_id, phase, rc, latency_ms, redact_argv(cmd))
-    tail = (stderr or "").strip()
-    if tail:
-        log.info("[debug] %s stderr tail:\n%s", provider_id, tail[-2000:])
+    if stderr:
+        log.info("[debug] %s stderr: %s", provider_id,
+                 _redact_payload(stderr, "stderr"))
     if path:
         write_debug_trace(path, {
             "provider": provider_id, "phase": phase, "returncode": rc,
             "latency_ms": latency_ms, "argv": redact_argv(cmd),
-            "session_id": session_id, "stderr": (stderr or "")[-20000:],
+            "session_id": session_id, "stderr": stderr or "",
         })
 
 
@@ -299,7 +334,7 @@ async def _drain_stderr(stream, sink: list[str], logger, provider_id: str) -> No
     ``--debug`` 는 stderr 를 대량 출력하는데, 이를 빼주지 않으면 OS 파이프
     버퍼가 차서 subprocess 가 stderr write 에서 블록 → 행이 걸린다. 디버그
     스트리밍에서 이 task 로 stderr 를 계속 읽어 데드락을 막고, 동시에 각 줄을
-    DEBUG 로그로 흘린다.
+    DEBUG 로그에는 본문 대신 길이만 남긴다.
     """
     try:
         while True:
@@ -308,7 +343,8 @@ async def _drain_stderr(stream, sink: list[str], logger, provider_id: str) -> No
                 break
             text = line_b.decode("utf-8", errors="replace").rstrip("\n")
             sink.append(text)
-            logger.debug("[debug] %s stderr: %s", provider_id, text)
+            logger.debug("[debug] %s stderr: %s", provider_id,
+                         _redact_payload(text, "stderr"))
     except Exception:  # noqa: BLE001 — drain 실패는 본 스트림에 영향 주지 않음
         pass
 
@@ -664,7 +700,8 @@ class LLMProvider(ABC):
                 type="error",
                 content=f"{self.provider_id} CLI not found")
         except Exception as exc:  # noqa: BLE001 — error chunk 만 yield, cleanup 은 finally
-            logger.exception("%s stream 예외", self.provider_id)
+            # Exception messages/tracebacks may echo argv and credentials.
+            logger.error("%s stream 예외 (%s)", self.provider_id, type(exc).__name__)
             yield StreamChunk(type="error", content=str(exc))
         finally:
             # issue #44: stdin writer task 는 정상 종료/timeout/GeneratorExit
@@ -722,7 +759,7 @@ class LLMProvider(ABC):
                         "session_id": state.final_session_id,
                         # timeout/early-break 면 stderr·chunks 가 부분 데이터다.
                         "truncated": not reached_done,
-                        "stderr": "\n".join(debug_stderr)[-20000:],
+                        "stderr": "\n".join(debug_stderr),
                     })
 
     async def _dispatch_stream_event(
@@ -902,8 +939,8 @@ async def run_subprocess_async(
                 # 그룹 kill 로도 안 풀리는 병적인 손자(파이프를 계속 문 채)
                 # 대비 — sync 경로의 10s reap bound 와 동일한 방어.
                 logger.warning(
-                    "post-kill communicate retry failed (%r); returning "
-                    "empty output", exc)
+                    "post-kill communicate retry failed (%s); returning "
+                    "empty output", type(exc).__name__)
                 stdout_b, stderr_b = b"", b""
     finally:
         # 호출 task 취소(CancelledError)·정상완료 포함 모든 종료 경로에서 그룹
@@ -984,8 +1021,8 @@ def run_subprocess_sync(
             stdout_b, stderr_b = proc.communicate(timeout=10)
         except Exception as exc:
             logger.warning(
-                "post-kill communicate retry failed (%r); returning "
-                "empty output", exc)
+                "post-kill communicate retry failed (%s); returning "
+                "empty output", type(exc).__name__)
             stdout_b, stderr_b = b"", b""
     finally:
         # 정상완료 포함 모든 경로에서 그룹 kill 은 무조건 수행 — 떨어져나간

@@ -91,7 +91,8 @@ def test_invoke_debug_writes_invoke_trace(mock_find, mock_env, mock_run, tmp_pat
     rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["phase"] == "invoke" and rec["provider"] == "copilot"
     assert rec["returncode"] == 0
-    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+    assert rec["schema"] == 2 and len(rec["call_id"]) == 12
+    assert rec["stderr"] == f"<stderr:{len('cp dbg')} chars>"
 
 
 @patch("agentcli.providers.copilot.subprocess.run")

@@ -225,7 +225,8 @@ def test_codex_stream_debug_writes_trace(monkeypatch, tmp_path):
     assert any(c.type == "text" for c in chunks)
     rec = json.loads(trace.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["phase"] == "stream"
-    assert rec["schema"] == 1 and len(rec["call_id"]) == 12
+    assert rec["schema"] == 2 and len(rec["call_id"]) == 12
+    assert rec["stderr"] == f"<stderr:{len('codex debug stderr')} chars>"
     assert any(c["type"] == "text" for c in rec["chunks"])
 
 
@@ -333,8 +334,10 @@ def test_run_stream_template_debug_writes_trace(monkeypatch, tmp_path):
     assert rec["truncated"] is False
     # 프롬프트 본문 redact
     assert "SECRET-PROMPT" not in json.dumps(rec["argv"])
-    # stderr 동시 드레인되어 trace 에 담김
-    assert "mcp connected" in rec["stderr"]
+    # stderr is drained, but only its length is persisted in schema 2.
+    assert "mcp connected" not in rec["stderr"]
+    expected_stderr = "\n".join(("debug: mcp connected", "debug: tool_use Bash"))
+    assert rec["stderr"] == f"<stderr:{len(expected_stderr)} chars>"
 
 
 def test_run_stream_template_debug_trace_truncated_on_timeout(monkeypatch, tmp_path):

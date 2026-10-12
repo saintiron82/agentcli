@@ -1,0 +1,52 @@
+# Security hardening status
+
+[English](security-hardening.md) | [한국어](security-hardening.ko.md)
+
+Branch: `fix/security-hardening`. Baseline: published v0.7.5.
+These changes are not yet released. The existing v0.7.5 tag/wheel is unchanged.
+
+## Step 1 — SEC-005: automatic diagnostic payload exposure
+
+The patch omits complete MCP/config payloads from diagnostic argv rather than
+trying to recognize every possible credential field. Raw stderr and subprocess
+exception bodies are omitted from automatic logs. Trace schema 2 stores stderr
+length markers and keeps exit codes, elapsed time, call/session IDs and chunk
+timelines. The trace writer sanitizes argv/stderr even for direct helper callers.
+
+Actual execution argv, native session handling, tool permissions, CLI errors,
+response content, token accounting and fallback behavior are unchanged. No
+runtime dependency or model request is added. Raw errors remain available to the
+host application; the host must control their display and logging. This patch
+is not a general-purpose secret scrubber for arbitrary metadata or application
+logs. Traces still require restricted access. Existing logs are not rewritten;
+review their access and retention separately.
+
+The regression tests use fake credentials and subprocesses only. They cover
+configuration redaction, trace-boundary sanitization, sync/async failures for
+Claude/Codex/Copilot, client failure logging, streaming stderr and exception
+messages. The new tests fail against the baseline and pass with the patch.
+
+An offline Windows microbenchmark compared argv redaction plus JSON encoding:
+short debug records took 2.05 µs at baseline versus 2.82 µs patched; a 32,000-char
+MCP payload took 36.93 µs versus 2.55 µs. These are local diagnostic-path
+measurements, not model latency or production performance guarantees. Successful
+calls with debug disabled do not run this redaction path.
+
+## Remaining work
+
+| ID | Scope | Status |
+| --- | --- | --- |
+| SEC-001 | Windows batch argument interpretation | Pending |
+| SEC-002 | Conversation and injected-context ownership | Pending |
+| SEC-003 | Profile permission/config propagation | Pending |
+| SEC-004 | Permission preservation during fallback | Pending |
+| SEC-006 | Materialization boundaries and user skill protection | Pending |
+| SEC-007 | Explicit Kiro filesystem access policy | Pending |
+| SEC-008 | Workspace/session binding | Pending |
+| OPS-001 | Coordination of concurrent session callers | Pending |
+| OPS-002 | Streaming pipe drainage and bounded teardown | Pending |
+
+Review and test each change independently. Do not combine security fixes with
+a broad refactor, change existing session identifiers silently, or serialize
+unrelated sessions globally. Closing a code finding does not certify an actual
+server deployment or all versions of the external CLIs.

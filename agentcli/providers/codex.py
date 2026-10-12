@@ -416,8 +416,8 @@ class CodexProvider(LLMProvider):
                         debug=debug, debug_log_path=debug_log_path,
                         effort=effort, thinking=thinking)
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
-                logger.error("Codex 실패 (code=%d): %s",
-                             result.returncode, msg)
+                logger.error("Codex 실패 (code=%d, type=%s)",
+                             result.returncode, classify_error(msg))
                 resp = LLMResponse(
                     content="", provider=self.provider_id, model=model,
                     raw_stderr=result.stderr,
@@ -446,8 +446,8 @@ class CodexProvider(LLMProvider):
                 if retry_result.returncode != 0:
                     msg = ((retry_result.stderr or "").strip()[:300]
                            or f"exit={retry_result.returncode}")
-                    logger.error("Codex greeting retry 실패 (code=%d): %s",
-                                 retry_result.returncode, msg)
+                    logger.error("Codex greeting retry 실패 (code=%d, type=%s)",
+                                 retry_result.returncode, classify_error(msg))
                     resp = LLMResponse(
                         content="", provider=self.provider_id, model=model,
                         raw_stderr=retry_result.stderr,
@@ -573,7 +573,7 @@ class CodexProvider(LLMProvider):
                     debug=debug, debug_log_path=debug_log_path,
                     effort=effort, thinking=thinking)
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Codex 실패 (code=%d): %s", rc, msg)
+            logger.error("Codex 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt, session_id=session_id,

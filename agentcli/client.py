@@ -782,9 +782,9 @@ class LLMClient:
     @staticmethod
     def _log_provider_failure(provider_id: str, resp: LLMResponse) -> None:
         if resp.error:
-            logger.warning("[LLM] %s 실패(%s): %s",
+            logger.warning("[LLM] %s 실패(%s), exit_code=%s, error_chars=%d",
                            provider_id, resp.error_type or "?",
-                           resp.error[:200])
+                           resp.exit_code, len(resp.error))
 
     # ---------- 비동기 chat ----------
 

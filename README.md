@@ -452,9 +452,18 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | claude-only options | `env` (tier), `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a
-per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr
+per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr-length
 trace. `debug_log_path` appends JSON-Lines records (each stamped with a `schema`
 version and `call_id`). kiro (ACP) has no debug instrumentation.
+
+On the security-hardening branch, trace schema 2 omits prompt, system-prompt,
+MCP/config payloads and raw stderr, using length markers instead. Automatic
+provider-failure logs record error categories and exit codes, not error bodies.
+CLI arguments, returned responses and error classification are unchanged.
+`LLMResponse.error`, `raw_stderr` and error chunks remain private diagnostic
+data: do not automatically publish or log them. Traces still contain session
+IDs, paths and tool/event names; restrict access. Existing schema 1 logs are not
+rewritten. See [security hardening status](docs/security-hardening.md).
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
@@ -835,10 +844,10 @@ client.chat(report_text, provider="claude",
 ```
 
 When a call is mysteriously slow, `debug=True` (optionally with
-`debug_log_path`) appends Claude's `--debug`, logs the prompt-redacted argv, and
+`debug_log_path`) appends Claude's `--debug`, logs the payload-redacted argv, and
 for streaming records a per-chunk timeline so a tool loop or init stall is
 visible. A `debug_log_path` appends a JSON-Lines trace (argv, chunk timeline,
-stderr, elapsed) you can inspect after reproducing the slow call.
+stderr length, elapsed) you can inspect after reproducing the slow call.
 
 ```python
 async for chunk in client.chat_stream(prompt, provider="claude",
