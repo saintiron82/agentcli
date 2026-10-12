@@ -116,6 +116,25 @@ can be rejected by host policy, with a warning. This is cleanup, not a sandbox.
 Strict containment requires a host-owned job/container. See the
 [Windows job limit reference](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information).
 
+## Step 9 — OPS-001: session coordination
+
+Clients sharing a store coordinate sync, async and streaming calls across loops.
+File-backed SQLite stores also acquire a sidecar OS file lock per conversation,
+across local processes. Different conversations remain parallel. Preparation is
+refreshed after acquisition so history, instructions and session IDs are current.
+Async waiters do not monopolize executor workers. Cancellation collects a late
+acquisition instead of leaking it. Related regression gate: 96 passed, 5 skipped,
+including 64 concurrent callers and a separate Windows process.
+
+`LLMClient(..., session_lock_factory=factory)` accepts a host-managed distributed
+lease. `factory(store, conversation_id)` returns an object with `acquire()` and
+`release()`; these must be thread-independent, bounded, and safe to release after
+a failed acquisition. Hosts own lease expiry, renewal and fencing of stale
+writers. Sidecar locks do not certify NFS/SMB or cross-server coordination.
+Use a single session writer or a verified distributed lease plus shared native
+session availability. Separate custom-store objects referring to one backend
+also require a host lease. Lock files are not unlinked while callers may use them.
+
 ## Remaining work
 
 | ID | Scope | Status |
@@ -127,7 +146,7 @@ Strict containment requires a host-owned job/container. See the
 | SEC-006 | Materialization boundaries and user skill protection | Fixed, regression tested |
 | SEC-007 | Explicit Kiro filesystem access policy | Fixed, regression tested |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
-| OPS-001 | Coordination of concurrent session callers | Pending |
+| OPS-001 | Coordination of concurrent session callers | Fixed locally; distributed lease is host configuration |
 | OPS-002 | Streaming pipe drainage and bounded teardown | Fixed, regression tested |
 
 Review and test each change independently. Do not combine security fixes with

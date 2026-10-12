@@ -17,9 +17,7 @@ import hashlib
 import itertools
 import logging
 import os
-import threading
 import uuid
-import weakref
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +26,7 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
                     TokenUsage, StreamChunk, make_error_chunk,
                     standardize_error_chunk)
 from .store.base import ConversationStore
+from .coordination import ConversationLease, async_lease
 from .providers.registry import ProviderRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
@@ -342,21 +341,13 @@ class LLMClient:
     def __init__(self, store: ConversationStore,
                  registry: ProviderRegistry | None = None,
                  fallback_order: list[str] | None = None,
-                 *, context_authorizer=None):
+                 *, context_authorizer=None, session_lock_factory=None):
         self._store = store
         self._registry = registry or create_default_registry()
         self._context_authorizer = context_authorizer
+        self._session_lock_factory = session_lock_factory
         if fallback_order:
             self._registry.set_fallback_order(fallback_order)
-        # 같은 conversation 에 대한 동시 호출 직렬화 (in-process).
-        # 직렬화 없이는 두 호출이 같은 session_id 를 읽고 각자 CLI 세션을
-        # 분기시킨 뒤 마지막 쓰기가 다른 쪽을 덮어쓴다.
-        self._conv_locks_guard = threading.Lock()
-        self._sync_conv_locks: dict[str, threading.Lock] = {}
-        # asyncio.Lock 은 event loop 에 묶이므로 루프별로 분리. 루프가
-        # 소멸하면 WeakKeyDictionary 가 잠금 사전을 함께 회수한다.
-        self._async_conv_locks: "weakref.WeakKeyDictionary" = (
-            weakref.WeakKeyDictionary())
 
     def _store_lock(self):
         lock = getattr(self._store, "_lock", None)
@@ -372,13 +363,8 @@ class LLMClient:
         if selected is not None:
             _validate_provider_options(selected, method, options)
 
-    def _sync_conversation_lock(self, conv_id: str) -> threading.Lock:
-        with self._conv_locks_guard:
-            lock = self._sync_conv_locks.get(conv_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._sync_conv_locks[conv_id] = lock
-            return lock
+    def _sync_conversation_lock(self, conv_id: str):
+        return ConversationLease(self._store, conv_id, self._session_lock_factory)
 
     def _check_resume_policy(self, conv_id, provider_obj, session_id, options):
         policy = _codex_policy(provider_obj, options)
@@ -391,18 +377,8 @@ class LLMClient:
                 or (previous is None and policy != ["danger-full-access", None])):
             raise PermissionError("Codex resume cannot change/verify this execution policy; use new_session=True")
 
-    def _async_conversation_lock(self, conv_id: str) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        with self._conv_locks_guard:
-            per_loop = self._async_conv_locks.get(loop)
-            if per_loop is None:
-                per_loop = {}
-                self._async_conv_locks[loop] = per_loop
-            lock = per_loop.get(conv_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                per_loop[conv_id] = lock
-            return lock
+    def _async_conversation_lock(self, conv_id: str):
+        return async_lease(self._sync_conversation_lock(conv_id))
 
     def _refresh_session_id(self, conv_id: str, provider: str,
                             provider_obj, session_id: str,
@@ -410,7 +386,7 @@ class LLMClient:
         """conversation 잠금 획득 후 최신 session_id 재조회.
 
         _prepare 와 잠금 획득 사이에 동시 호출이 새 세션을 만들었을 수 있다.
-        같은 모드(sync↔sync, async↔async) 내 동시 호출만 직렬화된다.
+        클라이언트·호출 모드와 관계없이 공용 lease 안에서 재조회한다.
         """
         with self._store_lock():
             conv = self._store.get(conv_id)
@@ -718,6 +694,14 @@ class LLMClient:
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         with self._sync_conversation_lock(conversation_id):
+            with self._store_lock():
+                (provider, provider_obj, conv, messages, fallback_messages,
+                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
+                 system_prompt_hash, force_new_session) = self._prepare(
+                    prompt, provider, model, conversation_id, owner,
+                    system_prompt, context_turns, agent, inject_context,
+                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                created_conversation = created_conversation or refreshed_created
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)
@@ -967,6 +951,14 @@ class LLMClient:
 
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         async with self._async_conversation_lock(conversation_id):
+            with self._store_lock():
+                (provider, provider_obj, conv, messages, fallback_messages,
+                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
+                 system_prompt_hash, force_new_session) = self._prepare(
+                    prompt, provider, model, conversation_id, owner,
+                    system_prompt, context_turns, agent, inject_context,
+                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                created_conversation = created_conversation or refreshed_created
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)
@@ -1147,6 +1139,14 @@ class LLMClient:
         # 같은 conversation 동시 호출 직렬화 — 세션 분기/덮어쓰기 방지.
         # 스트림 소비가 끝날 때까지 같은 conversation 의 다른 호출은 대기한다.
         async with self._async_conversation_lock(conversation_id):
+            with self._store_lock():
+                (provider, provider_obj, conv, messages, fallback_messages,
+                 session_id, model, refreshed_created, resolved_alias, alias_to_set,
+                 system_prompt_hash, force_new_session) = self._prepare(
+                    prompt, provider, model, conversation_id, owner,
+                    system_prompt, context_turns, agent, inject_context,
+                    strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                created_conversation = created_conversation or refreshed_created
             session_id = self._refresh_session_id(
                 conversation_id, provider, provider_obj,
                 session_id, force_new_session, owner=owner, cwd=cwd)

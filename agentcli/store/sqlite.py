@@ -15,6 +15,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from threading import RLock
+from pathlib import Path
+import os
 from .base import ConversationStore
 from ..types import Conversation, Message
 
@@ -22,6 +24,8 @@ from ..types import Conversation, Message
 class SQLiteStore(ConversationStore):
     def __init__(self, db_path: str = ":memory:"):
         self._lock = RLock()
+        self._coordination_path = (os.path.normcase(str(Path(db_path).resolve()))
+                                   if str(db_path) != ":memory:" else None)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         if db_path != ":memory:":
@@ -31,6 +35,11 @@ class SQLiteStore(ConversationStore):
                 pass
         self._conn.execute("PRAGMA busy_timeout=5000;")
         self._create_tables()
+
+    def close(self):
+        """Close after all clients using this store have stopped."""
+        with self._lock:
+            self._conn.close()
 
     def _create_tables(self):
         self._conn.executescript("""
@@ -141,12 +150,21 @@ class SQLiteStore(ConversationStore):
             return existing
 
         now = datetime.now()
-        self._conn.execute(
-            """INSERT INTO conversations (id, owner, provider, model, alias,
-               created_at, updated_at) VALUES (?,?,?,?,?,?,?)""",
-            (conv_id, owner, provider, model, alias or "",
-             now.isoformat(), now.isoformat()))
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                """INSERT INTO conversations (id, owner, provider, model, alias,
+                   created_at, updated_at) VALUES (?,?,?,?,?,?,?)""",
+                (conv_id, owner, provider, model, alias or "",
+                 now.isoformat(), now.isoformat()))
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            existing = self.find_by_alias(owner, alias) if alias else self.get(conv_id)
+            if existing is None:
+                raise
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
+            return existing
         return Conversation(id=conv_id, owner=owner, provider=provider,
                             model=model, created_at=now, updated_at=now,
                             alias=alias or "")
