@@ -25,7 +25,7 @@ from ..launchers import prepare_subprocess_command
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
                    emit_invoke_debug, health_from_response, run_health_command,
-                   run_subprocess_async, validate_reasoning_defaults)
+                   run_subprocess_async, run_owned_command, validate_reasoning_defaults)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
                      ProviderHealth, TokenUsage, StreamChunk, classify_error)
 from ..utils import build_env
@@ -259,7 +259,7 @@ class CopilotProvider(LLMProvider):
 
         start = time.time()
         try:
-            result = subprocess.run(
+            result = run_owned_command(
                 cmd, capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
             latency = int((time.time() - start) * 1000)

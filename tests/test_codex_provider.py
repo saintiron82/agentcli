@@ -92,7 +92,7 @@ def test_parse_jsonl_events_ignores_codex_initial_greeting():
 # ===== invoke (신규 세션) =====
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_debug_writes_invoke_trace(mock_env, mock_run, mock_find, tmp_path):
     """#29: codex 비스트리밍 invoke 도 debug trace(phase=invoke) 를 남긴다."""
@@ -115,7 +115,7 @@ def test_invoke_debug_writes_invoke_trace(mock_env, mock_run, mock_find, tmp_pat
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_new_session(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
@@ -140,7 +140,7 @@ def test_invoke_new_session(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_stale_session_auto_recovers(mock_env, mock_run, mock_find):
     """죽은 thread(resume 실패: 'no rollout found') → 새 세션으로 1회 자동 재시도."""
@@ -165,7 +165,7 @@ def test_invoke_stale_session_auto_recovers(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_other_resume_failure_not_retried(mock_env, mock_run, mock_find):
     """stale 외의 resume 실패는 재시도 없이 에러 반환."""
@@ -178,7 +178,7 @@ def test_invoke_other_resume_failure_not_retried(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_stale_recovery_is_bounded(mock_env, mock_run, mock_find):
     """재시도(새 세션)도 stale 면 무한 루프 없이 1회로 끝낸다."""
@@ -192,7 +192,7 @@ def test_invoke_stale_recovery_is_bounded(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_stale_recovery_preserves_options(mock_env, mock_run, mock_find):
     """stale 재시도(새 세션)에 sandbox/approval 이 적용된다 (resume 는 무시하던 것)."""
@@ -258,7 +258,7 @@ def test_build_cmd_uses_resolved_binary_path(mock_which):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
@@ -282,7 +282,7 @@ def test_invoke_marks_codex_prompt_usage_as_provider_reported(mock_env, mock_run
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, mock_run, mock_find):
     mock_run.side_effect = [
@@ -315,7 +315,7 @@ def test_invoke_retries_once_when_first_turn_is_only_initial_greeting(mock_env, 
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_resume_session(mock_env, mock_run, mock_find):
     """session_id 전달 시 `codex exec resume <sid>` 사용."""
@@ -336,7 +336,7 @@ def test_invoke_resume_session(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_cwd_and_sandbox(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
@@ -353,7 +353,7 @@ def test_invoke_cwd_and_sandbox(mock_env, mock_run, mock_find):
     assert kwargs.get("cwd") == "/repo"
 
 
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value=None)
 def test_invoke_binary_missing(mock_find, mock_run):
     """바이너리 미해석 시 exec 전에 binary_missing 으로 단락한다."""
@@ -368,7 +368,7 @@ def test_invoke_binary_missing(mock_find, mock_run):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run",
+@patch("agentcli.providers.codex.run_owned_command",
        side_effect=FileNotFoundError)
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_not_found(mock_env, mock_run, mock_find):
@@ -379,7 +379,7 @@ def test_invoke_not_found(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_uses_system_and_last_message_only(mock_env, mock_run, mock_find):
     """provider 는 client 가 담은 메시지를 충실히 직렬화한다.
@@ -406,7 +406,7 @@ def test_invoke_uses_system_and_last_message_only(mock_env, mock_run, mock_find)
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_nonzero_returns_error(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
@@ -419,7 +419,7 @@ def test_invoke_nonzero_returns_error(mock_env, mock_run, mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run",
+@patch("agentcli.providers.codex.run_owned_command",
        side_effect=subprocess.TimeoutExpired("cmd", 120))
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_timeout(mock_env, mock_run, mock_find):
@@ -521,7 +521,7 @@ def test_build_cmd_default_still_inlines_prompt(mock_find):
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_large_prompt_routes_via_stdin_input(mock_env, mock_run, mock_find):
     """8000바이트 초과 프롬프트는 argv 가 아니라 subprocess.run(input=...) 로."""
@@ -541,7 +541,7 @@ def test_invoke_large_prompt_routes_via_stdin_input(mock_env, mock_run, mock_fin
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_small_prompt_stdin_untouched(mock_env, mock_run, mock_find):
     """임계치 이하 프롬프트는 기존과 동일하게 argv 로, stdin=DEVNULL 유지."""
@@ -612,7 +612,7 @@ def _big_korean_prompt() -> str:
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_invoke_large_korean_prompt_uses_utf8_encoding_kwargs(mock_env, mock_run, mock_find):
     """non-ASCII 대용량 프롬프트가 codex 동기 invoke 를 거칠 때, subprocess.run

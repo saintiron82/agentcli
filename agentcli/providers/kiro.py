@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from .base import _drain_stderr, _kill_process_group, _new_session_kwargs
+from ..processes import attach_process_job
 from ..filesystem import safe_workspace_path
 
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
@@ -142,14 +144,16 @@ class KiroProvider(LLMProvider):
             box = state.get("proc_box") or {}
             rdr = box.get("reader")
             proc = box.get("proc")
-            if rdr and not rdr.done():
-                rdr.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await rdr
-            if proc is not None and proc.returncode is None:
+            if proc is not None:
                 with contextlib.suppress(Exception):
-                    proc.kill()
-                    await proc.wait()
+                    _kill_process_group(proc)
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+            for task in (rdr, box.get("stderr")):
+                if task:
+                    if not task.done():
+                        task.cancel()
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await task
 
     def _subprocess_conn_factory(self, model: str, cwd: str | None):
         """Return (factory, state) for spawning a real kiro-cli acp subprocess.
@@ -174,18 +178,26 @@ class KiroProvider(LLMProvider):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd, env=build_env())
+                    cwd=cwd, env=build_env(), limit=8 * 1024 * 1024,
+                    **_new_session_kwargs())
+                attach_process_job(proc)
                 proc_box["proc"] = proc
 
                 async def reader():
                     assert proc.stdout
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line:
-                            break
-                        await conn.handle_line(line.decode("utf-8", errors="replace"))
+                    try:
+                        while True:
+                            line = await proc.stdout.readline()
+                            if not line:
+                                break
+                            await conn.handle_line(line.decode("utf-8", errors="replace"))
+                    finally:
+                        conn.close()
 
                 proc_box["reader"] = asyncio.create_task(reader())
+                if proc.stderr is not None:
+                    proc_box["stderr"] = asyncio.create_task(
+                        _drain_stderr(proc.stderr, [], logger, self.provider_id, debug=False))
                 return proc
 
             async def write_line(line: str) -> None:
@@ -285,7 +297,7 @@ class KiroProvider(LLMProvider):
             except Exception as exc:  # noqa: BLE001
                 await queue.put((_DONE, exc))
 
-        start = time.time()
+        start = time.monotonic()
         wall_deadline = start + wall_timeout if wall_timeout is not None else None
         driver = asyncio.create_task(drive())
         idle = idle_timeout if idle_timeout is not None else timeout
@@ -294,7 +306,7 @@ class KiroProvider(LLMProvider):
             while True:
                 # Compute effective timeout: min(idle, remaining wall time).
                 if wall_deadline is not None:
-                    remaining = wall_deadline - time.time()
+                    remaining = wall_deadline - time.monotonic()
                     if remaining <= 0:
                         yield StreamChunk(type="error",
                                           content="wall timeout expired",
@@ -308,7 +320,7 @@ class KiroProvider(LLMProvider):
                     item = await asyncio.wait_for(queue.get(), timeout=effective)
                 except asyncio.TimeoutError:
                     # Determine whether wall or idle expired.
-                    if wall_deadline is not None and time.time() >= wall_deadline:
+                    if wall_deadline is not None and time.monotonic() >= wall_deadline:
                         yield StreamChunk(type="error",
                                           content="wall timeout expired",
                                           data={"error_type": "timeout",
@@ -338,7 +350,7 @@ class KiroProvider(LLMProvider):
                     type="done", content="".join(text_parts),
                     session_id=state["session_id"], usage=usage,
                     data={"provider": self.provider_id, "model": model,
-                          "latency_ms": int((time.time() - start) * 1000),
+                          "latency_ms": int((time.monotonic() - start) * 1000),
                           "stop_reason": payload})
                 return
         finally:

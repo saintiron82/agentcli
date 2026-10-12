@@ -63,12 +63,15 @@ spawn 하고, issue #4 류 무한 대기의 상한으로 턴별 타임아웃을 
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
 import shutil
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
+from .base import _kill_process_group, _new_session_kwargs
+from ..processes import attach_process_job
 
 from ..types import StreamChunk
 from .claude import NONESSENTIAL_TRAFFIC_ENV_VAR
@@ -176,6 +179,7 @@ class WarmSession:
 
     async def _start(self) -> None:
         kwargs: dict = {
+            **_new_session_kwargs(),
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
@@ -190,7 +194,8 @@ class WarmSession:
         env.setdefault(NONESSENTIAL_TRAFFIC_ENV_VAR, "1")
         kwargs["env"] = env
         self._proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(self._cmd), **kwargs)
-        asyncio.ensure_future(self._drain_stderr())
+        attach_process_job(self._proc)
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
         """stderr 를 계속 비운다 — 안 비우면 파이프 버퍼가 차서 프로세스가 멈춘다."""
@@ -199,11 +204,11 @@ class WarmSession:
             return
         try:
             while True:
-                line = await proc.stderr.readline()
+                line = await proc.stderr.read(8192)
                 if not line:
                     return
                 self._stderr_tail.append(line.decode("utf-8", "replace"))
-                del self._stderr_tail[:-50]
+                self._stderr_tail[:] = ["".join(self._stderr_tail)[-65536:]]
         except (asyncio.CancelledError, ValueError):
             return
 
@@ -221,10 +226,17 @@ class WarmSession:
         try:
             await asyncio.wait_for(proc.wait(), timeout=10)
         except (asyncio.TimeoutError, ProcessLookupError):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_process_group(proc)
+        finally:
+            _kill_process_group(proc)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            task = getattr(self, "_stderr_task", None)
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await task
 
     async def __aenter__(self) -> "WarmSession":
         return self

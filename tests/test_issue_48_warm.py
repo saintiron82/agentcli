@@ -52,6 +52,9 @@ class _FakeStream:
             return b""          # EOF
         return self._buf.pop(0)
 
+    async def read(self, n=-1):
+        return await self.readline()
+
 
 class _FakeProc:
     def __init__(self, turns):

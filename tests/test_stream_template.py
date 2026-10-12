@@ -572,10 +572,9 @@ def test_partial_success_yields_done_with_text(monkeypatch):
     chunks = asyncio.run(run())
     types = [c.type for c in chunks]
     assert "text" in types
-    assert types[-1] == "done", (
-        f"text+rc≠0 should still yield done (current invariant), got {types}")
-    done = chunks[-1]
-    assert done.content == "partial"
+    assert types[-1] == "error"
+    assert chunks[-1].data["returncode"] == 1
+    assert "done" not in types
 
 
 def test_failed_run_with_no_text_yields_error_with_stderr(monkeypatch):

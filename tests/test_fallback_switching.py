@@ -120,7 +120,7 @@ def test_copilot_parser_success():
 # ===== Provider 모킹: error 노출 =====
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_codex_invoke_returns_error_on_usage_limit(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(
@@ -139,7 +139,7 @@ def test_codex_invoke_returns_error_on_usage_limit(mock_env, mock_run, mock_find
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_codex_invoke_error_suppresses_partial_text(mock_env, mock_run, mock_find):
     mock_run.return_value = MagicMock(

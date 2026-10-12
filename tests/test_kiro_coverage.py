@@ -217,11 +217,8 @@ async def test_stream_async_cleanup_kills_live_process(tmp_path):
                       "content":{"type":"text","text":"x"}}}})
                 # block on stdin forever (no further output)
     '''), encoding="utf-8")
-    launcher = tmp_path / "kiro-cli"
-    launcher.write_text(
-        "#!/bin/sh\nexec {py} {s} \"$@\"\n".format(py=sys.executable, s=str(script)),
-        encoding="utf-8")
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    from tests._stream_helpers import write_fake_cli_launcher
+    launcher = write_fake_cli_launcher(tmp_path, script.read_text(encoding="utf-8"), name="loop-kiro")
 
     p = KiroProvider()
     with patch.object(KiroProvider, "_find_binary", return_value=str(launcher)):
@@ -530,7 +527,7 @@ async def test_fs_read_oserror_returns_empty_content(tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("data", encoding="utf-8")
     p = KiroProvider()
-    with patch("pathlib.Path.read_text", side_effect=OSError("boom")):
+    with patch("pathlib.Path.open", side_effect=OSError("boom")):
         res = await p._handle_agent_request(
             "fs/read_text_file", {"path": str(f)}, cwd=str(tmp_path))
     assert res == {"content": ""}

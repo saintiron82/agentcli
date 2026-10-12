@@ -180,7 +180,12 @@ async def test_fs_read_symlink_escape_denied(tmp_path):
     target_outside = tmp_path.parent / "outside.txt"
     target_outside.write_text("secret", encoding="utf-8")
     link = tmp_path / "link.txt"
-    os.symlink(target_outside, link)
+    try:
+        os.symlink(target_outside, link)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable; junction covered separately")
+        raise
     p = KiroProvider()
     res = await p._handle_agent_request(
         "fs/read_text_file", {"path": str(link)}, cwd=str(tmp_path))

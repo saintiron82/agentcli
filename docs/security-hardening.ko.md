@@ -91,6 +91,20 @@ native 실행파일이나 지원 shim으로 교체해야 한다. launcher mtime�
 관련 테스트 35개 통과이며, 기존 관리자 권한 필요 symlink 테스트는 이 Windows에서
 제외하고 실제 junction은 별도로 검증했다.
 
+## 8단계 — OPS-002: 프로세스와 스트림 정리
+
+모든 스트림에서 stderr를 비우고 최근 64 KiB만 보관합니다. 디버그 타임라인은
+최대 10,000개입니다. 부분 텍스트 이후 비정상 종료는 `done` 대신 `error`로
+끝납니다. 프로세스 종료·kill 이후 대기는 제한됩니다. Kiro는 EOF에서 대기 중인
+ACP 요청을 실패 처리하고, warm 세션은 stderr 작업을 보관하고 회수합니다.
+
+Codex/Copilot 동기 호출도 공통 실행기를 사용합니다. Windows에서는 생성 직후
+kill-on-close Job Object에 연결하고 POSIX에서는 전용 프로세스 그룹을 사용합니다.
+Windows 연결은 생성과 원자적이지 않고 호스트 정책에 따라 실패할 수 있어 경고를
+남깁니다. 이는 정리 기능이지 샌드박스가 아닙니다. 엄격한 격리는 호스트의
+Job Object/컨테이너가 필요합니다.
+[Windows Job 제한 설명](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information).
+
 ## 남은 작업
 
 | ID | 범위 | 상태 |
@@ -103,7 +117,7 @@ native 실행파일이나 지원 shim으로 교체해야 한다. launcher mtime�
 | SEC-007 | Kiro 파일 접근 정책 명시 | 수정·회귀 검증 |
 | SEC-008 | 작업 폴더·세션 바인딩 | 수정·기존 핸들 이행 주의 |
 | OPS-001 | 동시 세션 호출 조정 | 대기 |
-| OPS-002 | 스트리밍 파이프 배출·종료 시간 상한 | 대기 |
+| OPS-002 | 스트리밍 파이프 배출·종료 시간 상한 | 수정 및 회귀 검증 |
 
 각 수정은 독립적으로 검토하고 테스트한다. 보안 패치와 대규모 리팩터링을
 혼합하거나, 기존 세션 식별자를 조용히 바꾸거나, 다른 세션까지 전역으로

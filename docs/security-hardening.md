@@ -102,6 +102,20 @@ and reject workspace links. This is not an OS sandbox for native agent tools.
 Relevant tests: 35 passed; the existing privileged symlink test is excluded on
 this Windows host and real junction coverage is tested separately.
 
+## Step 8 — OPS-002: process and stream cleanup
+
+All streaming paths drain stderr, retaining at most 64 KiB; debug timelines keep
+at most 10,000 entries. A nonzero exit after partial text ends with `error`, not
+`done`. Process-exit and post-kill waits are bounded. Kiro fails pending ACP
+requests on EOF; warm sessions retain and collect their drain task.
+
+Codex/Copilot synchronous calls now use the shared owned-process runner. Windows
+uses a best-effort kill-on-close Job Object attached immediately after spawn;
+POSIX uses a dedicated process group. Assignment is not atomic with spawn and
+can be rejected by host policy, with a warning. This is cleanup, not a sandbox.
+Strict containment requires a host-owned job/container. See the
+[Windows job limit reference](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information).
+
 ## Remaining work
 
 | ID | Scope | Status |
@@ -114,7 +128,7 @@ this Windows host and real junction coverage is tested separately.
 | SEC-007 | Explicit Kiro filesystem access policy | Fixed, regression tested |
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
 | OPS-001 | Coordination of concurrent session callers | Pending |
-| OPS-002 | Streaming pipe drainage and bounded teardown | Pending |
+| OPS-002 | Streaming pipe drainage and bounded teardown | Fixed, regression tested |
 
 Review and test each change independently. Do not combine security fixes with
 a broad refactor, change existing session identifiers silently, or serialize

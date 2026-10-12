@@ -25,7 +25,7 @@ from ..launchers import prepare_subprocess_command
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command, run_subprocess_async,
+                   run_health_command, run_subprocess_async, run_owned_command,
                    validate_reasoning_defaults)
 from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
@@ -397,7 +397,7 @@ class CodexProvider(LLMProvider):
 
         start = time.time()
         try:
-            result = subprocess.run(
+            result = run_owned_command(
                 cmd, **_codex_run_kwargs(prompt, use_stdin,
                                          timeout=timeout, cwd=cwd))
             latency = int((time.time() - start) * 1000)
@@ -434,7 +434,7 @@ class CodexProvider(LLMProvider):
             parsed["usage"].prompt_tokens_source = "codex_cli_reported"
             if _needs_initial_greeting_retry(parsed, session_id):
                 first_thread_id = parsed["thread_id"]
-                retry_result = subprocess.run(
+                retry_result = run_owned_command(
                     self._build_cmd(prompt, model, cwd, first_thread_id,
                                     sandbox_mode=sandbox_mode,
                                     approval_policy=approval_policy,

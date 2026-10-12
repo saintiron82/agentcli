@@ -127,7 +127,7 @@ def test_health_check_gh_probe_invokes_provider(mock_find, mock_env):
 
     with patch("agentcli.providers.copilot.run_health_command",
                side_effect=fake_health), \
-         patch("agentcli.providers.copilot.subprocess.run",
+         patch("agentcli.providers.copilot.run_owned_command",
                return_value=_completed(0, stdout=_OK_STDOUT, stderr="")):
         h = CopilotProvider().health_check(probe=True)
     assert h.ok is True
@@ -156,7 +156,7 @@ def test_health_check_copilot_probe_path(mock_find, mock_env):
     """copilot 바이너리 + probe=True → invoke 경유 health_from_response."""
     with patch("agentcli.providers.copilot.run_health_command",
                return_value=_completed(0, stdout="copilot 1.2.3")), \
-         patch("agentcli.providers.copilot.subprocess.run",
+         patch("agentcli.providers.copilot.run_owned_command",
                return_value=_completed(0, stdout=_OK_STDOUT, stderr="")):
         h = CopilotProvider().health_check(probe=True)
     assert h.ok is True
@@ -233,7 +233,7 @@ def test_build_cmd_returns_none_when_binary_missing():
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
 def test_invoke_nonzero_return_code_is_error(mock_find, mock_env):
-    with patch("agentcli.providers.copilot.subprocess.run",
+    with patch("agentcli.providers.copilot.run_owned_command",
                return_value=_completed(2, stdout="",
                                        stderr="boom failure detail")):
         resp = CopilotProvider().invoke([Message(role="user", content="hi")])
@@ -247,7 +247,7 @@ def test_invoke_nonzero_return_code_is_error(mock_find, mock_env):
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))
 def test_invoke_nonzero_with_empty_stderr_uses_exit_marker(mock_find, mock_env):
-    with patch("agentcli.providers.copilot.subprocess.run",
+    with patch("agentcli.providers.copilot.run_owned_command",
                return_value=_completed(3, stdout="", stderr="")):
         resp = CopilotProvider().invoke([Message(role="user", content="hi")])
     assert resp.exit_code == 3
@@ -255,7 +255,7 @@ def test_invoke_nonzero_with_empty_stderr_uses_exit_marker(mock_find, mock_env):
 
 
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
-@patch("agentcli.providers.copilot.subprocess.run",
+@patch("agentcli.providers.copilot.run_owned_command",
        side_effect=FileNotFoundError())
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))

@@ -30,8 +30,18 @@ class AcpConnection:
         self._on_notification = on_notification
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(AcpError({"code": -32000, "message": "ACP transport closed"}))
+        self._pending.clear()
 
     async def request(self, method: str, params: dict) -> dict:
+        if self._closed:
+            raise AcpError({"code": -32000, "message": "ACP transport closed"})
         self._next_id += 1
         rid = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
