@@ -2,6 +2,7 @@
 import asyncio
 import sqlite3
 import threading
+import time
 import pytest
 from agentcli import LLMClient, MemoryStore, SQLiteStore
 from agentcli.providers.base import LLMProvider
@@ -107,3 +108,47 @@ def test_cancelled_prepare_releases_memory_pin_after_worker_completes():
         asyncio.run(run())
     finally:
         release.set()
+
+
+def test_loop_shutdown_does_not_release_running_worker_lease():
+    entered, release, checking, finished = (threading.Event() for _ in range(4))
+    class Provider(LLMProvider):
+        provider_id = "thread"
+        supports_sessions = True
+        def is_available(self): return True
+        def list_models(self): return []
+        def invoke(self, messages, **kwargs):
+            if messages[-1].content == "slow":
+                entered.set()
+                release.wait(3)
+            return LLMResponse("ok", "thread", "", session_id="fake")
+    registry = ProviderRegistry()
+    registry.register(Provider())
+    store = MemoryStore()
+    client = LLMClient(store, registry)
+    errors = []
+    async def background():
+        asyncio.create_task(client.chat_async("slow", provider="thread", owner="o", alias="a"))
+        assert await asyncio.to_thread(entered.wait, 2)
+        # Returning starts asyncio.run's cancellation of ALL outstanding Tasks.
+    def shutdown():
+        try: asyncio.run(background())
+        except BaseException as exc: errors.append(exc)
+    def next_turn():
+        assert entered.wait(2)
+        checking.set()
+        client.chat("fast", provider="thread", owner="o", alias="a")
+        finished.set()
+    first = threading.Thread(target=shutdown)
+    second = threading.Thread(target=next_turn)
+    first.start(); second.start()
+    try:
+        assert checking.wait(2)
+        time.sleep(0.05)
+        assert not finished.is_set()
+        assert store._pins
+    finally:
+        release.set()
+        first.join(3); second.join(3)
+    assert not first.is_alive() and not second.is_alive() and not errors
+    assert finished.is_set() and not store._pins

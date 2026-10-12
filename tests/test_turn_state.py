@@ -1,5 +1,6 @@
 """Turn lifetime and reset races: fake providers only."""
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import pytest
@@ -133,3 +134,38 @@ def test_stats_and_create_are_intrinsically_synchronized():
         futures = [pool.submit(write), pool.submit(read)]
         for future in futures: future.result(timeout=10)
     assert store.get_token_stats(days=0)["total_calls"] == 500
+
+
+@pytest.mark.parametrize("sqlite", [False, True])
+def test_late_creator_failure_does_not_delete_other_success(tmp_path, monkeypatch, sqlite):
+    store = SQLiteStore(str(tmp_path / "race.db")) if sqlite else MemoryStore()
+    client, provider = client_for(store)
+    entered, release = threading.Event(), threading.Event()
+    prepare, invoke = client._locked_prepare, provider.invoke
+    first = [True]
+    def delayed(*args):
+        plan = prepare(*args)
+        if args[0] == "fail" and first[0]:
+            first[0] = False
+            entered.set()
+            assert release.wait(3)
+        return plan
+    def failed(messages, **options):
+        if messages[-1].content == "fail": return LLMResponse("", "gate", "", error="fake")
+        return invoke(messages, **options)
+    monkeypatch.setattr(client, "_locked_prepare", delayed)
+    monkeypatch.setattr(provider, "invoke", failed)
+    async def run():
+        failing = asyncio.create_task(client.chat_async("fail", provider="gate", owner="o", alias="a"))
+        assert await asyncio.to_thread(entered.wait, 2)
+        success = await client.chat_async("fast", provider="gate", owner="o", alias="a")
+        release.set()
+        result = await failing
+        assert not result.content
+        assert result.conversation_id == success.conversation_id
+        assert store.get(success.conversation_id).metadata["session_id:gate"] == "new-sid"
+        assert store.get_token_stats(days=0)["total_calls"] == 1
+    try: asyncio.run(run())
+    finally:
+        release.set()
+        if sqlite: store.close()

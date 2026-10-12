@@ -660,7 +660,14 @@ class LLMClient:
         """Remove a conversation created only for a failed call."""
         if not created_conversation:
             return False
-        with self._store_lock():
+        with self._store_write():
+            current = self._store.get(conv_id)
+            if current is None:
+                return True
+            if (current.metadata.get("has_successful_turn")
+                    or current.metadata.get(WORKSPACE_KEY)
+                    or _session_providers_from_metadata(current.metadata)):
+                return False
             self._store.delete(conv_id)
         return True
 
@@ -673,6 +680,7 @@ class LLMClient:
             current = self._store.get(conv.id)
             if current is None:
                 raise RuntimeError("Conversation disappeared before persistence")
+            self._store.set_metadata(conv.id, "has_successful_turn", True)
             if not session_generation_matches(self._store, current, response.provider):
                 self._persist(conv.id, prompt, response, agent, alias=alias,
                               persist_session=False)
