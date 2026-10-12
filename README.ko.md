@@ -73,6 +73,18 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
   유지합니다. 도구의 외부 변경은 rollback되지 않습니다. 정리·잠금 대기 시간은
   실행 예산을 넘을 수 있습니다. 진단 trace는 본문을 제외하는 schema 2입니다.
 
+### 서비스별 독립 인증 (미배포)
+
+서비스 client마다 `LLMClient(..., auth_profile=AuthProfile(...))`로 연결합니다.
+공용 머신 로그인·전역 환경 변수 변경 없이 인증과 네이티브 CLI 경로를 분리합니다.
+토큰 교체·비활성화는 해당 client의 이후 호출에만 적용하며 진행 중인 호출은
+스냅샷을 유지합니다. Claude OAuth/API key·Codex API key/프로필 내부 auth.json·
+명시적 Copilot GitHub 토큰을 지원합니다. 프로필 모드에서 Kiro는 미지원입니다.
+
+[서비스 인증 문서](docs/service-auth.ko.md)에 준비·동시 실행·교체 예제와 보안
+경계를 정리했습니다. 프로필 없는 client는 기존 공유 인증을 유지하며 기존 서비스는
+자동 이행되지 않습니다.
+
 ## 핵심 설계 원칙
 
 **대화 히스토리의 single source of truth는 provider CLI 세션입니다.** 라이브러리는 provider별 `session_id`만 저장하고 이전 대화를 prompt에 다시 주입하지 않습니다. 이 원칙 때문에 토큰 중복, 히스토리 중복 저장, 예측하기 어려운 context 증가를 피할 수 있습니다.

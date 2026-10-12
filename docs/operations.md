@@ -7,6 +7,11 @@ not evidence that the user's servers satisfy it. Last reviewed: 2026-10-12.
 
 ## Trust and identity
 
+For services sharing a machine, bind separate
+[service auth profiles](service-auth.md) to their clients. Never switch the shared
+machine login or process-global default client to select a service account.
+Profile isolation is opt-in and does not replace OS/container boundaries.
+
 AgentCli starts locally installed CLIs with the service account's permissions.
 It is not an OS sandbox, authentication server or credential broker. Authenticate
 users before deriving `owner`; never accept arbitrary owner/cwd/provider options

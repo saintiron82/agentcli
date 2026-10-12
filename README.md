@@ -86,6 +86,19 @@ and [the operating runbook](docs/operations.md).
   per attempt. Tool side effects are not rolled back. Cleanup and lease waiting
   can exceed the execution budget. Debug traces use schema 2 with payload omission.
 
+### Independent service authentication (unreleased)
+
+Bind each service's client with `LLMClient(..., auth_profile=AuthProfile(...))`.
+Profiles separate credentials and native CLI directories without switching the
+shared machine login or modifying global environment variables. Rotation and
+disabling affect only that client's future calls; active calls retain their
+snapshot. Claude OAuth/API keys, Codex API keys/profile-local auth.json, and
+explicit Copilot GitHub tokens are supported. Kiro is not supported in profile mode.
+
+See [service authentication](docs/service-auth.md) for setup, concurrency examples,
+credential rotation and security boundaries. Clients without a profile retain
+legacy shared authentication; existing services are not automatically migrated.
+
 ## Design principle
 
 **The CLI session is the single source of truth for history.** The library stores only `session_id` per provider — it does not re-inject prior turns into prompts. This is what keeps the library lightweight and tokens predictable.
