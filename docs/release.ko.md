@@ -20,7 +20,7 @@ API가 아직 beta이고 실제 Claude Code, Codex, GitHub Copilot CLI 환경에
 
 4. Release 워크플로의 테스트·빌드 게이트가 통과하고 wheel·소스 패키지를
    첨부한 GitHub Release `v0.7.5`가 생성되는지 확인합니다. 릴리스 노트는
-   [docs/releases/v0.7.5.md](releases/v0.7.5.md)를 사용합니다.
+   [docs/releases/v0.7.5.ko.md](releases/v0.7.5.ko.md)를 사용합니다.
 
 5. 사용자는 다음 명령으로 설치할 수 있습니다.
 
@@ -71,9 +71,11 @@ git push origin v0.7.5
 
 1. **build + verify** — `".[dev]"` 설치 후 `pytest`를 게이트로 실행(실패한
    태그는 배포되지 않음), `python -m build`, `twine check dist/*`.
-2. **github-release** — 빌드 검증 성공 후 `docs/releases/<tag>.md`를 기준으로
-   빌드 산출물을 첨부해 GitHub Release를 생성합니다. PyPI 비활성화나 게시
-   실패는 이 잡을 막지 않습니다.
+2. **github-release** — 빌드 검증 성공 후 `docs/releases/<tag>.ko.md`를 우선
+   사용하고, 없으면 `docs/releases/<tag>.md`를 사용해 빌드 산출물을 첨부한
+   GitHub Release를 생성합니다. 릴리스 본문에서는 저장소 상대 경로가 올바르게
+   연결되지 않으므로 언어 전환 링크에 GitHub 절대 URL을 사용합니다.
+   PyPI 비활성화나 게시 실패는 이 잡을 막지 않습니다.
 3. **pypi-publish** — repository variable `PYPI_PUBLISH_ENABLED`가 `true`일
    때만 `pypa/gh-action-pypi-publish`로 **PyPI Trusted
    Publishing (OIDC)** 업로드. `twine upload`가 아니며, 저장되는 API 토큰도

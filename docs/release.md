@@ -21,7 +21,7 @@ real Claude Code, Codex, and GitHub Copilot CLI behavior.
 
 4. Wait for the Release workflow to pass its tests/build gate and create the
    GitHub Release `v0.7.5` with wheel and source distributions, using
-   [docs/releases/v0.7.5.md](releases/v0.7.5.md) as the release note.
+   [docs/releases/v0.7.5.ko.md](releases/v0.7.5.ko.md) as the release note.
 
 5. Users can install with:
 
@@ -74,7 +74,10 @@ The workflow then:
 1. **build + verify** — installs `".[dev]"`, runs `pytest` as a gate (a failing
    tag never ships), `python -m build`, and `twine check dist/*`.
 2. **github-release** — after successful build verification, creates the GitHub
-   Release from `docs/releases/<tag>.md` with the built distributions attached.
+   Release from `docs/releases/<tag>.ko.md` when available, otherwise
+   `docs/releases/<tag>.md`, with the built distributions attached. Use absolute
+   GitHub URLs for language-switch links because repository-relative links do
+   not resolve correctly in a Release body.
    PyPI being disabled or failing does not block this job.
 3. **pypi-publish** — only when the repository variable `PYPI_PUBLISH_ENABLED`
    is `true`, uploads via **PyPI Trusted Publishing (OIDC)** using

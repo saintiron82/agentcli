@@ -95,7 +95,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          notes="docs/releases/${TAG}.md"
+          # Publish Korean notes when available; retain English-only releases.
+          notes="docs/releases/${TAG}.ko.md"
+          if [ ! -f "$notes" ]; then
+            notes="docs/releases/${TAG}.md"
+          fi
           if [ -f "$notes" ]; then
             gh release create "$TAG" dist/* --title "$TAG" --notes-file "$notes"
           else
