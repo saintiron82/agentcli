@@ -19,6 +19,7 @@ import pathlib
 import shutil
 import subprocess
 import time
+from contextlib import aclosing
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
 from ..auth import AuthProfileError
@@ -450,11 +451,9 @@ class CodexProvider(LLMProvider):
                 resp.reasoning = reasoning
                 return resp
 
-            parsed = _parse_jsonl_events(result.stdout)
-            parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
-            parsed["usage"].prompt_tokens_reliable = False
-            parsed["usage"].prompt_tokens_source = "codex_cli_reported"
+            parsed = _parse_output(result.stdout, prompt)
             if _needs_initial_greeting_retry(parsed, session_id):
+                first_usage = parsed["usage"]
                 first_thread_id = parsed["thread_id"]
                 retry_result = run_owned_command(
                     self._build_cmd(prompt, model, cwd, first_thread_id,
@@ -473,16 +472,15 @@ class CodexProvider(LLMProvider):
                                  retry_result.returncode, classify_error(msg))
                     resp = LLMResponse(
                         content="", provider=self.provider_id, model=model,
+                        tokens=first_usage,
                         raw_stderr=retry_result.stderr,
                         session_id=parsed["thread_id"],
                         error=msg, error_type=classify_error(msg),
                         exit_code=retry_result.returncode)
                     resp.reasoning = reasoning
                     return resp
-                parsed = _parse_jsonl_events(retry_result.stdout)
-                parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
-                parsed["usage"].prompt_tokens_reliable = False
-                parsed["usage"].prompt_tokens_source = "codex_cli_reported"
+                parsed = _parse_output(retry_result.stdout, prompt)
+                parsed["usage"].accumulate(first_usage)
                 if not parsed["thread_id"]:
                     parsed["thread_id"] = first_thread_id
                 result = retry_result
@@ -606,7 +604,17 @@ class CodexProvider(LLMProvider):
             return resp
 
         stdout_txt = stdout_b.decode("utf-8", errors="replace")
-        parsed = _parse_jsonl_events(stdout_txt)
+        parsed = _parse_output(stdout_txt, prompt)
+        if _needs_initial_greeting_retry(parsed, session_id):
+            response = await self.invoke_async(
+                messages, model=model, timeout=timeout,
+                session_id=parsed["thread_id"], cwd=cwd, sandbox_mode=sandbox_mode,
+                approval_policy=approval_policy, mcp_config=mcp_config,
+                debug=debug, debug_log_path=debug_log_path,
+                effort=effort, thinking=thinking)
+            response.tokens.accumulate(parsed["usage"])
+            response.latency_ms = int((time.time() - start) * 1000)
+            return response
         err = parsed.get("error", "")
         resp = LLMResponse(
             content=parsed["text"] if not err else "",
@@ -667,6 +675,8 @@ class CodexProvider(LLMProvider):
         # 만료된 thread 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다 (claude 동일 패턴).
         attempt_sid = session_id
+        total_usage = TokenUsage()
+        deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
         for _attempt in range(2):
             cmd = self._build_cmd(prompt, model, cwd, attempt_sid,
                                   sandbox_mode=sandbox_mode,
@@ -684,19 +694,39 @@ class CodexProvider(LLMProvider):
                     prompt_tokens_reliable=False,
                     prompt_tokens_source="codex_cli_reported"))
             retry_stale = False
+            retry_greeting = False
             emitted = False
-            async for chunk in self._run_stream_template(
+            async with aclosing(self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
-                    idle_timeout=idle_timeout, wall_timeout=wall_timeout,
+                    idle_timeout=idle_timeout,
+                    wall_timeout=max(0, deadline - time.monotonic()) if deadline is not None else None,
                     env=provider_environment("codex", build_env), debug=debug, debug_log_path=debug_log_path,
-                    input_bytes=prompt_bytes if use_stdin else None):
-                if (attempt_sid and not emitted
-                        and chunk.type == "error"
-                        and _is_codex_stale(chunk.content)):
-                    retry_stale = True
-                    break
-                emitted = True
-                yield chunk
+                    input_bytes=prompt_bytes if use_stdin else None)) as stream:
+                async for chunk in stream:
+                    if (attempt_sid and not emitted and _attempt == 0
+                            and chunk.type == "error" and _is_codex_stale(chunk.content)):
+                        retry_stale = True
+                        break
+                    if chunk.type == "error":
+                        state.extra["failed"] = True
+                    if chunk.type in ("tool_use", "tool_result"):
+                        state.extra["side_effects"] = True
+                    if chunk.type == "done":
+                        total_usage.accumulate(chunk.usage or state.final_usage or TokenUsage())
+                        parsed = {"text": "".join(state.text_parts),
+                                  "thread_id": state.final_session_id,
+                                  "ignored_initial_greeting": state.extra.get("ignored_initial_greeting"),
+                                  "error": state.extra.get("failed"),
+                                  "side_effects": state.extra.get("side_effects")}
+                        if _attempt == 0 and _needs_initial_greeting_retry(parsed, attempt_sid):
+                            retry_greeting = True
+                            break
+                        chunk.usage = total_usage
+                    emitted = True
+                    yield chunk
+            if retry_greeting:
+                attempt_sid = state.final_session_id
+                continue
             if not retry_stale:
                 return
             logger.warning(
@@ -718,6 +748,7 @@ class CodexProvider(LLMProvider):
             if itype == "agent_message":
                 text = item.get("text", "")
                 if _is_codex_initial_greeting(text) and not state.text_parts:
+                    state.extra["ignored_initial_greeting"] = True
                     return  # 초기 인사 무시
                 if text:
                     state.text_parts.append(text)
@@ -754,6 +785,12 @@ class CodexProvider(LLMProvider):
 
 # ---------- JSONL 이벤트 파싱 유틸 ----------
 
+def _parse_output(stdout: str, prompt: str) -> dict:
+    parsed = _parse_jsonl_events(stdout)
+    parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+    return parsed
+
+
 def _parse_jsonl_events(stdout: str) -> dict:
     """codex exec --json stdout 전체를 파싱하여 text/thread_id/usage/error 추출.
 
@@ -771,6 +808,7 @@ def _parse_jsonl_events(stdout: str) -> dict:
     cached_tokens = 0
     error_msg = ""
     ignored_initial_greeting = False
+    side_effects = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -790,6 +828,8 @@ def _parse_jsonl_events(stdout: str) -> dict:
                 thread_id = tid
         elif etype == "item.completed":
             item = evt.get("item") or {}
+            if item.get("type") in ("command_execution", "tool_call"):
+                side_effects = True
             if item.get("type") == "agent_message":
                 t = item.get("text", "")
                 if t:
@@ -826,6 +866,7 @@ def _parse_jsonl_events(stdout: str) -> dict:
         "usage": usage,
         "error": error_msg,
         "ignored_initial_greeting": ignored_initial_greeting,
+        "side_effects": side_effects,
     }
 
 
@@ -840,4 +881,5 @@ def _needs_initial_greeting_retry(parsed: dict, session_id: str) -> bool:
         and not parsed.get("text")
         and bool(parsed.get("thread_id"))
         and not parsed.get("error")
+        and not parsed.get("side_effects")
     )
