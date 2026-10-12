@@ -174,3 +174,39 @@ Review and test each change independently. Do not combine security fixes with
 a broad refactor, change existing session identifiers silently, or serialize
 unrelated sessions globally. Closing a code finding does not certify an actual
 server deployment or all versions of the external CLIs.
+
+## Final verification — 2026-10-12
+
+Validated runtime commit: `6675f2f` (baseline `13bcfac`, v0.7.5 tag unchanged).
+Exported only tracked files to a separate clean directory before testing/building.
+
+- Windows / Python 3.14 clean snapshot: **1,020 passed, 39 skipped**. Skips are
+  POSIX-only process/permission/lifecycle checks, an unavailable optional host
+  integration and a privileged Windows symlink test. Real junction coverage passed.
+- Wheel and sdist built successfully; both passed `twine check`. These are local
+  validation artifacts with unchanged 0.7.5 metadata, not publishable new releases.
+- Runtime dependencies remain zero; optional dev dependencies are unchanged.
+- Installed Claude 2.1.296 and Codex 0.161.0 `--version` checks succeeded through
+  the hardened runner. No generation request or paid-model benchmark was run.
+- All local links in the changed README/security/operations documents resolved;
+  workflow YAML parsed. Action revisions were checked against upstream Git refs.
+
+Offline fake-provider overhead (5 batches of 500 warmed calls, MemoryStore, no CLI):
+sync median per call 9.35 → 153.72 μs; async 86.64 → 318.15 μs. Removing redundant
+scope checks reduced the first hardening measurement of 489.50/717.38 μs. This
+measures library overhead only, not model latency or throughput on actual servers;
+there is no zero-overhead or universal no-regression guarantee. Different sessions
+remain parallel in regression tests.
+
+Final review also made explicit instruction resets bypass the mtime/size cache:
+equal-length changes with a restored modification time are detected. Kiro write
+denials and disk failures now become ACP errors instead of false success. Started
+store writes complete under the lease even when the caller is cancelled; a host
+lease returning `False` never authorizes an invocation.
+
+Linux/macOS CI, the manual Windows GitHub workflow, distributed deployment and
+live Kiro/Copilot behavior still need verification in their actual environments.
+See [the operating runbook](operations.md) for server-side requirements. No remote
+push, merge, tag change, PyPI publication, server change or native history deletion
+was performed. Pre-existing untracked manual/example/output work was preserved
+and excluded from the clean snapshot and security commits.
