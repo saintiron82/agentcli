@@ -4,6 +4,7 @@
 
 project:
   name: agentcli
+  preferred_card_language: ko
   description: >
     Python library wrapping three external agentic CLIs (claude, codex,
     copilot/gh copilot) into one session-aware client API. Not an agent
@@ -55,7 +56,7 @@ architecture:
   canonical_apis:
     - "LLMClient.chat / chat_async / chat_stream"
     - "LLMProvider.invoke / invoke_async / stream_async"
-    - "Store.upsert / get / delete"
+    - "ConversationStore.create / get / delete"
 
   data_ownership:
     sessions: store
@@ -120,6 +121,16 @@ evidence_roots:
   fixtures: [tests/conftest.py]
   deployment: [pyproject.toml]
 
+classification:
+  runtime_roots:
+    - agentcli
+  test_markers:
+    - tests
+    - fixtures
+  docs_markers:
+    - docs
+    - readme
+
 validation:
   unit_test: "pytest"
   single_test: "pytest tests/test_<file>.py -k <name>"
@@ -138,6 +149,7 @@ audit:
   tradeoff_accepter: human_owner
 
 package_policy:
+  express_lane_max_changed_loc: 30
   express_lane:
     max_loc: 30
     max_files: 1
