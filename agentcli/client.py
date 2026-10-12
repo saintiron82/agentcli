@@ -529,7 +529,7 @@ class LLMClient:
                                        conversation_id=conversation_id,
                                        alias=alias)
             created_conversation = alias_existing is None
-        _require_conversation_scope(conv, owner, cwd)
+            _require_conversation_scope(conv, owner, cwd)
         resolved_alias = conv.alias or alias
         alias_to_set = alias if alias and not conv.alias else ""
 
@@ -620,7 +620,8 @@ class LLMClient:
                          alias: str, alias_to_set: str = "",
                          system_prompt_hash: str = "", provider_options=None) -> None:
         with self._store_lock():
-            self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
+            if not conv.metadata.get(WORKSPACE_KEY):
+                self._store.set_metadata(conv.id, WORKSPACE_KEY, _workspace_root(cwd))
             if alias_to_set:
                 self._store.set_alias(conv.id, alias_to_set)
                 conv.alias = alias_to_set
@@ -745,9 +746,6 @@ class LLMClient:
                     system_prompt, context_turns, agent, inject_context,
                     strict_model, reset_on_instruction_change, alias, cwd, new_session)
                 created_conversation = created_conversation or refreshed_created
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session, owner=owner, cwd=cwd)
             self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
 
             def _dispatch(msgs: list[Message]) -> LLMResponse:
@@ -1003,9 +1001,6 @@ class LLMClient:
                     system_prompt, context_turns, agent, inject_context,
                     strict_model, reset_on_instruction_change, alias, cwd, new_session)
                 created_conversation = created_conversation or refreshed_created
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session, owner=owner, cwd=cwd)
             self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
@@ -1194,9 +1189,6 @@ class LLMClient:
                     system_prompt, context_turns, agent, inject_context,
                     strict_model, reset_on_instruction_change, alias, cwd, new_session)
                 created_conversation = created_conversation or refreshed_created
-            session_id = self._refresh_session_id(
-                conversation_id, provider, provider_obj,
-                session_id, force_new_session, owner=owner, cwd=cwd)
             self._check_resume_policy(conversation_id, provider_obj, session_id, provider_options)
             attempts = [
                 (provider, provider_obj, messages, model, session_id,
