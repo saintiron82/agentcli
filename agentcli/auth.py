@@ -6,6 +6,7 @@ user. Credentials are never written by this module or borrowed from global login
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -99,11 +100,18 @@ class AuthProfile:
         root, marker = self._marker()
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._check_private(root)
+        fd, temporary = tempfile.mkstemp(prefix=".agentcli-auth-", dir=root)
         try:
-            with marker.open("x", encoding="utf-8") as output:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
                 json.dump(self.binding, output)
-        except FileExistsError:
-            pass
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                os.link(temporary, marker)  # Publish complete bytes without replacing a marker.
+            except FileExistsError:
+                pass
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         self._check_marker()
         for provider in ("claude", "codex", "copilot", "gh", "home"):
             path = self.directory(provider)
@@ -145,14 +153,17 @@ class AuthProfile:
             return "github_token"
         raise AuthProfileError("Provider does not support service authentication profiles")
 
-    def claude_token(self):
+    def claude_credentials(self):
         if self.claude_oauth_token is not None:
-            return self.claude_oauth_token
+            return {"accessToken": self.claude_oauth_token}
         oauth = self._credential_file("claude", ".credentials.json").get("claudeAiOauth")
         value = oauth.get("accessToken") if isinstance(oauth, dict) else None
         if not isinstance(value, str) or not value.strip() or any(c in value for c in "\0\r\n"):
             raise AuthProfileError("Service Claude OAuth credential is missing or invalid")
-        return value.strip()
+        return {**oauth, "accessToken": value.strip()}
+
+    def claude_token(self):
+        return self.claude_credentials()["accessToken"]
 
     def validate(self, provider):
         if provider in self.disabled_providers:
@@ -161,42 +172,50 @@ class AuthProfile:
         self.method(provider)
         self._check_private(self.directory(provider))
         if provider == "claude" and self.claude_api_key is None:
-            self.claude_token()
+            return self.claude_credentials()
         elif provider == "codex" and self.codex_api_key is None:
             auth = self._credential_file("codex", "auth.json")
             token = (auth.get("tokens") or {}).get("access_token") if isinstance(auth.get("tokens"), dict) else None
             key = auth.get("OPENAI_API_KEY")
             if not ((isinstance(token, str) and token.strip()) or (isinstance(key, str) and key.strip())):
                 raise AuthProfileError("Service Codex credential is missing or invalid")
+            return auth
         elif provider == "copilot" and self.github_token is None:
             raise AuthProfileError("Service GitHub token is required; gh/global login is not used")
+        return {}
 
     def environment(self, provider):
         """Private child environment. Never modify os.environ or run auth/login."""
-        self.validate(provider)
+        return self._environment(provider, self.validate(provider))
+
+    def _environment(self, provider, credentials):
         # Inherit launch/transport settings only, never arbitrary host secrets.
         env = {k: v for k, v in os.environ.items() if k.upper() in _BASE_ENV}
         env.update(self.extra_env)
-        home = str(self.directory("home"))
+        home_path = self.directory("home")
+        self._check_private(home_path)
+        home = str(home_path)
         env.update(HOME=home, USERPROFILE=home)
-        env.update(APPDATA=str(self.directory("home") / "AppData" / "Roaming"),
-                   LOCALAPPDATA=str(self.directory("home") / "AppData" / "Local"),
-                   XDG_CONFIG_HOME=str(self.directory("home") / ".config"))
+        env.update(APPDATA=str(home_path / "AppData" / "Roaming"),
+                   LOCALAPPDATA=str(home_path / "AppData" / "Local"),
+                   XDG_CONFIG_HOME=str(home_path / ".config"))
         if provider == "claude":
-            env["CLAUDE_CONFIG_DIR"] = str(self.directory("claude"))
+            env["CLAUDE_CONFIG_DIR"] = str(Path(self.root) / "claude")
             env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
             if self.claude_api_key is not None:
                 env["ANTHROPIC_API_KEY"] = self.claude_api_key
             else:
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = self.claude_token()
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = credentials["accessToken"]
         elif provider == "codex":
-            env["CODEX_HOME"] = str(self.directory("codex"))
+            env["CODEX_HOME"] = str(Path(self.root) / "codex")
             if self.codex_api_key is not None:
                 env["CODEX_API_KEY"] = self.codex_api_key
         elif provider == "copilot":
-            env["COPILOT_HOME"] = str(self.directory("copilot"))
-            env["GH_CONFIG_DIR"] = str(self.directory("gh"))
+            env["COPILOT_HOME"] = str(Path(self.root) / "copilot")
+            gh_path = self.directory("gh")
+            self._check_private(gh_path)
+            env["GH_CONFIG_DIR"] = str(gh_path)
             env["GH_HOST"] = "github.com"
             env["COPILOT_GITHUB_TOKEN"] = self.github_token
             env["GH_TOKEN"] = self.github_token

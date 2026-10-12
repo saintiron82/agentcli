@@ -226,7 +226,8 @@ class CodexProvider(LLMProvider):
         if profile is not None:
             if oauth_token is not None or credentials_path is not None:
                 raise AuthProfileError("Service usage lookup cannot override the auth profile")
-            profile.validate("codex")
+            from ..auth_context import validate_auth_options
+            validate_auth_options("codex")
             if profile.codex_api_key is not None:
                 return AccountUsage(provider="codex", status="unsupported_auth",
                                     message="API-key billing usage is not supported")

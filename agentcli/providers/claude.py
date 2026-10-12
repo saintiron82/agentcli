@@ -373,7 +373,8 @@ class ClaudeProvider(LLMProvider):
         if profile is not None:
             if oauth_token is not None or self._oauth_token is not None:
                 raise AuthProfileError("Service auth cannot be overridden by provider OAuth credentials")
-            return profile.environment("claude")
+            from ..auth_context import provider_environment
+            return provider_environment("claude", lambda: None)
         token = self._resolve_oauth_token(oauth_token)
         extra: dict = {}
         if NONESSENTIAL_TRAFFIC_ENV_VAR not in os.environ:
@@ -396,11 +397,13 @@ class ClaudeProvider(LLMProvider):
         if profile is not None:
             if oauth_token is not None or credentials_path is not None or self._oauth_token is not None:
                 raise AuthProfileError("Service usage lookup cannot override the auth profile")
-            profile.validate("claude")
+            from ..auth_context import service_credentials
+            credentials = service_credentials("claude")
             if profile.claude_api_key is not None:
                 return AccountUsage(provider="claude", status="unsupported_auth",
                                     message="API-key billing usage is not supported")
-            return claude_account_usage(token=profile.claude_token(), timeout=timeout,
+            return claude_account_usage(token=credentials.get("accessToken"),
+                                        oauth_metadata=credentials, timeout=timeout,
                                         allow_probe=allow_probe)
         if oauth_token is not None and credentials_path is not None:
             raise ValueError("Choose oauth_token or credentials_path, not both.")

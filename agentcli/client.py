@@ -34,6 +34,7 @@ from .deadlines import request_budget, remaining_timeout, bounded_stream
 from .auth import AuthProfile, AuthProfileError
 from .auth_context import (AUTH_SCOPE_KEY, auth_scoped, current_auth_profile,
                            require_auth_scope, require_auth_method, validate_auth_options,
+                           validate_auth_options_async,
                            service_auth_response, SERVICE_AUTH_ACTION)
 from .providers.registry import ProviderRegistry, create_default_registry
 
@@ -338,7 +339,7 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke_async", provider_options)
     try:
-        validate_auth_options(provider_obj.provider_id, provider_options)
+        await validate_auth_options_async(provider_obj.provider_id, provider_options)
     except AuthProfileError as exc:
         return service_auth_response(LLMResponse("", provider_obj.provider_id, model,
                                                 error=str(exc), error_type="auth"))
@@ -1280,6 +1281,7 @@ class LLMClient:
                 current_stream = None
 
                 try:
+                    await validate_auth_options_async(current_id, provider_options)
                     current_stream = _stream_with_alias(
                             current_provider, current_messages,
                             model=current_model, timeout=timeout,
@@ -1329,6 +1331,13 @@ class LLMClient:
                         if raw_chunk.type == "text":
                             text_parts.append(raw_chunk.content)
                         yield raw_chunk
+                except AuthProfileError as exc:
+                    saw_error = True
+                    last_error = make_error_chunk(str(exc), provider=current_id,
+                                                  error_type="auth",
+                                                  suggested_action=SERVICE_AUTH_ACTION)
+                    if emitted_output:
+                        yield last_error
                 except asyncio.TimeoutError:
                     saw_error = True
                     last_error = make_error_chunk("wall timeout expired", provider=current_id,
@@ -1492,7 +1501,15 @@ class LLMClient:
         if current_auth_profile() is not None:
             if oauth_token is not None or credentials_path is not None:
                 raise AuthProfileError("Service usage lookup cannot override the auth profile")
-            validate_auth_options(provider)
+            if provider not in {"claude", "codex", "copilot"}:
+                return AccountUsage(provider=provider, status="unsupported",
+                                    message="Provider does not support service authentication")
+            try:
+                validate_auth_options(provider)
+            except AuthProfileError as exc:
+                return AccountUsage(provider=provider, status="auth_required",
+                                    error_type="auth", message=str(exc),
+                                    suggested_action=SERVICE_AUTH_ACTION)
         return p.get_account_usage(timeout=timeout, allow_probe=allow_probe,
                                    oauth_token=oauth_token,
                                    credentials_path=credentials_path)

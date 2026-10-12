@@ -203,13 +203,14 @@ def _claude_probe(token: str, timeout: float) -> AccountUsage:
 
 def claude_account_usage(*, token: str | None = None,
                          credentials_path: str | None = None,
-                         timeout: float = 15, allow_probe: bool = False) -> AccountUsage:
+                         timeout: float = 15, allow_probe: bool = False,
+                         oauth_metadata: dict | None = None) -> AccountUsage:
     validate_timeout(timeout)
     if credentials_path is None:
         token = token or _text(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
         if not token and (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
             return _failure("claude", "unsupported_auth", "API-key/gateway billing usage is not supported.")
-    oauth = {}
+    oauth = oauth_metadata or {}
     if not token:
         try:
             path = (Path(credentials_path).expanduser() if credentials_path is not None
