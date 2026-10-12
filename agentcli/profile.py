@@ -271,6 +271,16 @@ class AgentProfile:
             "system_prompt": self.resolve_instructions(),
         }
         kwargs.update({k: v for k, v in overrides.items() if v is not None})
+        options = {}
+        if self.allowed_tools:
+            options["allowed_tools"] = list(self.allowed_tools)
+        if self.disallowed_tools:
+            options["disallowed_tools"] = list(self.disallowed_tools)
+        if self.mcp_config:
+            options["mcp_config"] = self.mcp_config
+        options.update(kwargs.get("provider_options") or {})
+        if options:
+            kwargs["provider_options"] = options
         return kwargs
 
     async def chat_async(self, prompt: str, *,

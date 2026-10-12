@@ -157,6 +157,8 @@ class CopilotProvider(LLMProvider):
                    output_format: str = "text",
                    alias: str = "",
                    resume_by_alias: bool = True,
+                   allowed_tools: list[str] | None = None,
+                   disallowed_tools: list[str] | None = None,
                    reasoning_args: list[str] | None = None) -> tuple[list[str] | None, bool]:
         """(cmd, use_gh) 반환. session_id 발급은 CLI가 담당, 우리는 stdout에서 파싱.
 
@@ -180,13 +182,16 @@ class CopilotProvider(LLMProvider):
 
         if model and not use_gh:
             cmd += ["--model", model]
-        if self._allow_all_tools:
+        # A per-call allowlist must not be neutralized by --allow-all-tools.
+        if self._allow_all_tools and allowed_tools is None:
             cmd.append("--allow-all-tools")
-        if self._allowed_tools:
-            for t in self._allowed_tools:
+        atools = self._allowed_tools if allowed_tools is None else allowed_tools
+        dtools = self._disallowed_tools if disallowed_tools is None else disallowed_tools
+        if atools:
+            for t in atools:
                 cmd += ["--allow-tool", t]
-        if self._disallowed_tools:
-            for t in self._disallowed_tools:
+        if dtools:
+            for t in dtools:
                 cmd += ["--deny-tool", t]
         if self._available_tools:
             cmd += ["--available-tools", ",".join(self._available_tools)]
@@ -231,6 +236,8 @@ class CopilotProvider(LLMProvider):
                resume_by_alias: bool = True,
                debug: bool = False,
                debug_log_path: str | None = None,
+               allowed_tools: list[str] | None = None,
+               disallowed_tools: list[str] | None = None,
                effort: str | None = None,
                thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
@@ -238,6 +245,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
@@ -317,6 +326,8 @@ class CopilotProvider(LLMProvider):
                            resume_by_alias: bool = True,
                            debug: bool = False,
                            debug_log_path: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None,
                            effort: str | None = None,
                            thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
@@ -324,6 +335,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
@@ -406,6 +419,8 @@ class CopilotProvider(LLMProvider):
                            wall_timeout: int | None = None,
                            debug: bool = False,
                            debug_log_path: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None,
                            effort: str | None = None,
                            thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
@@ -430,6 +445,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")

@@ -96,6 +96,29 @@ def _session_providers_from_metadata(metadata: dict) -> list[str]:
 # provider 클래스는 런타임에 바뀌지 않으므로 1회 계산 후 캐시.
 _PARAM_SUPPORT_CACHE: dict[tuple[type, str, str], bool] = {}
 
+# These options change execution boundaries and must never be silently dropped.
+_SECURITY_OPTIONS = frozenset({
+    "permission_mode", "allowed_tools", "disallowed_tools", "sandbox_mode",
+    "approval_policy", "mcp_config", "strict_mcp_config", "lean", "isolated",
+    "env", "trust_all", "trust_tools", "allow_file_reads", "allow_file_writes",
+    "allow_all_tools", "available_tools", "allow_all_paths", "add_dirs",
+})
+_RESERVED_OPTIONS = frozenset({
+    "messages", "model", "timeout", "session_id", "cwd", "alias", "resume_by_alias",
+})
+
+
+def _validate_provider_options(provider_obj, method_name: str, options: dict | None):
+    if not options:
+        return
+    if _RESERVED_OPTIONS.intersection(options):
+        raise ValueError("provider_options cannot override routing/execution arguments")
+    unsupported = [name for name in _SECURITY_OPTIONS.intersection(options)
+                   if options[name] is not None
+                   and not _method_accepts_param(provider_obj, method_name, name)]
+    if unsupported:
+        raise ValueError(f"Unsupported security options: {sorted(unsupported)}")
+
 
 def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bool:
     key = (type(provider_obj), method_name, param_name)
@@ -202,6 +225,7 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        session_id, cwd, alias, resume_by_alias=True,
                        effort=None, thinking=None,
                        provider_options=None):
+    _validate_provider_options(provider_obj, "invoke", provider_options)
     kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -220,6 +244,7 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     resume_by_alias=True,
                                     effort=None, thinking=None,
                                     provider_options=None):
+    _validate_provider_options(provider_obj, "invoke_async", provider_options)
     kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -238,6 +263,7 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         wall_timeout=None, resume_by_alias=True,
                         effort=None, thinking=None,
                         provider_options=None):
+    _validate_provider_options(provider_obj, "stream_async", provider_options)
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -274,6 +300,16 @@ class LLMClient:
     def _store_lock(self):
         lock = getattr(self._store, "_lock", None)
         return lock if lock is not None else nullcontext()
+
+    def _validate_call_options(self, provider: str, method: str, options):
+        if not options:
+            return
+        if not provider:
+            chain = self._registry.get_fallback_chain()
+            provider = chain[0] if chain else ""
+        selected = self._registry.get(provider)
+        if selected is not None:
+            _validate_provider_options(selected, method, options)
 
     def _sync_conversation_lock(self, conv_id: str) -> threading.Lock:
         with self._conv_locks_guard:
@@ -571,6 +607,7 @@ class LLMClient:
              ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        self._validate_call_options(provider, "invoke", provider_options)
         if output_schema is not None:
             from .schema import assert_supported_schema
             assert_supported_schema(output_schema)   # 재시도 비용 전에 터뜨림
@@ -811,6 +848,7 @@ class LLMClient:
                          ) -> LLMResponse:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        self._validate_call_options(provider, "invoke_async", provider_options)
         if output_schema is not None:
             from .schema import assert_supported_schema
             assert_supported_schema(output_schema)
@@ -978,6 +1016,7 @@ class LLMClient:
         """
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
+        self._validate_call_options(provider, "stream_async", provider_options)
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model, created_conversation, resolved_alias, alias_to_set,

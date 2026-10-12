@@ -32,13 +32,23 @@ MCP payload took 36.93 µs versus 2.55 µs. These are local diagnostic-path
 measurements, not model latency or production performance guarantees. Successful
 calls with debug disabled do not run this redaction path.
 
+## Step 2 — SEC-003: profile permission propagation
+
+Non-empty profile tool restrictions and MCP configuration now merge into
+`provider_options`; explicit per-call options take precedence without mutating
+the profile. Copilot accepts per-call tool lists and omits `--allow-all-tools`
+when an allowlist is supplied. Unsupported security options and routing overrides
+in `provider_options` fail before creating a conversation or launching a CLI.
+Ordinary unsupported diagnostic options remain ignorable. Relevant tests: 126
+passed; all three profile call paths are covered.
+
 ## Remaining work
 
 | ID | Scope | Status |
 | --- | --- | --- |
 | SEC-001 | Windows batch argument interpretation | Pending |
 | SEC-002 | Conversation and injected-context ownership | Pending |
-| SEC-003 | Profile permission/config propagation | Pending |
+| SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Pending |
 | SEC-006 | Materialization boundaries and user skill protection | Pending |
 | SEC-007 | Explicit Kiro filesystem access policy | Pending |
