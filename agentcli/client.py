@@ -484,9 +484,14 @@ class LLMClient:
     def _async_conversation_lock(self, conv_id: str):
         return async_lease(self._sync_conversation_lock(conv_id))
 
-    def _locked_prepare(self, *args):
+    def _locked_prepare(self, *args, method=None, options=None, check_policy=False):
+        if method is not None:
+            self._validate_call_options(args[1], method, options)
         with self._store_lock():
-            return self._prepare(*args)
+            plan = self._prepare(*args)
+        if check_policy:
+            self._check_resume_policy(plan.conv.id, plan.provider_obj, plan.session_id, options)
+        return plan
 
     # ---------- 공용 준비/저장 로직 (sync/async 공유) ----------
 
@@ -1047,7 +1052,6 @@ class LLMClient:
         _validate_schema_retries(schema_retries)
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
-        await complete_in_thread(self._validate_call_options, provider, "invoke_async", provider_options)
         if output_schema is not None:
             from .schema import assert_supported_schema
             assert_supported_schema(output_schema)
@@ -1056,7 +1060,8 @@ class LLMClient:
         plan = await complete_in_thread(
             self._locked_prepare, prompt, provider, model, conversation_id, owner,
             system_prompt, context_turns, agent, inject_context,
-            strict_model, reset_on_instruction_change, alias, cwd, new_session)
+            strict_model, reset_on_instruction_change, alias, cwd, new_session,
+            method="invoke_async", options=provider_options)
         conversation_id = plan.conv.id
         created_conversation = plan.created_conversation
 
@@ -1065,10 +1070,9 @@ class LLMClient:
             plan = await complete_in_thread(
                 self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                strict_model, reset_on_instruction_change, alias, cwd, new_session,
+                options=provider_options, check_policy=True)
             created_conversation = created_conversation or plan.created_conversation
-            await complete_in_thread(self._check_resume_policy, conversation_id,
-                                     plan.provider_obj, plan.session_id, provider_options)
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
                     plan.provider, msgs, _corrected_fallback(plan.messages, plan.fallback_messages, msgs), plan.model,
@@ -1227,11 +1231,11 @@ class LLMClient:
         if wall_timeout is not None and wall_timeout < 0:
             raise ValueError("wall_timeout must be nonnegative")
         deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
-        await complete_in_thread(self._validate_call_options, provider, "stream_async", provider_options)
         plan = await complete_in_thread(
             self._locked_prepare, prompt, provider, model, conversation_id, owner,
             system_prompt, context_turns, agent, inject_context,
-            strict_model, reset_on_instruction_change, alias, cwd, new_session)
+            strict_model, reset_on_instruction_change, alias, cwd, new_session,
+            method="stream_async", options=provider_options)
         conversation_id = plan.conv.id
         created_conversation = plan.created_conversation
 
@@ -1250,10 +1254,9 @@ class LLMClient:
             plan = await complete_in_thread(
                 self._locked_prepare, prompt, plan.provider, plan.model, conversation_id, owner,
                 system_prompt, context_turns, agent, inject_context,
-                strict_model, reset_on_instruction_change, alias, cwd, new_session)
+                strict_model, reset_on_instruction_change, alias, cwd, new_session,
+                options=provider_options, check_policy=True)
             created_conversation = created_conversation or plan.created_conversation
-            await complete_in_thread(self._check_resume_policy, conversation_id,
-                                     plan.provider_obj, plan.session_id, provider_options)
             attempts = [
                 (plan.provider, plan.provider_obj, plan.messages, plan.model, plan.session_id,
                  not plan.force_new_session)

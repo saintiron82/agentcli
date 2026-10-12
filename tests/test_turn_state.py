@@ -143,8 +143,8 @@ def test_late_creator_failure_does_not_delete_other_success(tmp_path, monkeypatc
     entered, release = threading.Event(), threading.Event()
     prepare, invoke = client._locked_prepare, provider.invoke
     first = [True]
-    def delayed(*args):
-        plan = prepare(*args)
+    def delayed(*args, **kwargs):
+        plan = prepare(*args, **kwargs)
         if args[0] == "fail" and first[0]:
             first[0] = False
             entered.set()
