@@ -17,9 +17,24 @@ from datetime import datetime, timedelta
 from threading import RLock
 from pathlib import Path
 import os
+from functools import wraps
 from .base import ConversationStore
 from ..types import Conversation, Message
 from .locking import synchronized_store
+
+
+def _read_snapshot(function):
+    @wraps(function)
+    def snapshot(self, *args, **kwargs):
+        own_transaction = not self._conn.in_transaction
+        if own_transaction:
+            self._conn.execute("BEGIN")
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            if own_transaction:
+                self._conn.rollback()
+    return snapshot
 
 
 @synchronized_store
@@ -304,6 +319,7 @@ class SQLiteStore(ConversationStore):
             (datetime.now().isoformat(), conversation_id))
         self._conn.commit()
 
+    @_read_snapshot
     def get_token_stats(self, owner: str = "", days: int = 7,
                         *, alias: str = "", provider: str = "",
                         model: str = "", agent: str = "",
@@ -333,76 +349,41 @@ class SQLiteStore(ConversationStore):
             where.append("u.agent = ?")
             params.append(agent)
 
-        sql = f"""
-            SELECT u.prompt_tokens, u.completion_tokens, u.total_tokens,
-                   u.cached_tokens, u.payload_prompt_tokens,
-                   u.prompt_tokens_reliable, u.prompt_tokens_source,
-                   u.latency_ms, u.provider, u.model, u.agent, u.alias,
-                   u.timestamp
-            FROM usage_log u {join}
-            WHERE {' AND '.join(where) if where else '1=1'}
-        """
-        rows = self._conn.execute(sql, params).fetchall()
+        source = (f"FROM usage_log u {join} "
+                  f"WHERE {' AND '.join(where) if where else '1=1'}")
+        sums = {
+            "total_tokens": "total_tokens", "total_prompt": "prompt_tokens",
+            "total_completion": "completion_tokens", "total_cached": "cached_tokens",
+            "total_payload_prompt": "payload_prompt_tokens", "total_latency_ms": "latency_ms",
+        }
+        aggregates = ", ".join(f"COALESCE(SUM(u.{column}), 0) AS {name}"
+                               for name, column in sums.items())
+        aggregates += (", COUNT(*) AS total_calls, "
+                       "COALESCE(SUM(CASE WHEN COALESCE(u.prompt_tokens_reliable, 0) = 0 "
+                       "THEN 1 ELSE 0 END), 0) AS prompt_tokens_unreliable_calls")
+        out = dict(self._conn.execute(f"SELECT {aggregates} {source}", params).fetchone())
+        axes = {
+            "provider": "COALESCE(NULLIF(u.provider, ''), 'unknown')",
+            "model": "COALESCE(NULLIF(u.model, ''), 'unknown')",
+            "alias": "COALESCE(NULLIF(u.alias, ''), '(no alias)')",
+            "agent": "COALESCE(NULLIF(u.agent, ''), '(no agent)')",
+            "day": "SUBSTR(COALESCE(u.timestamp, ''), 1, 10)",
+        }
 
-        total = {k: 0 for k in (
-            "total_tokens", "total_prompt", "total_completion",
-            "total_cached", "total_payload_prompt", "total_latency_ms",
-            "total_calls", "prompt_tokens_unreliable_calls")}
-        by_provider: dict[str, int] = {}
-        groups: dict[str, dict] = {}
+        def grouped(axis):
+            expression = axes.get(axis, "'unknown'")
+            return self._conn.execute(
+                f"SELECT {expression} AS group_key, {aggregates} {source} GROUP BY {expression}",
+                params).fetchall()
 
-        for r in rows:
-            total["total_tokens"] += r["total_tokens"]
-            total["total_prompt"] += r["prompt_tokens"]
-            total["total_completion"] += r["completion_tokens"]
-            total["total_cached"] += r["cached_tokens"] or 0
-            total["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
-            total["total_latency_ms"] += r["latency_ms"] or 0
-            total["total_calls"] += 1
-            if not bool(r["prompt_tokens_reliable"]):
-                total["prompt_tokens_unreliable_calls"] += 1
-            p = r["provider"] or "unknown"
-            by_provider[p] = by_provider.get(p, 0) + r["total_tokens"]
-            if group_by:
-                key = _sqlite_group_key(r, group_by)
-                if key not in groups:
-                    groups[key] = {k: 0 for k in (
-                        "total_tokens", "total_prompt", "total_completion",
-                        "total_cached", "total_payload_prompt",
-                        "total_latency_ms", "total_calls",
-                        "prompt_tokens_unreliable_calls")}
-                g = groups[key]
-                g["total_tokens"] += r["total_tokens"]
-                g["total_prompt"] += r["prompt_tokens"]
-                g["total_completion"] += r["completion_tokens"]
-                g["total_cached"] += r["cached_tokens"] or 0
-                g["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
-                g["total_latency_ms"] += r["latency_ms"] or 0
-                g["total_calls"] += 1
-                if not bool(r["prompt_tokens_reliable"]):
-                    g["prompt_tokens_unreliable_calls"] += 1
-
-        out = dict(total)
-        out["by_provider"] = by_provider
+        provider_rows = grouped("provider")
+        out["by_provider"] = {row["group_key"]: row["total_tokens"] for row in provider_rows}
         if group_by:
             out["group_by"] = group_by
-            out["groups"] = groups
+            rows = provider_rows if group_by == "provider" else grouped(group_by)
+            out["groups"] = {row["group_key"]: {k: row[k] for k in out
+                              if k not in {"by_provider", "group_by"}} for row in rows}
         return out
 
 
 SQLiteSessionStore = SQLiteStore
-
-
-def _sqlite_group_key(row, axis: str) -> str:
-    if axis == "day":
-        ts = row["timestamp"] or ""
-        return ts[:10]
-    if axis == "provider":
-        return row["provider"] or "unknown"
-    if axis == "model":
-        return row["model"] or "unknown"
-    if axis == "alias":
-        return row["alias"] or "(no alias)"
-    if axis == "agent":
-        return row["agent"] or "(no agent)"
-    return "unknown"
