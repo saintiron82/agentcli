@@ -68,6 +68,7 @@ import os
 import platform
 import shutil
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
 
 from ..types import StreamChunk
 from .claude import NONESSENTIAL_TRAFFIC_ENV_VAR
@@ -98,7 +99,7 @@ class WarmSessionError(RuntimeError):
 
 def _find_claude() -> str | None:
     if platform.system() == "Windows":
-        return shutil.which("claude.cmd") or shutil.which("claude")
+        return shutil.which("claude.exe") or shutil.which("claude.cmd") or shutil.which("claude")
     return shutil.which("claude")
 
 
@@ -120,7 +121,7 @@ def build_warm_cmd(*, binary: str,
     if resume_session_id:
         cmd += ["--resume", resume_session_id]
     cmd += list(extra_args)
-    return cmd
+    return prepare_subprocess_command(cmd)
 
 
 class WarmSession:
@@ -188,7 +189,7 @@ class WarmSession:
         env = dict(self._env) if self._env is not None else dict(os.environ)
         env.setdefault(NONESSENTIAL_TRAFFIC_ENV_VAR, "1")
         kwargs["env"] = env
-        self._proc = await asyncio.create_subprocess_exec(*self._cmd, **kwargs)
+        self._proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(self._cmd), **kwargs)
         asyncio.ensure_future(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:

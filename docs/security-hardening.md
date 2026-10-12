@@ -80,11 +80,22 @@ Instruction ownership requires an exact first-line marker. Source/destination
 checks do not replace OS isolation against concurrent hostile filesystem actors.
 Relevant tests: 62 passed, including a real Windows junction and rollback failure.
 
+## Step 6 — SEC-001: Windows launcher arguments
+
+Prefer native Claude executables. Standard npm shims launch their Node entrypoint
+directly; supported interpreter/script wrappers launch the interpreter directly.
+No user argument passes through cmd.exe. Unknown batch wrappers are rejected and
+must be replaced by a native executable or supported shim. Resolution is cached
+against launcher mtime/size. Invocation, streaming, warm, Kiro and health paths
+share this boundary. Argument tests include shell metacharacters, quotes, percent
+expansion and newlines. Relevant tests: 187 passed. Installed Claude 2.1.296 and
+Codex 0.161.0 version checks succeeded without model calls.
+
 ## Remaining work
 
 | ID | Scope | Status |
 | --- | --- | --- |
-| SEC-001 | Windows batch argument interpretation | Pending |
+| SEC-001 | Windows batch argument interpretation | Fixed, real Windows argument tests |
 | SEC-002 | Conversation and injected-context ownership | Fixed, regression tested |
 | SEC-003 | Profile permission/config propagation | Fixed, regression tested |
 | SEC-004 | Permission preservation during fallback | Fixed, regression tested |

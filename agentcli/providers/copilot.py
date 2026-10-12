@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import time
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
                    emit_invoke_debug, health_from_response, run_health_command,
@@ -210,7 +211,7 @@ class CopilotProvider(LLMProvider):
             if resume_by_alias:
                 cmd.append(f"--resume={alias}")
 
-        return cmd, use_gh
+        return prepare_subprocess_command(cmd), use_gh
 
     def _reasoning_flags(self, effort, thinking):
         """유효 effort/thinking → (copilot native 플래그, ReasoningResolution).

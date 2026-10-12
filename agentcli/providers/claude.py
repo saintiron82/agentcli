@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
@@ -300,8 +301,9 @@ class ClaudeProvider(LLMProvider):
         return None
 
     def _find_binary(self) -> str | None:
-        executable = "claude.cmd" if platform.system() == "Windows" else "claude"
-        return shutil.which(executable) or shutil.which("claude")
+        if platform.system() == "Windows":
+            return shutil.which("claude.exe") or shutil.which("claude.cmd") or shutil.which("claude")
+        return shutil.which("claude")
 
     def is_available(self) -> bool:
         return self._find_binary() is not None
@@ -603,7 +605,7 @@ class ClaudeProvider(LLMProvider):
         else:
             used_session_id = str(uuid.uuid4())
             cmd += ["--session-id", used_session_id]
-        return cmd, used_session_id
+        return prepare_subprocess_command(cmd), used_session_id
 
     def _reasoning_flags(self, effort, thinking):
         """resolve 된 effort/thinking → claude native 플래그 렌더링 (#38).

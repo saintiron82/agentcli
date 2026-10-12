@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import time
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
@@ -320,7 +321,7 @@ class CodexProvider(LLMProvider):
             # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
             # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
             cmd += ["--", session_id, prompt_arg]
-            return cmd
+            return prepare_subprocess_command(cmd)
         # 신규 세션
         cmd.append("--json")
         if self._skip_git:
@@ -342,7 +343,7 @@ class CodexProvider(LLMProvider):
         # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
         # 해석되지 않는다 (untrusted 입력 주입 방지).
         cmd += ["--", prompt_arg]
-        return cmd
+        return prepare_subprocess_command(cmd)
 
     def _reasoning_flags(self, effort, thinking):
         """유효 effort/thinking → (codex `-c` config args, ReasoningResolution).

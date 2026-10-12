@@ -248,13 +248,13 @@ def test_invoke_async_stale_session_auto_recovers(mock_env, mock_find):
     assert m.call_count == 2
 
 
-@patch("agentcli.providers.codex.shutil.which", return_value=r"C:\Users\u\AppData\Roaming\npm\codex.CMD")
+@patch("agentcli.providers.codex.shutil.which", return_value=r"C:\Tools\codex.exe")
 def test_build_cmd_uses_resolved_binary_path(mock_which):
     p = CodexProvider()
 
     cmd = p._build_cmd("hi", "", None, "")
 
-    assert cmd[0] == r"C:\Users\u\AppData\Roaming\npm\codex.CMD"
+    assert cmd[0] == r"C:\Tools\codex.exe"
 
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary", return_value="/usr/bin/codex")

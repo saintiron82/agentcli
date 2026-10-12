@@ -15,6 +15,7 @@ from typing import AsyncIterator
 from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
                      LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
 from ..utils import serialize_messages
+from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +566,7 @@ class LLMProvider(ABC):
         # subprocess cleanup 이 실행되지 않아 좀비 프로세스가 남는다.
         # ``try/finally`` 로 어떤 종료 경로에서도 그룹 kill 보장.
         try:
-            proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+            proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
             assert proc.stdout
             if input_bytes is not None:
                 assert proc.stdin
@@ -911,7 +912,7 @@ async def run_subprocess_async(
     if cwd is not None:
         kwargs["cwd"] = cwd
 
-    proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
     # communicate() 를 별도 Task 로 감싼다 — asyncio.wait_for(proc.communicate(),
     # timeout) 은 타임아웃 시 communicate task 자체를 취소해 그때까지 버퍼링된
     # stdout/stderr 를 통째로 잃는다. asyncio.wait() 는 task 를 취소하지 않으므로
@@ -999,7 +1000,7 @@ def run_subprocess_sync(
     if env is not None:
         kwargs["env"] = env
 
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = subprocess.Popen(prepare_subprocess_command(cmd), **kwargs)
     timed_out = False
     reap_attempted = False
     try:
@@ -1046,7 +1047,7 @@ def run_health_command(cmd: list[str], *, timeout: int = 10,
     """Run a health command and normalize timeout into a CompletedProcess."""
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            prepare_subprocess_command(cmd), capture_output=True, text=True, timeout=timeout,
             cwd=cwd, env=env)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(
@@ -1056,6 +1057,8 @@ def run_health_command(cmd: list[str], *, timeout: int = 10,
     except FileNotFoundError:
         return subprocess.CompletedProcess(
             cmd, 127, stdout="", stderr="command not found")
+    except UnsafeLauncherError as exc:
+        return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
 
 
 def health_from_response(provider: str, resp: LLMResponse,

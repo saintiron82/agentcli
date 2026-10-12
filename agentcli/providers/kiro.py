@@ -13,6 +13,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
 
 from .base import LLMProvider, build_session_prompt, run_health_command, estimate_payload_prompt_tokens as _estimate
 from ._acp import AcpConnection, AcpError
@@ -160,7 +161,7 @@ class KiroProvider(LLMProvider):
                 if "proc" in proc_box:
                     return proc_box["proc"]
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd,
+                    *prepare_subprocess_command(cmd),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
