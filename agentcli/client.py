@@ -17,6 +17,7 @@ import hashlib
 import itertools
 import logging
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from datetime import datetime
@@ -27,6 +28,7 @@ from .types import (AccountUsage, Message, LLMResponse, ProviderCapabilities, Pr
                     standardize_error_chunk)
 from .store.base import ConversationStore
 from .coordination import ConversationLease, async_lease
+from .deadlines import request_budget, remaining_timeout, bounded_stream
 from .providers.registry import ProviderRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
@@ -284,6 +286,9 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
                        effort=None, thinking=None,
                        provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke", provider_options)
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return _budget_expired(provider_obj.provider_id, model)
     kwargs = _supported_kwargs(provider_obj, "invoke", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -294,7 +299,17 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return provider_obj.invoke(messages, **kwargs)
+    result = provider_obj.invoke(messages, **kwargs)
+    if remaining_timeout(1) <= 0:
+        expired = _budget_expired(provider_obj.provider_id, model)
+        expired.tokens, expired.raw_content = result.tokens, result.content
+        return expired
+    return result
+
+
+def _budget_expired(provider, model):
+    return LLMResponse(content="", provider=provider, model=model,
+                       error="wall timeout expired", error_type="timeout", exit_code=124)
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
@@ -303,6 +318,9 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
                                     effort=None, thinking=None,
                                     provider_options=None, native_namespace=""):
     _validate_provider_options(provider_obj, "invoke_async", provider_options)
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return _budget_expired(provider_obj.provider_id, model)
     kwargs = _supported_kwargs(provider_obj, "invoke_async", _merge_options({
         "model": model,
         "timeout": timeout,
@@ -313,14 +331,21 @@ async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return await provider_obj.invoke_async(messages, **kwargs)
+    try:
+        # No budget: retain provider-native timeout behavior.
+        if remaining_timeout(float("inf")) == float("inf"):
+            return await provider_obj.invoke_async(messages, **kwargs)
+        return await asyncio.wait_for(provider_obj.invoke_async(messages, **kwargs),
+                                      remaining_timeout(float("inf")))
+    except asyncio.TimeoutError:
+        return _budget_expired(provider_obj.provider_id, model)
 
 
 def _stream_with_alias(provider_obj, messages, *, model, timeout,
                         session_id, cwd, alias, idle_timeout=None,
                         wall_timeout=None, resume_by_alias=True,
                         effort=None, thinking=None,
-                        provider_options=None, native_namespace=""):
+                        provider_options=None, native_namespace="", deadline=None):
     _validate_provider_options(provider_obj, "stream_async", provider_options)
     kwargs = _supported_kwargs(provider_obj, "stream_async", _merge_options({
         "model": model,
@@ -334,7 +359,7 @@ def _stream_with_alias(provider_obj, messages, *, model, timeout,
         "effort": effort,
         "thinking": thinking,
     }, provider_options))
-    return provider_obj.stream_async(messages, **kwargs)
+    return bounded_stream(provider_obj.stream_async(messages, **kwargs), deadline)
 
 
 class LLMClient:
@@ -652,6 +677,7 @@ class LLMClient:
 
     # ---------- 동기 chat ----------
 
+    @request_budget
     def chat(self, prompt: str, *,
              provider: str = "", model: str = "",
              conversation_id: str = "", owner: str = "",
@@ -710,7 +736,7 @@ class LLMClient:
             def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return self._invoke_with_fallback(
                     provider, msgs, fallback_messages, model,
-                    wall_timeout or timeout, session_id, cwd,
+                    timeout, session_id, cwd,
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
                     allow_fallback=fallback, effort=effort,
@@ -909,6 +935,7 @@ class LLMClient:
 
     # ---------- 비동기 chat ----------
 
+    @request_budget
     async def chat_async(self, prompt: str, *,
                          provider: str = "", model: str = "",
                          conversation_id: str = "", owner: str = "",
@@ -966,7 +993,7 @@ class LLMClient:
             async def _dispatch(msgs: list[Message]) -> LLMResponse:
                 return await self._invoke_async_with_fallback(
                     provider, msgs, fallback_messages, model,
-                    wall_timeout or timeout, session_id, cwd,
+                    timeout, session_id, cwd,
                     alias=resolved_alias,
                     resume_by_alias=not force_new_session,
                     allow_fallback=fallback, effort=effort,
@@ -1117,6 +1144,9 @@ class LLMClient:
         _reject_reasoning_conflict(effort, thinking, provider_options)
         _validate_reasoning_levels(effort, thinking)
         self._validate_call_options(provider, "stream_async", provider_options)
+        if wall_timeout is not None and wall_timeout < 0:
+            raise ValueError("wall_timeout must be nonnegative")
+        deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
         with self._store_lock():
             (provider, provider_obj, conv, messages, fallback_messages,
              session_id, model, created_conversation, resolved_alias, alias_to_set,
@@ -1181,9 +1211,10 @@ class LLMClient:
                 latency_ms = 0
                 saw_error = False
                 emitted_output = False
+                current_stream = None
 
                 try:
-                    async for raw_chunk in _stream_with_alias(
+                    current_stream = _stream_with_alias(
                             current_provider, current_messages,
                             model=current_model, timeout=timeout,
                             session_id=current_sid, cwd=cwd,
@@ -1193,7 +1224,8 @@ class LLMClient:
                             resume_by_alias=resume_by_alias,
                             effort=effort, thinking=thinking,
                             provider_options=provider_options,
-                            native_namespace=conversation_id):
+                            native_namespace=conversation_id, deadline=deadline)
+                    async for raw_chunk in current_stream:
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
 
@@ -1229,12 +1261,21 @@ class LLMClient:
                         if raw_chunk.type == "text":
                             text_parts.append(raw_chunk.content)
                         yield raw_chunk
+                except asyncio.TimeoutError:
+                    saw_error = True
+                    last_error = make_error_chunk("wall timeout expired", provider=current_id,
+                                                  error_type="timeout")
+                    if emitted_output:
+                        yield last_error
                 except Exception as exc:
                     saw_error = True
                     err_chunk = make_error_chunk(str(exc), provider=current_id)
                     last_error = err_chunk
                     if emitted_output:
                         yield err_chunk
+                finally:
+                    if current_stream is not None:
+                        await current_stream.aclose()
 
                 full_content = "".join(text_parts)
                 has_more_attempts = attempt_index < len(attempts) - 1

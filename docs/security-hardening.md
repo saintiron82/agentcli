@@ -135,7 +135,24 @@ Use a single session writer or a verified distributed lease plus shared native
 session availability. Separate custom-store objects referring to one backend
 also require a host lease. Lock files are not unlinked while callers may use them.
 
-## Remaining work
+## Step 10 — OPS-003: bounded retry budgets
+
+Explicit `wall_timeout` now shares one monotonic execution budget across fallback,
+schema correction and native subprocess retries. Zero means no provider call;
+omitting it retains per-attempt `timeout`. Async calls and stream reads enforce
+the remaining budget even for custom providers. Synchronous custom providers
+must honor the supplied timeout; Python cannot safely terminate arbitrary code.
+The execution budget starts at request entry, but waiting for a conversation
+lease and bounded cleanup can make return time exceed it. It is not a hard
+end-to-end latency guarantee or a transactional rollback.
+
+Tool actions may already have happened before timeout/fallback/schema retry.
+Use `schema_retries=0`, `fallback=False`, appropriate tool restrictions and host
+idempotency keys for mutating tasks. Token metrics are observations, not a billing
+ledger, especially after interrupted attempts. No automatic native history
+deletion or external side-effect rollback is introduced.
+
+## Finding status
 
 | ID | Scope | Status |
 | --- | --- | --- |
@@ -148,6 +165,9 @@ also require a host lease. Lock files are not unlinked while callers may use the
 | SEC-008 | Workspace/session binding | Fixed; legacy migration caveat above |
 | OPS-001 | Coordination of concurrent session callers | Fixed locally; distributed lease is host configuration |
 | OPS-002 | Streaming pipe drainage and bounded teardown | Fixed, regression tested |
+| OPS-003 | Retry time budgets and side effects | Shared budget added; host idempotency required |
+| OPS-004 | Cross-server native history/account availability | Host configuration; runbook required |
+| OPS-005 | Native history retention and restore | Host policy; no destructive automation |
 
 Review and test each change independently. Do not combine security fixes with
 a broad refactor, change existing session identifiers silently, or serialize

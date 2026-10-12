@@ -111,7 +111,7 @@ def test_provider_failure_logs_are_safe_but_response_is_unchanged(
         if provider_cls is ClaudeProvider:
             monkeypatch.setattr(module, "run_subprocess_sync", lambda *a, **k: (b"", stderr.encode(), 1, False))
         else:
-            monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", stderr))
+            monkeypatch.setattr(module, "run_owned_command", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", stderr))
         response = provider.invoke([Message("user", "fake")], **args)
     assert response.raw_stderr == stderr
     assert SECRET in response.error

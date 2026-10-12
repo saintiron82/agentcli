@@ -17,6 +17,7 @@ from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEO
 from ..utils import serialize_messages
 from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 from ..processes import attach_process_job, close_process_job
+from ..deadlines import remaining_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -924,6 +925,9 @@ async def run_subprocess_async(
     if cwd is not None:
         kwargs["cwd"] = cwd
 
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return b"", b"", 124, True
     proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
     attach_process_job(proc)
     # communicate() 를 별도 Task 로 감싼다 — asyncio.wait_for(proc.communicate(),
@@ -1019,6 +1023,9 @@ def run_subprocess_sync(
     if env is not None:
         kwargs["env"] = env
 
+    timeout = remaining_timeout(timeout)
+    if timeout <= 0:
+        return b"", b"", 124, True
     proc = subprocess.Popen(prepare_subprocess_command(cmd), **kwargs)
     attach_process_job(proc)
     timed_out = False
