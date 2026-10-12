@@ -116,3 +116,37 @@ def test_host_lease_factory_is_entered_and_released():
     with ConversationLease(store, "same", lambda s, cid: External()):
         events.append("body")
     assert events == ["acquire", "body", "release"]
+
+
+def test_host_lease_false_does_not_enter_body():
+    import pytest
+    class External:
+        def acquire(self):
+            return False
+        def release(self):
+            pass
+    store = MemoryStore()
+    with pytest.raises(TimeoutError):
+        with ConversationLease(store, "same", lambda s, cid: External()):
+            raise AssertionError("Unacquired host lease entered")
+    with ConversationLease(store, "same"):
+        pass
+
+
+def test_cancellation_waits_for_started_persistence():
+    import pytest
+    from agentcli.client import _persist_in_thread
+    entered, finish = threading.Event(), threading.Event()
+    def write():
+        entered.set()
+        assert finish.wait(3)
+    async def run():
+        task = asyncio.create_task(_persist_in_thread(write))
+        await asyncio.to_thread(entered.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(run())

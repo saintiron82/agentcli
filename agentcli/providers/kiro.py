@@ -435,12 +435,9 @@ class KiroProvider(LLMProvider):
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None:
             logger.warning("kiro fs/write 거부")
-            return {}
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        except OSError:
-            pass
+            raise PermissionError("File write outside the workspace is denied")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
         return {}
 
 

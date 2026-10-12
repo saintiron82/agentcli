@@ -58,7 +58,8 @@ class ConversationLease:
             if self.factory:
                 # The host supplies a thread-independent distributed lease.
                 self.external = self.factory(self.store, self.conversation_id)
-                self.external.acquire()
+                if self.external.acquire() is False:
+                    raise TimeoutError("Host session lease was not acquired")
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("Conversation lease acquisition cancelled")
             return self
@@ -72,7 +73,7 @@ class ConversationLease:
                 raise InterruptedError("Conversation lease acquisition cancelled")
             if self.try_acquire(cancel) is not None:
                 return self
-            time.sleep(0.05)
+            time.sleep(0.005)
 
     def release(self):
         try:
@@ -96,6 +97,14 @@ class ConversationLease:
 
 @asynccontextmanager
 async def async_lease(lease):
+    if not lease.db and not lease.factory:
+        while lease.try_acquire() is None:
+            await asyncio.sleep(0.001)
+        try:
+            yield lease
+        finally:
+            lease.release()
+        return
     cancel = threading.Event()
     while True:
         # A single nonblocking attempt per worker avoids exhausting the executor

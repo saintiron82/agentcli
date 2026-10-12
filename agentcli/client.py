@@ -49,6 +49,8 @@ def _require_conversation_scope(conv, owner: str, cwd: str | None):
     bound = conv.metadata.get(WORKSPACE_KEY)
     if bound and bound != _workspace_root(cwd):
         raise PermissionError("Conversation workspace mismatch; use a different alias")
+
+
 DRIFT_INSTRUCTION_FILES = (
     "AGENTS.md", "CLAUDE.md", "GUIDE.md", "AGENTS.override.md")
 
@@ -310,6 +312,21 @@ def _invoke_with_alias(provider_obj, messages, *, model, timeout,
 def _budget_expired(provider, model):
     return LLMResponse(content="", provider=provider, model=model,
                        error="wall timeout expired", error_type="timeout", exit_code=124)
+
+
+async def _persist_in_thread(function, *args):
+    """Keep the conversation lease until a started store write has finished."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 async def _invoke_async_with_alias(provider_obj, messages, *, model, timeout,
@@ -1011,7 +1028,7 @@ class LLMClient:
                 return response
 
             # 저장은 sync이므로 스레드로 이전 (SQLite 등 blocking 방지)
-            await asyncio.to_thread(self._persist_success, conv, cwd, prompt,
+            await _persist_in_thread(self._persist_success, conv, cwd, prompt,
                                     response, agent, resolved_alias,
                                     alias_to_set, system_prompt_hash, provider_options)
             return response
@@ -1027,8 +1044,8 @@ class LLMClient:
                                           allow_fallback: bool = False,
                                           effort: str | None = None,
                                           thinking: str | None = None,
-                                         provider_options: dict | None = None,
-                                         native_namespace: str = "") -> LLMResponse:
+                                          provider_options: dict | None = None,
+                                          native_namespace: str = "") -> LLMResponse:
         last_resp: LLMResponse | None = None
 
         p = self._registry.get(provider_id)
@@ -1313,7 +1330,7 @@ class LLMClient:
                         model=current_model, tokens=final_usage,
                         latency_ms=latency_ms, session_id=final_sid,
                         conversation_id=conversation_id)
-                    await asyncio.to_thread(
+                    await _persist_in_thread(
                         self._persist_success, conv, cwd, prompt, synthetic,
                         agent, resolved_alias, alias_to_set,
                         system_prompt_hash, provider_options)

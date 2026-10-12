@@ -17,7 +17,7 @@ from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEO
 from ..utils import serialize_messages
 from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 from ..processes import attach_process_job, close_process_job
-from ..deadlines import remaining_timeout
+from ..deadlines import remaining_timeout, has_budget
 
 logger = logging.getLogger(__name__)
 
@@ -749,15 +749,11 @@ class LLMProvider(ABC):
                     pass
             # debug: GeneratorExit/timeout/error/done 어떤 경로든 trace 마감.
             if stderr_task is not None and not stderr_task.done():
-                    stderr_task.cancel()
-                    try:
-                        await stderr_task
-                    # 방금 우리가 요청한 취소의 결과가 CancelledError 로
-                    # 돌아온다 — 여기서 새면 진행 중인 GeneratorExit 를
-                    # 대체해 aclose 가 예외로 끝나고, 아래 trace 마감까지
-                    # 건너뛴다 (#46; stdin_task 정리와 같은 계약).
-                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
-                        pass
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except (Exception, asyncio.CancelledError):
+                    pass
             if debug:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 logger.info(
@@ -926,7 +922,7 @@ async def run_subprocess_async(
         kwargs["cwd"] = cwd
 
     timeout = remaining_timeout(timeout)
-    if timeout <= 0:
+    if timeout <= 0 and has_budget():
         return b"", b"", 124, True
     proc = await asyncio.create_subprocess_exec(*prepare_subprocess_command(cmd), **kwargs)
     attach_process_job(proc)
@@ -1024,7 +1020,7 @@ def run_subprocess_sync(
         kwargs["env"] = env
 
     timeout = remaining_timeout(timeout)
-    if timeout <= 0:
+    if timeout <= 0 and has_budget():
         return b"", b"", 124, True
     proc = subprocess.Popen(prepare_subprocess_command(cmd), **kwargs)
     attach_process_job(proc)
@@ -1089,7 +1085,7 @@ def run_health_command(cmd: list[str], *, timeout: int = 10,
                        env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a health command and normalize timeout into a CompletedProcess."""
     try:
-        return subprocess.run(
+        return run_owned_command(
             prepare_subprocess_command(cmd), capture_output=True, text=True, timeout=timeout,
             cwd=cwd, env=env, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:

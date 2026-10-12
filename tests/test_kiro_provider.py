@@ -457,9 +457,10 @@ async def test_fs_write_outside_cwd_denied(tmp_path):
     """fs/write_text_file outside cwd must be denied — no file created."""
     p = KiroProvider()
     evil_path = str(tmp_path.parent / "evil.txt")
-    await p._handle_agent_request(
-        "fs/write_text_file", {"path": evil_path, "content": "bad"},
-        cwd=str(tmp_path))
+    with pytest.raises(PermissionError):
+        await p._handle_agent_request(
+            "fs/write_text_file", {"path": evil_path, "content": "bad"},
+            cwd=str(tmp_path))
     import pathlib
     assert not pathlib.Path(evil_path).exists(), (
         "File outside cwd must NOT be created")

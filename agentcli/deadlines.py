@@ -9,6 +9,10 @@ from contextlib import contextmanager
 _deadline = contextvars.ContextVar("agentcli_request_deadline", default=None)
 
 
+def has_budget():
+    return _deadline.get() is not None
+
+
 def remaining_timeout(timeout):
     deadline = _deadline.get()
     return timeout if deadline is None else min(timeout, max(0, deadline - time.monotonic()))
