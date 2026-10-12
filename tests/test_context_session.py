@@ -249,6 +249,7 @@ def test_refine_async_and_stream_passthrough():
 
 
 def test_default_context_provider_and_import_compatibility():
+    import asyncio
     from tests.test_turn_state import client_for
     from agentcli.client import ContextSession as old_import
     from agentcli.context_session import ContextSession as new_import
