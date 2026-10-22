@@ -1,7 +1,9 @@
 import asyncio
 import sys
 import time
+import pytest
 from agentcli.providers.claude import ClaudeProvider
+from agentcli.providers import base
 from agentcli.providers.base import StreamState, _drain_stderr, run_subprocess_async, run_subprocess_sync
 from agentcli.providers._acp import AcpConnection, AcpError
 
@@ -38,21 +40,43 @@ def test_eof_does_not_allow_unbounded_process_wait():
     assert time.monotonic() - start < 8
 
 
-def test_owned_descendant_pipes_are_closed_after_timeout():
-    script = ("import subprocess,sys,time; "
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_owned_descendant_pipes_are_closed_after_timeout(monkeypatch, tmp_path, mode):
+    ready = tmp_path / "ready"
+    script = ("import pathlib,subprocess,sys,time; "
               "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-              "print('ready',flush=True); time.sleep(30)")
-    cmd = [sys.executable, "-c", script]
-    start = time.monotonic()
-    out, _, rc, expired = run_subprocess_sync(cmd, timeout=0.5)
-    assert rc == 124 and expired and b"ready" in out
-    assert time.monotonic() - start < 8
+              "print('ready',flush=True); "
+              "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)")
+    cmd = [sys.executable, "-c", script, str(ready)]
+    original_attach = base.attach_process_job
+    ready_at = None
+
+    def attach_and_wait_for_ready(proc):
+        nonlocal ready_at
+        original_attach(proc)
+        # Gate only test setup: the real communicate timeout still gets 0.5s.
+        # Waiting here also works for the async runner: the child runs on its
+        # own while the event loop has not started the communicate timer yet.
+        deadline = time.monotonic() + 10
+        while not ready.is_file():
+            if time.monotonic() >= deadline:
+                base._kill_process_group(proc)
+                pytest.fail("Child did not start its descendant and signal readiness")
+            time.sleep(0.01)
+        ready_at = time.monotonic()
+
+    monkeypatch.setattr(base, "attach_process_job", attach_and_wait_for_ready)
+
     async def run():
         return await run_subprocess_async(cmd, timeout=0.5)
-    start = time.monotonic()
-    out, _, rc, expired = asyncio.run(run())
+
+    if mode == "sync":
+        out, _, rc, expired = run_subprocess_sync(cmd, timeout=0.5)
+    else:
+        out, _, rc, expired = asyncio.run(run())
     assert rc == 124 and expired and b"ready" in out
-    assert time.monotonic() - start < 8
+    assert ready_at is not None
+    assert time.monotonic() - ready_at < 8
 
 
 def test_acp_eof_resolves_pending_requests():
