@@ -11,6 +11,18 @@ _GH_TOKEN_CACHE: str | None = None
 _GH_TOKEN_RESOLVED: bool = False
 
 
+def _reported_token_count(value) -> int:
+    """Read a nonnegative integral CLI count without trusting its JSON type."""
+    if type(value) is int:
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            pass
+    return 0
+
+
 def parse_tokens(stderr: str) -> int:
     """stderr에서 토큰 사용량 추출 (Codex/Copilot legacy fallback)."""
     if not stderr:

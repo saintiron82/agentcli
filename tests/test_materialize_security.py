@@ -34,7 +34,7 @@ def test_unmanaged_skill_is_preserved(tmp_path):
     (existing / "custom.txt").write_text("user data", encoding="utf-8")
     result = profile.materialize(target)
     assert (existing / "custom.txt").read_text(encoding="utf-8") == "user data"
-    assert str(existing) in result["skipped"]
+    assert str(existing.resolve()) in result["skipped"]
     assert result["skills_copied"] == []
 
 
@@ -96,3 +96,51 @@ def test_junction_or_symlink_cannot_redirect_skill_writes(tmp_path):
         profile.materialize(target)
     assert list(outside.iterdir()) == []
     assert not (target / "AGENTS.md").exists()
+
+
+def test_source_inside_managed_destination_is_rejected_before_any_write(tmp_path):
+    target = tmp_path / "workspace"
+    existing = target / ".agents/skills/demo"
+    source = existing / "profile/skills"
+    skill = source / "demo"
+    skill.mkdir(parents=True)
+    (existing / ".agentcli-managed.json").write_text('{"managed_by":"agentcli"}')
+    original = existing / "profile/AGENTS.md"
+    original.write_text("canonical source", encoding="utf-8")
+    (skill / "SKILL.md").write_text("source skill", encoding="utf-8")
+    profile = AgentProfile("nested", instructions="new", skills_dir=source)
+    with pytest.raises(ValueError, match="overlap"):
+        profile.materialize(target)
+    assert original.read_text(encoding="utf-8") == "canonical source"
+    assert (skill / "SKILL.md").read_text(encoding="utf-8") == "source skill"
+    assert not (target / "AGENTS.md").exists()
+    assert not list(existing.parent.glob(".agentcli-skill-*"))
+
+
+def test_root_ancestor_alias_is_allowed_but_child_links_are_rejected(tmp_path):
+    from agentcli import AuthProfile
+    from agentcli.filesystem import safe_workspace_path
+    from agentcli.providers.kiro import KiroProvider
+
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    if os.name == "nt":
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null".format(
+                            str(alias).replace("'", "''"), str(real).replace("'", "''"))],
+                       check=True, capture_output=True)
+    else:
+        alias.symlink_to(real, target_is_directory=True)
+    workspace = alias / "workspace"
+    workspace.mkdir()
+    child = workspace / "file.txt"
+    child.write_text("data", encoding="utf-8")
+    assert safe_workspace_path(workspace, child) == child.resolve()
+    assert KiroProvider()._within_cwd(str(child), str(workspace)) == child.resolve()
+    auth = AuthProfile("alias", str(alias / "profile"), claude_oauth_token="FAKE").prepare()
+    assert auth.root == str((real / "profile").resolve())
+    with pytest.raises(PermissionError):
+        safe_workspace_path(workspace, workspace / "../outside.txt")
+    with pytest.raises(PermissionError):
+        safe_workspace_path(tmp_path, alias / "workspace/file.txt")

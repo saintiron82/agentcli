@@ -20,6 +20,7 @@ import platform
 import shutil
 import subprocess
 import time
+from contextlib import aclosing
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
 from ..auth_context import current_auth_profile, provider_environment, configured_health
@@ -465,11 +466,12 @@ class CopilotProvider(LLMProvider):
             final_usage=TokenUsage(
                 prompt_tokens_reliable=False,
                 prompt_tokens_source="copilot_not_reported"))
-        async for chunk in self._run_stream_template(
+        async with aclosing(self._run_stream_template(
                 cmd, state, model=model, cwd=cwd, timeout=timeout,
                 idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                env=provider_environment("copilot", build_env), debug=debug, debug_log_path=debug_log_path):
-            yield chunk
+                env=provider_environment("copilot", build_env), debug=debug, debug_log_path=debug_log_path)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:

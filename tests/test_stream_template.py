@@ -972,8 +972,8 @@ def test_claude_stream_async_large_prompt_threads_input_bytes(monkeypatch):
     assert captured.get("input_bytes") == big.encode("utf-8")
 
 
-def test_claude_stream_async_small_prompt_stays_argv_byte_identical(monkeypatch):
-    """작은 프롬프트는 기존과 byte-identical — argv 에 그대로, input_bytes=None."""
+def test_claude_stream_async_small_prompt_stays_argv_after_separator(monkeypatch):
+    """작은 프롬프트는 옵션 종결자 뒤 argv 로 전달하고 stdin 은 쓰지 않는다."""
     from agentcli.types import Message, StreamChunk
 
     captured: dict = {}
@@ -995,7 +995,7 @@ def test_claude_stream_async_small_prompt_stays_argv_byte_identical(monkeypatch)
             [Message(role="user", content="small prompt")])]
 
     asyncio.run(run())
-    assert captured["cmd"][captured["cmd"].index("-p") + 1] == "small prompt"
+    assert captured["cmd"][-2:] == ["--", "small prompt"]
     assert captured.get("input_bytes") is None
 
 

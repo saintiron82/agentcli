@@ -226,7 +226,7 @@ def test_materialize_skills_preserves_unmanaged_dst(tmpdir_path):
     assert not (dst / "SKILL.md").exists()
     assert (dst / "OLD.md").read_text(encoding="utf-8") == "옛날 잔여 파일"
     assert result["skills_copied"] == []
-    assert str(dst) in result["skipped"]
+    assert str(dst.resolve()) in result["skipped"]
 
 
 def test_materialize_skips_skills_when_include_false(tmpdir_path):

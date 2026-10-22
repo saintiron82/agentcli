@@ -409,9 +409,11 @@ def standardize_error_chunk(chunk: StreamChunk, *,
     """Fill required fields on provider-emitted error chunks."""
     if chunk.type != "error":
         return chunk
-    return make_error_chunk(
+    standardized = make_error_chunk(
         chunk.content,
         provider=provider,
         data=chunk.data,
         session_id=chunk.session_id,
     )
+    standardized.usage = chunk.usage
+    return standardized

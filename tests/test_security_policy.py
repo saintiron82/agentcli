@@ -138,6 +138,49 @@ def test_native_policies_are_compared_without_launching_clis():
     assert _fallback_preserves_policy(CodexProvider(sandbox_mode="read-only"), CodexProvider(sandbox_mode="read-only"), None)
     assert not _fallback_preserves_policy(CodexProvider(sandbox_mode="read-only"), CodexProvider(), None)
     assert _fallback_preserves_policy(Recorder(), Recorder(), None)
+    assert not _fallback_preserves_policy(ClaudeProvider(), CodexProvider(), None)
+    assert _fallback_preserves_policy(ClaudeProvider(), ClaudeProvider(), None)
+    assert _fallback_preserves_policy(ClaudeProvider(), ClaudeProvider(env="explicit"), None)
+    assert not _fallback_preserves_policy(ClaudeProvider(), ClaudeProvider(env="inherit"), None)
+
+
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+@pytest.mark.parametrize("environment", [None, "explicit", "inherit"])
+def test_claude_effective_environment_policy_survives_fallback(monkeypatch, mode, environment):
+    # Instance method doubles have wider signatures than the native class.
+    import agentcli.client as client_module
+    monkeypatch.setattr(client_module, "_PARAM_SUPPORT_CACHE", {})
+    primary, candidate = ClaudeProvider(env=environment), Recorder()
+    def fail(*args, **kwargs):
+        return LLMResponse("", "claude", "", error="fake network error")
+    async def fail_async(*args, **kwargs):
+        return fail()
+    async def fail_stream(*args, **kwargs):
+        yield StreamChunk(type="error", content="fake network error")
+    monkeypatch.setattr(primary, "invoke", fail)
+    monkeypatch.setattr(primary, "invoke_async", fail_async)
+    monkeypatch.setattr(primary, "stream_async", fail_stream)
+    registry = ProviderRegistry()
+    registry.register(primary)
+    registry.register(candidate)
+    registry.set_fallback_order(["claude", "record"])
+    client = LLMClient(MemoryStore(), registry)
+    if mode == "sync":
+        result = client.chat("hi", provider="claude", fallback=True)
+    elif mode == "async":
+        result = asyncio.run(client.chat_async("hi", provider="claude", fallback=True))
+    else:
+        async def consume():
+            return [chunk async for chunk in client.chat_stream("hi", provider="claude", fallback=True)]
+        result = asyncio.run(consume())
+    if environment == "inherit":
+        assert len(candidate.calls) == 1
+    else:
+        assert candidate.calls == []
+        if mode == "stream":
+            assert any(chunk.type == "error" and chunk.data.get("fallback_blocked") for chunk in result)
+        else:
+            assert "Fallback blocked" in result.suggested_action
 
 
 def test_codex_resume_requires_explicit_fresh_session_for_policy_change():

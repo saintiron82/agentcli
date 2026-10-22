@@ -383,7 +383,7 @@ def test_invoke_serializes_exactly_what_client_sends(mock_find, mock_run):
         Message(role="user", content="new question"),
     ])
     cmd = mock_run.call_args[0][0]
-    prompt = cmd[cmd.index("-p") + 1]
+    prompt = cmd[-1]
     assert cmd[cmd.index("--append-system-prompt") + 1] == "Follow GUIDE v2"
     assert "Follow GUIDE v2" not in prompt, (
         "#51: system 블록이 -p 에도 남으면 격리가 무의미하다(이중 전송)")
@@ -553,7 +553,7 @@ def test_invoke_prompt_exactly_at_threshold_stays_argv_mode(mock_find, mock_run)
     p.invoke([Message(role="user", content=exact)])
     cmd = mock_run.call_args[0][0]
     kwargs = mock_run.call_args[1]
-    assert cmd[cmd.index("-p") + 1] == exact
+    assert cmd[-2:] == ["--", exact]
     assert kwargs.get("input_bytes") is None
 
 
@@ -570,10 +570,10 @@ def test_build_cmd_prompt_via_stdin_omits_positional_prompt(mock_find):
 
 @patch("agentcli.providers.claude.ClaudeProvider._find_binary", return_value="/usr/bin/claude")
 def test_build_cmd_default_still_inlines_prompt(mock_find):
-    """prompt_via_stdin 미지정(기본 False) 은 기존과 byte-identical."""
+    """기본 argv 모드도 프롬프트를 옵션 종결자 뒤로 보낸다."""
     p = ClaudeProvider()
     cmd, _sid = p._build_cmd("small prompt", "", "", "json")
-    assert cmd[cmd.index("-p") + 1] == "small prompt"
+    assert cmd[-2:] == ["--", "small prompt"]
 
 
 @patch("agentcli.providers.claude.run_subprocess_sync")
@@ -600,7 +600,7 @@ def test_invoke_small_prompt_stdin_untouched(mock_find, mock_run):
     p.invoke([Message(role="user", content="small prompt")])
     cmd = mock_run.call_args[0][0]
     kwargs = mock_run.call_args[1]
-    assert cmd[cmd.index("-p") + 1] == "small prompt"
+    assert cmd[-2:] == ["--", "small prompt"]
     assert kwargs.get("input_bytes") is None
 
 

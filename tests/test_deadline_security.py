@@ -75,8 +75,15 @@ def test_fallback_gets_remaining_budget(asynchronous):
     assert 0 < b.timeouts[0] < a.timeouts[0] <= 0.1
 
 
-def test_schema_retries_share_one_budget():
+def test_schema_retries_share_one_budget(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("agentcli.deadlines.time.monotonic", lambda: clock[0])
     p = BudgetProvider("fake", delay=0.04)
+    def invoke(messages, *, timeout=120, **kwargs):
+        p.timeouts.append(timeout)
+        clock[0] += min(p.delay, timeout)
+        return LLMResponse(content="invalid", provider="fake", model="")
+    monkeypatch.setattr(p, "invoke", invoke)
     c = client(p)
     result = c.chat("hi", provider="fake", wall_timeout=0.07,
                     output_schema={"type": "object"}, schema_retries=4)

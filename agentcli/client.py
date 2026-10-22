@@ -163,9 +163,13 @@ def _validate_provider_options(provider_obj, method_name: str, options: dict | N
 
 def _fallback_preserves_policy(primary, candidate, options: dict | None) -> bool:
     """Do not guess equivalence between different native permission systems."""
+    from .providers.claude import ClaudeProvider
     attributes = tuple("_" + key for key in _SECURITY_OPTIONS)
     explicit = bool(options and any(k in _SECURITY_OPTIONS and v is not None
                                     for k, v in options.items()))
+    environment = getattr(primary, "_env", None)
+    if isinstance(primary, ClaudeProvider):
+        environment = environment or "explicit"
     restricted = (
         getattr(primary, "_sandbox_mode", "danger-full-access") != "danger-full-access"
         or getattr(primary, "_permission_mode", "bypassPermissions") != "bypassPermissions"
@@ -179,13 +183,17 @@ def _fallback_preserves_policy(primary, candidate, options: dict | None) -> bool
         or getattr(primary, "_allow_file_writes", True) is False
         or getattr(primary, "_approval_policy", None) is not None
         or getattr(primary, "_oauth_token", None) is not None
-        or getattr(primary, "_env", None) in ("isolated", "lean")
+        or environment in ("explicit", "isolated", "lean")
     )
     if not explicit and not restricted:
         return True
+    def value(provider, name):
+        result = getattr(provider, name, None)
+        if name == "_env" and isinstance(provider, ClaudeProvider):
+            return result or "explicit"
+        return result
     return type(primary) is type(candidate) and all(
-        getattr(primary, name, None) == getattr(candidate, name, None)
-        for name in attributes)
+        value(primary, name) == value(candidate, name) for name in attributes)
 
 
 def _method_accepts_param(provider_obj, method_name: str, param_name: str) -> bool:
@@ -1305,12 +1313,12 @@ class LLMClient:
                     async for raw_chunk in current_stream:
                         if raw_chunk.session_id:
                             final_sid = raw_chunk.session_id
+                        if raw_chunk.usage is not None:
+                            final_usage = raw_chunk.usage
 
                         if raw_chunk.type == "done":
                             if raw_chunk.content and not text_parts:
                                 text_parts.append(raw_chunk.content)
-                            if raw_chunk.usage is not None:
-                                final_usage = raw_chunk.usage
                             latency_ms = int(
                                 raw_chunk.data.get("latency_ms") or 0)
                             break

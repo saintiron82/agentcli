@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT, Message,
-                     LLMResponse, ProviderHealth, StreamChunk, TokenUsage)
+                     LLMResponse, ProviderHealth, StreamChunk, TokenUsage, make_error_chunk)
 from ..utils import serialize_messages
 from ..launchers import prepare_subprocess_command, UnsafeLauncherError
 from ..processes import attach_process_job, close_process_job
@@ -493,6 +493,13 @@ class LLMProvider(ABC):
         resp = await self.invoke_async(
             messages, model=model, timeout=timeout,
             session_id=session_id, cwd=cwd)
+        if resp.error or resp.error_type or resp.exit_code not in (None, 0):
+            chunk = make_error_chunk(resp.error or "Provider invocation failed",
+                                     provider=resp.provider, error_type=resp.error_type,
+                                     exit_code=resp.exit_code, suggested_action=resp.suggested_action)
+            chunk.session_id, chunk.usage = resp.session_id, resp.tokens
+            yield chunk
+            return
         if resp.content:
             yield StreamChunk(type="text", content=resp.content)
         yield StreamChunk(

@@ -194,8 +194,7 @@ class AgentProfile:
             for skill_path in self.skills_dir.iterdir():
                 if skill_path.is_dir():
                     destination = safe_workspace_path(cwd, cwd / ".agents" / "skills" / skill_path.name)
-                    if destination == skill_path.resolve() or destination.is_relative_to(skill_path.resolve()):
-                        raise ValueError("Cannot copy a skill into itself")
+                    self._check_skill_overlap(skill_path.resolve(), destination)
         cwd.mkdir(parents=True, exist_ok=True)
         inst_text = self.resolve_instructions()
         if not inst_text.strip():
@@ -229,8 +228,7 @@ class AgentProfile:
                     dst = target_skills / skill_path.name
                     safe_workspace_path(cwd, dst)
                     source = skill_path.resolve()
-                    if dst == source or dst.is_relative_to(source):
-                        raise ValueError("Cannot copy a skill into itself")
+                    self._check_skill_overlap(source, dst)
                     reject_tree_links(skill_path)
                     if dst.exists():
                         marker = dst / ".agentcli-managed.json"
@@ -281,6 +279,12 @@ class AgentProfile:
             "cwd": str(cwd),
             "materialized_at": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _check_skill_overlap(source: Path, destination: Path):
+        if (source == destination or destination.is_relative_to(source)
+                or source.is_relative_to(destination)):
+            raise ValueError("Skill source and destination must not overlap")
 
     def _wrap_with_marker(self, text: str) -> str:
         src = str(self.source_dir) if self.source_dir else "<inline>"

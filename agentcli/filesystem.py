@@ -6,12 +6,19 @@ from pathlib import Path
 
 
 def safe_workspace_path(root: Path, target: Path) -> Path:
-    root = root.resolve()
+    lexical_root = Path(os.path.abspath(root))
+    root = lexical_root.resolve()
     target = Path(os.path.abspath(target))
     try:
-        parts = target.relative_to(root).parts
+        parts = target.relative_to(lexical_root).parts
     except ValueError:
-        raise PermissionError("Path escapes the workspace") from None
+        try:
+            parts = target.relative_to(root).parts
+        except ValueError:
+            raise PermissionError("Path escapes the workspace") from None
+    # Map only the trusted root alias. Resolving the whole target first would
+    # hide forbidden links inside the workspace from the lstat checks below.
+    target = root.joinpath(*parts)
     current = root
     for part in parts:
         current /= part

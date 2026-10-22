@@ -8,6 +8,7 @@ import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from .filesystem import safe_workspace_path
+from .async_utils import complete_in_thread
 
 _guard = threading.Lock()
 _locks = weakref.WeakValueDictionary()
@@ -109,18 +110,13 @@ async def async_lease(lease):
     while True:
         # A single nonblocking attempt per worker avoids exhausting the executor
         # with queued lock waiters while the active turn needs to persist.
-        task = asyncio.create_task(asyncio.to_thread(lease.try_acquire, cancel))
         try:
-            acquired = await asyncio.shield(task)
+            acquired = await complete_in_thread(lease.try_acquire, cancel)
         except BaseException:
             cancel.set()
-            def reclaim(done):
-                try:
-                    if done.result() is not None:
-                        lease.release()
-                except BaseException:
-                    pass
-            task.add_done_callback(reclaim)
+            # The worker has actually finished, even during cancel-all/shutdown.
+            # It may have acquired the lease just before cancellation arrived.
+            await complete_in_thread(lease.release)
             raise
         if acquired is not None:
             break
@@ -128,4 +124,4 @@ async def async_lease(lease):
     try:
         yield lease
     finally:
-        lease.release()
+        await complete_in_thread(lease.release)

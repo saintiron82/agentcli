@@ -12,6 +12,7 @@ import stat
 import tempfile
 import time
 import uuid
+from contextlib import aclosing
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
 from ..auth import AuthProfileError
@@ -27,6 +28,7 @@ from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEO
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
 from ..reasoning import needs_event as _reasoning_needs_event, to_dict as _reasoning_to_dict
+from ..utils import _reported_token_count
 
 logger = logging.getLogger(__name__)
 
@@ -541,8 +543,6 @@ class ClaudeProvider(LLMProvider):
                        else partial_messages)
 
         cmd = [bin_path, "-p"]
-        if not prompt_via_stdin:
-            cmd.append(prompt)
         cmd += ["--output-format", output_format,
                 "--permission-mode", pmode]
         if append_system_prompt:
@@ -635,6 +635,9 @@ class ClaudeProvider(LLMProvider):
         else:
             used_session_id = str(uuid.uuid4())
             cmd += ["--session-id", used_session_id]
+        if not prompt_via_stdin:
+            # Keep arbitrary user input out of the CLI option parser (#82).
+            cmd += ["--", prompt]
         return prepare_subprocess_command(cmd), used_session_id
 
     def _reasoning_flags(self, effort, thinking):
@@ -763,20 +766,10 @@ class ClaudeProvider(LLMProvider):
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token,
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
-            err_msg = stderr_txt.strip()[:300]
-            msg = err_msg or f"exit={rc}"
-            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
-            resp = LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                raw_stderr=stderr_txt, session_id=used_sid,
-                error=msg,
-                error_type=classify_error(msg),
-                exit_code=rc,
-            )
-            resp.reasoning = reasoning
-            return resp
-
-        content, tokens, err = _parse_claude_json(stdout_txt)
+        content, tokens, err, error_type = _parse_claude_result(stdout_txt)
+        if rc != 0 and not err:
+            err = stderr_txt.strip()[:300] or f"exit={rc}"
+            error_type = classify_error(err)
         # system 블록도 agentcli 가 CLI 에 넘긴 payload 다 (#51) — 플래그로
         # 분리 전달되어도 추정치에는 포함한다.
         tokens.payload_prompt_tokens = (estimate_payload_prompt_tokens(prompt)
@@ -789,7 +782,7 @@ class ClaudeProvider(LLMProvider):
             tokens=tokens, latency_ms=latency,
             raw_stderr=stderr_txt, session_id=used_sid,
             error=err,
-            error_type=classify_error(err) if err else "",
+            error_type=error_type,
             exit_code=rc,
         )
         resp.reasoning = reasoning
@@ -900,26 +893,23 @@ class ClaudeProvider(LLMProvider):
                     effort=effort, thinking=thinking,
                     oauth_token=oauth_token,
                     exclude_dynamic_system_prompt=exclude_dynamic_system_prompt)
-            msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Claude 실패 (code=%d, type=%s)", rc, classify_error(msg))
-            resp = LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                raw_stderr=stderr_txt, session_id=used_sid,
-                error=msg, error_type=classify_error(msg),
-                exit_code=rc)
-            resp.reasoning = reasoning
-            return resp
-
         stderr_txt = stderr_b.decode("utf-8", errors="replace")
-        content, tokens, err = _parse_claude_json(
+        content, tokens, err, error_type = _parse_claude_result(
             stdout_b.decode("utf-8", errors="replace"))
+        if rc != 0 and not err:
+            err = stderr_txt.strip()[:300] or f"exit={rc}"
+            error_type = classify_error(err)
+        tokens.payload_prompt_tokens = (estimate_payload_prompt_tokens(prompt)
+                                        + estimate_payload_prompt_tokens(system_text))
+        tokens.prompt_tokens_reliable = False
+        tokens.prompt_tokens_source = "claude_cli_reported"
         resp = LLMResponse(
             content=content if not err else "",
             provider=self.provider_id, model=model,
             tokens=tokens, latency_ms=latency,
             raw_stderr=stderr_txt, session_id=used_sid,
             error=err,
-            error_type=classify_error(err) if err else "",
+            error_type=error_type,
             exit_code=rc,
         )
         resp.reasoning = reasoning
@@ -1021,18 +1011,19 @@ class ClaudeProvider(LLMProvider):
                 state.extra["partial"] = use_partial
                 retry_stale = False
                 emitted = False
-                async for chunk in self._run_stream_template(
+                async with aclosing(self._run_stream_template(
                         cmd, state, model=model, cwd=cwd, timeout=timeout,
                         idle_timeout=idle_timeout, wall_timeout=wall_timeout,
                         env=run_env, debug=use_debug, debug_log_path=dbg_path,
-                        input_bytes=prompt_bytes if use_stdin else None):
-                    if (attempt_sid and not emitted
-                            and chunk.type == "error"
-                            and STALE_SESSION_MARKER in (chunk.content or "")):
-                        retry_stale = True
-                        break
-                    emitted = True
-                    yield chunk
+                        input_bytes=prompt_bytes if use_stdin else None)) as stream:
+                    async for chunk in stream:
+                        if (attempt_sid and not emitted
+                                and chunk.type == "error"
+                                and STALE_SESSION_MARKER in (chunk.content or "")):
+                            retry_stale = True
+                            break
+                        emitted = True
+                        yield chunk
                 if not retry_stale:
                     return
                 logger.warning(
@@ -1141,47 +1132,62 @@ class ClaudeProvider(LLMProvider):
 
 
 def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
+    """Compatibility wrapper for callers using the original parser tuple."""
+    content, tokens, error, _ = _parse_claude_result(stdout)
+    return content, tokens, error
+
+
+def _parse_claude_result(stdout: str) -> tuple[str, TokenUsage, str, str]:
     """Claude CLI --output-format json stdout 파싱.
 
-    Returns: (content, tokens, error_message)
+    Returns: (content, tokens, error_message, error_type)
       Claude API의 한도/오류는 보통 `is_error: true` + `subtype: "error_*"` 또는
       content 자체에 에러 메시지로 응답.
     """
     stdout = stdout.strip()
     if not stdout:
-        return "", TokenUsage(), ""
+        return "", TokenUsage(), "", ""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
-        return stdout, TokenUsage(), ""
+        return stdout, TokenUsage(), "", ""
     if not isinstance(data, dict):
         # 유효한 JSON이지만 객체가 아니면 (배열/스칼라) raw 텍스트와 동일 취급.
-        return stdout, TokenUsage(), ""
+        return stdout, TokenUsage(), "", ""
 
     content = (data.get("result")
                or data.get("content")
                or data.get("text")
                or "")
-    usage = data.get("usage") or {}
-    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-    cache_read = int(usage.get("cache_read_input_tokens") or 0)
-    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    input_tokens = _reported_token_count(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    cache_read = _reported_token_count(usage.get("cache_read_input_tokens"))
+    cache_creation = _reported_token_count(usage.get("cache_creation_input_tokens"))
     # Anthropic 의 input_tokens 는 캐시 read/creation 분을 제외한다(OpenAI 는
     # 포함). 정규화 계약은 "cached_tokens ⊆ prompt_tokens" 이므로 셋을 합쳐
     # 실제 입력 컨텍스트 전체를 prompt_tokens 로 보고한다 (#51) — 안 그러면
     # 14k 토큰짜리 캐시된 컨텍스트가 prompt_tokens=4 로 보인다.
     prompt_tokens = input_tokens + cache_read + cache_creation
-    completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    completion_tokens = _reported_token_count(usage.get("output_tokens") or usage.get("completion_tokens"))
     total = prompt_tokens + completion_tokens
 
     # 에러 감지: is_error / subtype != success / type=error
     error_msg = ""
     if data.get("is_error"):
-        error_msg = str(content) or data.get("subtype", "claude error")
+        error_msg = str(content) or str(data.get("subtype") or "claude error")
     elif data.get("subtype") and str(data.get("subtype")).startswith("error"):
         error_msg = str(content) or str(data.get("subtype"))
     elif data.get("type") == "error":
         error_msg = str(content) or "claude error"
+
+    status = data.get("api_error_status")
+    if type(status) is int and 400 <= status <= 599:
+        error_msg = error_msg or str(content) or f"Claude API error (HTTP {status})"
+    error_type = classify_error(error_msg) if error_msg else ""
+    if type(status) is int and status == 429 and error_msg:
+        error_type = "usage_limit"
 
     return str(content).strip(), TokenUsage(
         prompt_tokens=prompt_tokens,
@@ -1189,4 +1195,4 @@ def _parse_claude_json(stdout: str) -> tuple[str, TokenUsage, str]:
         total_tokens=total,
         cached_tokens=cache_read,
         cache_creation_tokens=cache_creation,
-    ), error_msg
+    ), error_msg, error_type

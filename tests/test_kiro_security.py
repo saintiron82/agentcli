@@ -53,3 +53,24 @@ def test_file_read_respects_requested_line_range(tmp_path):
     target.write_text("one\ntwo\nthree\n", encoding="utf-8")
     result = KiroProvider()._fs_read({"path": str(target), "line": 2, "limit": 1}, str(tmp_path))
     assert result == {"content": "two\n"}
+
+
+@pytest.mark.parametrize("wall_timeout,idle_timeout,expected", [(0.05, 30, "wall"), (30, 0.05, "idle")])
+def test_early_timer_keeps_the_selected_timeout_kind(monkeypatch, wall_timeout, idle_timeout, expected):
+    async def run():
+        # Simulate a timer firing within the clock's resolution, before the
+        # reported deadline. No actual sleep or external ACP process is needed.
+        clock = asyncio.get_running_loop().time()
+        monkeypatch.setattr("agentcli.providers.kiro.time.monotonic", lambda: clock)
+        async def write(line): pass
+        def factory(on_request, on_notification):
+            return AcpConnection(write, on_request=on_request, on_notification=on_notification)
+        async def early(awaitable, timeout):
+            awaitable.close()
+            raise asyncio.TimeoutError
+        monkeypatch.setattr("agentcli.providers.kiro.asyncio.wait_for", early)
+        return [chunk async for chunk in KiroProvider()._acp_turn(
+            prompt="hi", model="", session_id="", cwd=None, timeout=30,
+            idle_timeout=idle_timeout, wall_timeout=wall_timeout, conn_factory=factory)]
+    chunks = asyncio.run(run())
+    assert chunks[-1].type == "error" and chunks[-1].data["timeout_kind"] == expected

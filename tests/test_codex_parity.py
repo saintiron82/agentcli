@@ -6,6 +6,72 @@ from agentcli.providers.codex import CodexProvider
 from agentcli.types import Message, StreamChunk
 
 
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+@pytest.mark.parametrize("sequence,start_sid,expected_calls,expected_answer", [
+    (["stale", "greeting", "answer"], "old", 2, False),
+    (["greeting", "stale", "answer"], "", 2, False),
+    (["greeting", "greeting"], "", 2, False),
+    (["stale", "stale"], "old", 2, False),
+    (["stale", "answer"], "old", 2, True),
+    (["greeting", "answer"], "", 2, True),
+    (["tools", "answer"], "", 1, False),
+])
+def test_mixed_recovery_is_bounded_and_reports_failure(monkeypatch, mode, sequence, start_sid,
+                                                      expected_calls, expected_answer):
+    provider = CodexProvider()
+    attempts = []
+    def step():
+        kind = sequence[len(attempts)]
+        attempts.append(kind)
+        if kind == "stale":
+            return "", "no rollout found for thread id old", 1
+        output = events(kind != "answer", tools=kind == "tools")
+        return "\n".join(json.dumps(event) for event in output), "", 0
+    monkeypatch.setattr(provider, "_build_cmd", lambda *args, **kwargs: ["fake"])
+    def sync(*args, **kwargs):
+        stdout, stderr, code = step()
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+    async def asynchronous(*args, **kwargs):
+        stdout, stderr, code = step()
+        return stdout.encode(), stderr.encode(), code, False
+    async def streaming(cmd, state, **kwargs):
+        stdout, stderr, code = step()
+        if code:
+            yield StreamChunk(type="error", content=stderr)
+            return
+        for line in stdout.splitlines():
+            async for chunk in provider._dispatch_stream_event(json.loads(line), state):
+                yield chunk
+        yield StreamChunk(type="done", content="".join(state.text_parts),
+                          session_id=state.final_session_id, usage=state.final_usage)
+    monkeypatch.setattr("agentcli.providers.codex.run_owned_command", sync)
+    monkeypatch.setattr("agentcli.providers.codex.run_subprocess_async", asynchronous)
+    monkeypatch.setattr(provider, "_run_stream_template", streaming)
+    messages = [Message(role="user", content="Do this task")]
+    expected_usage = sum(25 if kind == "answer" else 110 if kind in ("greeting", "tools") else 0
+                         for kind in sequence[:expected_calls])
+    if mode == "sync":
+        result = provider.invoke(messages, session_id=start_sid)
+    elif mode == "async":
+        result = asyncio.run(provider.invoke_async(messages, session_id=start_sid))
+    else:
+        async def consume():
+            return [chunk async for chunk in provider.stream_async(messages, session_id=start_sid)]
+        chunks = asyncio.run(consume())
+        terminal = [chunk for chunk in chunks if chunk.type in ("error", "done")][-1]
+        assert terminal.type == ("done" if expected_answer else "error")
+        if "greeting" in attempts or "tools" in attempts:
+            assert terminal.usage.total_tokens == expected_usage
+        result = None
+    assert len(attempts) == expected_calls
+    if result is not None:
+        assert result.content == ("ANSWER" if expected_answer else "")
+        assert bool(result.error) == (not expected_answer)
+        assert bool(result.error_type) == (not expected_answer)
+        if "greeting" in attempts or "tools" in attempts:
+            assert result.tokens.total_tokens == expected_usage
+
+
 def events(greeting, tools=False):
     output = [{"type": "thread.started", "thread_id": "fake-thread"},
               {"type": "item.completed", "item": {"type": "agent_message",

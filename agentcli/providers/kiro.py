@@ -11,6 +11,7 @@ import contextlib
 import logging
 import shutil
 import time
+from contextlib import aclosing
 from pathlib import Path
 from typing import AsyncIterator
 from ..launchers import prepare_subprocess_command
@@ -95,28 +96,34 @@ class KiroProvider(LLMProvider):
         sid = session_id
         err = ""
         err_type = ""
+        exit_code = None
+        suggested_action = ""
         latency = 0
-        async for ch in self.stream_async(
+        async with aclosing(self.stream_async(
                 messages, model=model, timeout=timeout,
-                session_id=session_id, cwd=cwd):
-            if ch.session_id:
-                sid = ch.session_id
-            if ch.type == "text":
-                parts.append(ch.content)
-            elif ch.type == "error":
-                err = ch.content or "kiro stream error"
-                err_type = (ch.data or {}).get("error_type", "")
-            elif ch.type == "done":
+                session_id=session_id, cwd=cwd)) as stream:
+            async for ch in stream:
+                if ch.session_id:
+                    sid = ch.session_id
                 if ch.usage is not None:
                     usage = ch.usage
-                latency = int((ch.data or {}).get("latency_ms") or 0)
+                if ch.type == "text":
+                    parts.append(ch.content)
+                elif ch.type == "error":
+                    err = ch.content or "kiro stream error"
+                    err_type = ch.data.get("error_type") or classify_error(err)
+                    exit_code = ch.data.get("exit_code")
+                    suggested_action = ch.data.get("suggested_action", "")
+                elif ch.type == "done":
+                    latency = int(ch.data.get("latency_ms") or 0)
         content = "".join(parts)
-        if not content and err:
+        if err:
             return LLMResponse(
                 content="", provider=self.provider_id,
                 model=model or self._model, session_id=sid,
-                error=err, error_type=err_type,
-                exit_code=127 if "not found" in err else None)
+                error=err, error_type=err_type, raw_content=content,
+                tokens=usage, latency_ms=latency, suggested_action=suggested_action,
+                exit_code=exit_code if exit_code is not None else (127 if "not found" in err else None))
         return LLMResponse(
             content=content, provider=self.provider_id,
             model=model or self._model, tokens=usage,
@@ -136,12 +143,13 @@ class KiroProvider(LLMProvider):
         prompt = build_session_prompt(messages)
         factory, state = self._subprocess_conn_factory(model or self._model, cwd)
         try:
-            async for chunk in self._acp_turn(
+            async with aclosing(self._acp_turn(
                     prompt=prompt, model=model or self._model,
                     session_id=session_id, cwd=cwd, timeout=timeout,
                     idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    conn_factory=factory):
-                yield chunk
+                    conn_factory=factory)) as stream:
+                async for chunk in stream:
+                    yield chunk
         finally:
             box = state.get("proc_box") or {}
             rdr = box.get("reader")
@@ -317,14 +325,16 @@ class KiroProvider(LLMProvider):
                                           data={"error_type": "timeout",
                                                 "timeout_kind": "wall"})
                         return
+                    wall_limited = remaining <= idle
                     effective = min(idle, remaining)
                 else:
+                    wall_limited = False
                     effective = idle
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=effective)
                 except asyncio.TimeoutError:
                     # Determine whether wall or idle expired.
-                    if wall_deadline is not None and time.monotonic() >= wall_deadline:
+                    if wall_limited or (wall_deadline is not None and time.monotonic() >= wall_deadline):
                         yield StreamChunk(type="error",
                                           content="wall timeout expired",
                                           data={"error_type": "timeout",
@@ -399,7 +409,7 @@ class KiroProvider(LLMProvider):
         if not cwd:
             return None
         try:
-            root = Path(cwd).resolve()
+            root = Path(cwd).absolute()
             target = Path(path)
             return safe_workspace_path(root, target if target.is_absolute() else root / target)
         except (ValueError, OSError):
