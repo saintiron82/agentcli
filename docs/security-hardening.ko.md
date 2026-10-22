@@ -3,7 +3,7 @@
 [English](security-hardening.md) | [한국어](security-hardening.ko.md)
 
 작업 브랜치: `fix/security-hardening`. 기준: 배포된 v0.7.5.
-아직 새 버전으로 배포하지 않았다. 기존 v0.7.5 태그와 wheel은 변경하지 않는다.
+v0.7.6에 포함한 변경이다. 기존 v0.7.5 태그와 wheel은 변경하지 않는다.
 
 ## 1단계 — SEC-005: 자동 진단의 민감한 payload 노출
 
@@ -56,6 +56,12 @@ provider는 건너뛴다. 명시한 보안·인증 옵션이나 제한된 생성
 구현과 일치하는 정책 설정을 요구한다. 제한 없는 fallback은 유지한다. 후보를
 실행하지 않고 차단을 알리며, 미지원 보안 옵션은 조용히 사라지지 않는다.
 관련 테스트 106개가 통과했고 세 호출 경로를 검증했다.
+
+PR #80 후속 수정은 Claude 기본 `env="explicit"`도 제한 정책으로 취급한다.
+`fallback=True`만으로 그 정책에서 다른 provider로 전환하지 않는다.
+`env="inherit"`는 ambient 설정 상속을 명시적으로 수용한다. fallback을 켜기 위해
+격리를 무심코 낮추지 말아야 한다. 동일 구현의 동등한 effective 기본값은 같은
+정책으로 비교한다.
 
 Codex는 성공 시 적용한 sandbox·승인 정책도 기록한다. 재개 중 정책을 조용히
 바꾸지 않으며 변경에는 `new_session=True`를 사용한다. 정책 기록 없는 기존

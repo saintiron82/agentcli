@@ -2,10 +2,12 @@
 
 [English](code-improvements.md) | [한국어](code-improvements.ko.md)
 
-Status: local, unreleased `fix/security-hardening` branch. Review baseline:
+Status: included in v0.7.6 from `fix/security-hardening`. Original review baseline:
 `e8300c1`; implementation: `1a7d29f`. Execution cards and package results:
 [GitHub issue 79](https://github.com/saintiron82/agentcli/issues/79).
-No push, PR, merge, tag, PyPI upload, real account switch or paid model call.
+This initial record predates PR #80. The validation sections below describe the
+branch at the time of each check. Release details are in
+[v0.7.6](releases/v0.7.6.md); no real account switch or paid model call was used.
 
 ## Completed corrections
 
@@ -101,3 +103,57 @@ the existing explicit exception, not a library transcript-replay feature.
 Linux/macOS, actual provider accounts/models, production workload and distributed
 server leases have not been verified. OS ACLs, trusted native configuration,
 admission control and cross-server coordination remain host responsibilities.
+
+## PR #80 merge-gate repairs
+
+Baseline: `a415480`; follow-up working-tree changes on the same branch, unreleased.
+Execution cards MG1–MG7, MG4b and MG6b are recorded in issue 79.
+
+- Reject both directions of skill source/destination overlap before any writes,
+  preserving canonical source data. Trusted root ancestor aliases are mapped to
+  canonical paths; links below the root and workspace escapes are still rejected.
+- Preserve Claude's effective default explicit policy during fallback; equivalent
+  default/explicit values compare equally. Cross-provider fallback is intentionally
+  blocked when that policy cannot be preserved.
+- Wait for actual lease acquisition worker completion on cancellation/shutdown.
+  Collect external/file releases off-loop while retaining the local lock; finite
+  host timeouts remain mandatory, and cancellation may wait for owned cleanup.
+- Close delegated Claude/Copilot/Kiro streams before returning from `aclose()`.
+  Kiro partial failures preserve raw content/usage/error metadata without successful
+  persistence. Custom provider default streams also retain the original error.
+- Codex stale/greeting recovery now shares at most two native attempts in every
+  mode. Exhausted greeting output is an explicit error, never a blank success.
+  Observed usage survives failure and public-client error normalization; failed
+  calls are not recorded as successful usage rows.
+- Classify Kiro timeouts by the selected limiting timer even at coarse clock
+  resolution. Shared-budget retry tests use a controlled clock, and materialization
+  path assertions use canonical paths rather than platform-specific spellings.
+  The former 25 ms parallel-speed assertion now verifies simultaneous provider
+  entry with a barrier, so scheduler load cannot masquerade as serialization.
+
+Final clean-source Windows validation: **1,240 passed, 39 skipped** on both
+Python 3.12 and 3.14. Wheel/sdist build and `twine check` passed. Artifacts retain
+0.7.5 metadata for internal validation only, not publication. User-owned untracked
+manual/example/output files were excluded. Repair audits closed the original
+findings and the subsequently discovered public-stream usage gap.
+
+Offline fake-provider measurement (same host, 3 warmed batches of 40 calls,
+microseconds per call, baseline `a415480` versus repaired source):
+
+| Store/auth | Sync before → after | Async before → after | Stream before → after |
+| --- | --- | --- | --- |
+| Memory/legacy | 652 → 478 | 1,909 → 1,081 | 1,767 → 969 |
+| Memory/profile | 2,150 → 1,904 | 2,750 → 2,436 | 2,574 → 2,511 |
+| SQLite/legacy | 3,128 → 3,367 | 4,143 → 5,576 | 4,175 → 4,608 |
+| SQLite/profile | 4,384 → 4,740 | 5,434 → 6,184 | 5,503 → 5,785 |
+
+These small samples include disk/scheduling noise and are not production throughput
+claims. SQLite async release adds a worker hop to avoid blocking the event loop;
+its overhead and service tail latency require operator measurement/acceptance.
+Fake remote release heartbeat improved from 219 ms to 28 ms in the repair audit.
+
+The sync stale-plus-greeting third attempt was removed, not generalized into a new
+fallback. No credentials, native histories, dependency defaults or retention
+policies were changed. Operational workload, real remote accounts/distributed
+leases and Linux/macOS follow-up CI remain unverified; passing offline tests is
+not a deployment or no-performance-regression certification.

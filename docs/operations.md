@@ -2,8 +2,8 @@
 
 [English](operations.md) | [한국어](operations.ko.md)
 
-Scope: unreleased hardening branch based on v0.7.5. This is a deployment template,
-not evidence that the user's servers satisfy it. Last reviewed: 2026-10-12.
+Scope: v0.7.6 security hardening. This is a deployment template,
+not evidence that the user's servers satisfy it. Last reviewed: 2026-10-22.
 
 See the [code improvement record](code-improvements.md) for concurrency fixes,
 measured overhead, compatibility and remaining rollout gates.

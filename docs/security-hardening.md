@@ -3,7 +3,7 @@
 [English](security-hardening.md) | [한국어](security-hardening.ko.md)
 
 Branch: `fix/security-hardening`. Baseline: published v0.7.5.
-These changes are not yet released. The existing v0.7.5 tag/wheel is unchanged.
+These changes are included in v0.7.6. The existing v0.7.5 tag/wheel is unchanged.
 
 ## Step 1 — SEC-005: automatic diagnostic payload exposure
 
@@ -63,6 +63,12 @@ constructor settings require the same implementation and matching policy
 settings. Unrestricted fallback remains available. Blocked fallback is reported
 without launching the candidate; unsupported options cannot disappear silently.
 Relevant tests: 106 passed, including all three call paths.
+
+PR #80 follow-up also treats Claude's default `env="explicit"` as restricted.
+`fallback=True` alone no longer permits cross-provider fallback from that policy.
+`env="inherit"` explicitly accepts ambient settings; do not weaken isolation merely
+to enable fallback. Equivalent effective defaults on the same implementation are
+compared as the same policy.
 
 Codex also records the effective sandbox/approval policy on success. Resume
 cannot silently change it; use `new_session=True` to change policy. Restricted

@@ -48,7 +48,7 @@ Three CLIs in the "agentic CLI" category have converged on similar primitives bu
 |---|---|---|---|
 | Session | `--session-id`, `--resume <sid>` | `codex exec resume <sid>` | `--resume=<sid>`, `--name=<alias>` |
 | Streaming | `--output-format stream-json` | `--json` JSONL | `--output-format json` JSONL |
-| Sandbox/permission | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-a <policy>` | `--allow-tool`, `--deny-tool`, `--add-dir` |
+| Sandbox/permission | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-c approval_policy=...` | `--allow-tool`, `--deny-tool`, `--add-dir` |
 | Session storage | `~/.claude/projects/<cwd>/<sid>.jsonl` | `~/.codex/sessions/…/<sid>.jsonl` | managed by Copilot CLI |
 
 `agentcli` normalizes all three into one contract so apps can switch, parallelize, or combine them without rewriting per-CLI glue.
@@ -66,10 +66,10 @@ before 1.0.
 
 For a fuller product boundary, see [docs/positioning.md](docs/positioning.md).
 
-### Unreleased security hardening
+### Security hardening in v0.7.6
 
-The `fix/security-hardening` branch is based on v0.7.5; the published tag and
-packages have not been replaced. See [the change report](docs/security-hardening.md)
+Version 0.7.6 includes the hardening developed on `fix/security-hardening`.
+See [the change report](docs/security-hardening.md)
 and [the operating runbook](docs/operations.md).
 
 - Conversations require the same `owner` and canonical workspace. Cross-owner
@@ -77,6 +77,8 @@ and [the operating runbook](docs/operations.md).
 - Profile tool/MCP policies are forwarded. Unsupported security options and
   incompatible restricted fallbacks fail closed. Changing Codex resume policy
   requires `new_session=True`.
+  Claude's default `env="explicit"` is restricted too: `fallback=True` does not
+  authorize switching to another native provider without equivalent policy.
 - Windows batch shims launch their interpreter directly; unknown wrappers are
   rejected. User skills are preserved during materialization.
 - Kiro exposes explicit filesystem flags and a 1 MiB default file cap.
@@ -86,7 +88,7 @@ and [the operating runbook](docs/operations.md).
   per attempt. Tool side effects are not rolled back. Cleanup and lease waiting
   can exceed the execution budget. Debug traces use schema 2 with payload omission.
 
-### Independent service authentication (unreleased)
+### Independent service authentication
 
 Bind each service's client with `LLMClient(..., auth_profile=AuthProfile(...))`.
 Profiles separate credentials and native CLI directories without switching the
@@ -145,7 +147,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -992,7 +994,8 @@ The test suite covers session routing, async/streaming parity, alias resolution,
 
 ## Status
 
-- **0.7.5** — current published baseline; these security fixes are unreleased.
+- **0.7.6** — security hardening, service authentication isolation, session and stream lifecycle repairs, and structured CLI failure preservation (#81/#82).
+- **0.7.5** — account quota lookup, structured output, and modern Codex CLI compatibility.
 
 - **0.5.1** — Claude native session resume on macOS/Linux (stateless only on Windows, #4), explicit history modes (`new_session`, working `inject_context`), Copilot stream error normalization, same-conversation call serialization, Codex `--` argument hardening.
 - **0.4.3** — Claude provider declared stateless: `-p` mode no longer pairs with `--resume`, fixing a 5-minute Windows hang (#4).
@@ -1009,7 +1012,7 @@ The test suite covers session routing, async/streaming parity, alias resolution,
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.7.5 release note: [docs/releases/v0.7.5.md](docs/releases/v0.7.5.md) / [docs/releases/v0.7.5.ko.md](docs/releases/v0.7.5.ko.md)
+- v0.7.6 release note: [docs/releases/v0.7.6.md](docs/releases/v0.7.6.md) / [docs/releases/v0.7.6.ko.md](docs/releases/v0.7.6.ko.md)
 - Security hardening: [docs/security-hardening.md](docs/security-hardening.md) / [docs/security-hardening.ko.md](docs/security-hardening.ko.md)
 - Operating runbook: [docs/operations.md](docs/operations.md) / [docs/operations.ko.md](docs/operations.ko.md)
 - Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)

@@ -2,7 +2,7 @@
 
 [English](service-auth.md) | [한국어](service-auth.ko.md)
 
-Status: implemented on `fix/security-hardening`, not released. Runtime dependencies
+Status: included in v0.7.6. Runtime dependencies
 remain zero. Profiles isolate credential selection within one Python process or
 across services on one machine. They do not isolate hostile code under one OS user.
 
@@ -153,8 +153,9 @@ Code commit: `c6f1f79`; clean tracked-source snapshot: `5072c53`.
   async 382–393 µs afterward. This small sample includes scheduling noise and is
   not a model-throughput benchmark or proof of zero performance regression.
 
-No global login, actual account credentials or deployment were changed. No push,
-tag, PyPI upload or paid generation was performed. Build metadata remains 0.7.5
-for branch validation only; the published 0.7.5 does not contain this feature.
+During the original branch validation, no global login, actual account credentials
+or deployment were changed, and no push, tag, PyPI upload or paid generation was
+performed. Those internal artifacts used 0.7.5 metadata; the published 0.7.5 does
+not contain this feature. The feature is included in v0.7.6.
 Before rollout, test real account identity and failure/rotation behavior with
 each service's securely provisioned credentials and its installed CLI version.

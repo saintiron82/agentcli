@@ -41,7 +41,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 |---|---|---|---|
 | 세션 | `--session-id`, `--resume <sid>` | `codex exec resume <sid>` | `--resume=<sid>`, `--name=<alias>` |
 | 스트리밍 | `--output-format stream-json` | `--json` JSONL | `--output-format json` JSONL |
-| 권한/샌드박스 | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-a <policy>` | `--allow-tool`, `--deny-tool`, `--add-dir` |
+| 권한/샌드박스 | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-c approval_policy=...` | `--allow-tool`, `--deny-tool`, `--add-dir` |
 | 세션 저장 | `~/.claude/projects/<cwd>/<sid>.jsonl` | `~/.codex/sessions/.../<sid>.jsonl` | Copilot CLI가 관리 |
 
 `agentcli`는 이 차이를 하나의 계약으로 감싸서 앱이 provider별 glue code를 직접 다시 만들지 않게 합니다.
@@ -54,16 +54,18 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 
 더 자세한 제품 경계는 [docs/positioning.ko.md](docs/positioning.ko.md)를 보세요.
 
-### 아직 배포되지 않은 보안 보강
+### v0.7.6 보안 보강
 
-`fix/security-hardening` 브랜치는 v0.7.5 기반이며 공개된 태그와 패키지는
-교체하지 않았습니다. [변경 보고서](docs/security-hardening.ko.md)와
+v0.7.6에는 `fix/security-hardening`에서 개발한 보안 보강을 포함합니다.
+[변경 보고서](docs/security-hardening.ko.md)와
 [운영 지침](docs/operations.ko.md)을 확인하십시오.
 
 - 대화는 동일한 `owner`와 정규화한 작업 경로를 요구합니다. 다른 owner의
   `inject_context`는 호스트의 `context_authorizer` 승인이 필요합니다. owner는 인증이 아닙니다.
 - 프로필의 도구·MCP 정책을 전달하고 미지원 보안 옵션·제한을 잃는 fallback은
   차단합니다. Codex resume 정책 변경에는 `new_session=True`가 필요합니다.
+  Claude 기본 `env="explicit"`도 제한 정책입니다. `fallback=True`만으로 동등한
+  정책이 확인되지 않은 다른 native provider로 전환하지 않습니다.
 - Windows batch shim은 해석기를 직접 실행하며 알 수 없는 wrapper는 거부합니다.
   materialization은 사용자 스킬을 삭제하지 않습니다.
 - Kiro 파일 접근 권한을 명시하고 파일 크기는 기본 1 MiB로 제한합니다.
@@ -73,7 +75,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
   유지합니다. 도구의 외부 변경은 rollback되지 않습니다. 정리·잠금 대기 시간은
   실행 예산을 넘을 수 있습니다. 진단 trace는 본문을 제외하는 schema 2입니다.
 
-### 서비스별 독립 인증 (미배포)
+### 서비스별 독립 인증
 
 서비스 client마다 `LLMClient(..., auth_profile=AuthProfile(...))`로 연결합니다.
 공용 머신 로그인·전역 환경 변수 변경 없이 인증과 네이티브 CLI 경로를 분리합니다.
@@ -127,7 +129,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -750,8 +752,9 @@ pytest
 
 ## 릴리즈
 
-- 현재 공개 릴리즈: `0.7.5` (이 보안 수정은 아직 미배포)
-- 릴리즈 노트: [docs/releases/v0.7.5.ko.md](docs/releases/v0.7.5.ko.md)
+- 현재 릴리즈: `0.7.6` — 보안 보강, 서비스 인증 분리, 세션·스트림 수명 및 CLI 실패 응답 수정 (#81/#82)
+- 이전 릴리즈: `0.7.5` — 계정 한도 조회, 구조화 출력, 최신 Codex CLI 호환성
+- 릴리즈 노트: [docs/releases/v0.7.6.ko.md](docs/releases/v0.7.6.ko.md)
 - 보안 수정: [docs/security-hardening.ko.md](docs/security-hardening.ko.md) / [docs/security-hardening.md](docs/security-hardening.md)
 - 운영 지침: [docs/operations.ko.md](docs/operations.ko.md) / [docs/operations.md](docs/operations.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)

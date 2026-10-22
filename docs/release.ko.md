@@ -13,19 +13,19 @@ API가 아직 beta이고 실제 Claude Code, Codex, GitHub Copilot CLI 환경에
 3. 커밋에 태그를 붙입니다.
 
    ```bash
-   git tag v0.7.5
+   git tag v0.7.6
    git push origin main
-   git push origin v0.7.5
+   git push origin v0.7.6
    ```
 
 4. Release 워크플로의 테스트·빌드 게이트가 통과하고 wheel·소스 패키지를
-   첨부한 GitHub Release `v0.7.5`가 생성되는지 확인합니다. 릴리스 노트는
-   [docs/releases/v0.7.5.ko.md](releases/v0.7.5.ko.md)를 사용합니다.
+   첨부한 GitHub Release `v0.7.6`가 생성되는지 확인합니다. 릴리스 노트는
+   [docs/releases/v0.7.6.ko.md](releases/v0.7.6.ko.md)를 사용합니다.
 
 5. 사용자는 다음 명령으로 설치할 수 있습니다.
 
    ```bash
-   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
    ```
 
 ## 2단계: PyPI 릴리즈
@@ -62,9 +62,9 @@ GitHub 릴리즈로 기본 외부 검증을 받은 뒤, 패키지 이름을 안�
 PyPI는 별도로 활성화하는 게시 경로입니다.
 
 ```bash
-git tag v0.7.5
+git tag v0.7.6
 git push origin main
-git push origin v0.7.5
+git push origin v0.7.6
 ```
 
 워크플로 동작:

@@ -14,19 +14,19 @@ real Claude Code, Codex, and GitHub Copilot CLI behavior.
 3. Tag the commit:
 
    ```bash
-   git tag v0.7.5
+   git tag v0.7.6
    git push origin main
-   git push origin v0.7.5
+   git push origin v0.7.6
    ```
 
 4. Wait for the Release workflow to pass its tests/build gate and create the
-   GitHub Release `v0.7.5` with wheel and source distributions, using
-   [docs/releases/v0.7.5.ko.md](releases/v0.7.5.ko.md) as the release note.
+   GitHub Release `v0.7.6` with wheel and source distributions, using
+   [docs/releases/v0.7.6.ko.md](releases/v0.7.6.ko.md) as the release note.
 
 5. Users can install with:
 
    ```bash
-   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+   pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
    ```
 
 ## Stage 2: PyPI release
@@ -64,9 +64,9 @@ name should become the stable public install path.
 PyPI is a separate, opt-in publication path:
 
 ```bash
-git tag v0.7.5
+git tag v0.7.6
 git push origin main
-git push origin v0.7.5
+git push origin v0.7.6
 ```
 
 The workflow then:
