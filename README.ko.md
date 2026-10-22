@@ -41,7 +41,7 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 |---|---|---|---|
 | 세션 | `--session-id`, `--resume <sid>` | `codex exec resume <sid>` | `--resume=<sid>`, `--name=<alias>` |
 | 스트리밍 | `--output-format stream-json` | `--json` JSONL | `--output-format json` JSONL |
-| 권한/샌드박스 | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-a <policy>` | `--allow-tool`, `--deny-tool`, `--add-dir` |
+| 권한/샌드박스 | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-c approval_policy=...` | `--allow-tool`, `--deny-tool`, `--add-dir` |
 | 세션 저장 | `~/.claude/projects/<cwd>/<sid>.jsonl` | `~/.codex/sessions/.../<sid>.jsonl` | Copilot CLI가 관리 |
 
 `agentcli`는 이 차이를 하나의 계약으로 감싸서 앱이 provider별 glue code를 직접 다시 만들지 않게 합니다.
@@ -53,6 +53,39 @@ Claude Code, Codex CLI, GitHub Copilot CLI는 비슷한 문제를 풀지만 세�
 현재 상태는 public beta입니다. API는 테스트되어 있고 실제 통합에 사용할 수 있지만, provider CLI들이 빠르게 바뀌기 때문에 1.0 전까지는 작은 breaking change가 있을 수 있습니다.
 
 더 자세한 제품 경계는 [docs/positioning.ko.md](docs/positioning.ko.md)를 보세요.
+
+### v0.7.6 보안 보강
+
+v0.7.6에는 `fix/security-hardening`에서 개발한 보안 보강을 포함합니다.
+[변경 보고서](docs/security-hardening.ko.md)와
+[운영 지침](docs/operations.ko.md)을 확인하십시오.
+
+- 대화는 동일한 `owner`와 정규화한 작업 경로를 요구합니다. 다른 owner의
+  `inject_context`는 호스트의 `context_authorizer` 승인이 필요합니다. owner는 인증이 아닙니다.
+- 프로필의 도구·MCP 정책을 전달하고 미지원 보안 옵션·제한을 잃는 fallback은
+  차단합니다. Codex resume 정책 변경에는 `new_session=True`가 필요합니다.
+  Claude 기본 `env="explicit"`도 제한 정책입니다. `fallback=True`만으로 동등한
+  정책이 확인되지 않은 다른 native provider로 전환하지 않습니다.
+- Windows batch shim은 해석기를 직접 실행하며 알 수 없는 wrapper는 거부합니다.
+  materialization은 사용자 스킬을 삭제하지 않습니다.
+- Kiro 파일 접근 권한을 명시하고 파일 크기는 기본 1 MiB로 제한합니다.
+- 같은 세션의 클라이언트·호출 모드·로컬 SQLite 프로세스를 조정합니다.
+  다중 서버 writer는 별도 조정과 네이티브 히스토리 접근 구성이 필요합니다.
+- 명시한 `wall_timeout`은 재시도 전체에 공유하며 기본 `timeout`은 시도별로
+  유지합니다. 도구의 외부 변경은 rollback되지 않습니다. 정리·잠금 대기 시간은
+  실행 예산을 넘을 수 있습니다. 진단 trace는 본문을 제외하는 schema 2입니다.
+
+### 서비스별 독립 인증
+
+서비스 client마다 `LLMClient(..., auth_profile=AuthProfile(...))`로 연결합니다.
+공용 머신 로그인·전역 환경 변수 변경 없이 인증과 네이티브 CLI 경로를 분리합니다.
+토큰 교체·비활성화는 해당 client의 이후 호출에만 적용하며 진행 중인 호출은
+스냅샷을 유지합니다. Claude OAuth/API key·Codex API key/프로필 내부 auth.json·
+명시적 Copilot GitHub 토큰을 지원합니다. 프로필 모드에서 Kiro는 미지원입니다.
+
+[서비스 인증 문서](docs/service-auth.ko.md)에 준비·동시 실행·교체 예제와 보안
+경계를 정리했습니다. 프로필 없는 client는 기존 공유 인증을 유지하며 기존 서비스는
+자동 이행되지 않습니다.
 
 ## 핵심 설계 원칙
 
@@ -96,7 +129,7 @@ Claude Code 2.1.x 대상 E2E로 검증.
 pip install agentcli-py
 
 # 그 전에는 공개 GitHub 저장소에서 직접 설치:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
 
 # 로컬 개발:
 pip install -e /path/to/agentcli
@@ -204,8 +237,9 @@ registry.register(KiroProvider(
 위 생성자 플래그는 provider 인스턴스 단위로 고정된다. 도구/권한/MCP 서버를
 **호출마다** 바꾸려면 — 예: *같은* 대화를 읽기 전용에서 행위로 전환 —
 `chat`/`chat_async`/`chat_stream` 에 `provider_options` 를 넘긴다. 각 키는 그
-키를 받는 provider 에게만 전달되므로, 다른 provider 로 fallback 돼도 무관한
-옵션은 안전하게 무시된다.
+키를 받는 provider에게 전달하되, 미지원 보안 제어는 `ValueError`로 거부한다.
+제한된 fallback은 정책 동등성을 확인할 수 있을 때만 허용한다. 비보안 미지원
+키는 무시한다. Codex 정책 변경은 새 세션이 필요하다.
 
 ```python
 # 읽기 턴: plan 권한, 외부 도구 없음.
@@ -395,9 +429,9 @@ client.chat(report_text, provider="claude",
 ```
 
 호출이 이유 없이 느리면 `debug=True`(필요 시 `debug_log_path` 와 함께)가 Claude
-의 `--debug` 를 붙이고, 프롬프트가 redact 된 argv 를 로깅하며, 스트리밍에서는
+의 `--debug` 를 붙이고, 민감한 payload가 가려진 argv 를 로깅하며, 스트리밍에서는
 청크별 타임라인을 기록해 툴 루프나 init 지연을 보이게 한다. `debug_log_path` 를
-주면 JSON Lines trace(argv·청크 타임라인·stderr·총 소요)가 append 되어, 느린
+주면 JSON Lines trace(argv·청크 타임라인·stderr 길이·총 소요)가 append 되어, 느린
 호출을 재현한 뒤 들여다볼 수 있다.
 
 ```python
@@ -422,7 +456,9 @@ async for chunk in client.chat_stream(prompt, provider="claude",
         print(chunk.content, end="", flush=True)   # 토큰 단위
 ```
 
-`env`/`lean`/`isolated`/`debug`/`partial_messages` 는 claude 전용 — fallback 시 다른 provider 는 무시한다.
+`env`/`lean`/`isolated`는 Claude 전용 실행 제어입니다. 미지원 보안 옵션은 거부하고
+fallback도 정책을 유지해야 합니다. 비보안 진단 옵션의 미지원 키는 계속 무시할 수
+있습니다. `debug`는 Codex/Copilot도 지원하며 `partial_messages`는 Claude 전용입니다.
 
 ### 계정 한도 사용량 (Claude / Codex)
 
@@ -571,9 +607,17 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | claude 전용 옵션 | `env`(티어), `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
-타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr trace 를 남긴다.
+타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr 길이 trace 를 남긴다.
 `debug_log_path` 는 JSON-Lines 레코드를 append 한다(각 레코드에 `schema` 버전 +
 `call_id` stamp). kiro(ACP)는 debug 계측이 없다.
+
+보안 수정 브랜치의 trace schema 2는 프롬프트·시스템 지시문·MCP/config 본문과
+stderr 원문을 길이 표시로 바꾼다. 자동 provider 실패 로그에는 오류 본문 대신
+오류 분류와 종료 코드를 남긴다. 실제 CLI 인자, 응답 반환값, 오류 분류 동작은
+유지된다. `LLMResponse.error`, `raw_stderr`, 오류 청크는 비공개 진단 데이터이므로
+자동으로 공개하거나 로깅하지 않는다. trace에는 세션 ID·경로·도구/이벤트 이름이
+남으므로 접근을 제한한다. 기존 schema 1 로그를 자동으로 고치지는 않는다.
+진행 상태는 [보안 수정 기록](docs/security-hardening.ko.md)을 참고한다.
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID 출처 |
 |---|---|---|---|
@@ -708,8 +752,11 @@ pytest
 
 ## 릴리즈
 
-- 현재 릴리즈: `0.7.1`
-- 릴리즈 노트: [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
+- 현재 릴리즈: `0.7.6` — 보안 보강, 서비스 인증 분리, 세션·스트림 수명 및 CLI 실패 응답 수정 (#81/#82)
+- 이전 릴리즈: `0.7.5` — 계정 한도 조회, 구조화 출력, 최신 Codex CLI 호환성
+- 릴리즈 노트: [docs/releases/v0.7.6.ko.md](docs/releases/v0.7.6.ko.md)
+- 보안 수정: [docs/security-hardening.ko.md](docs/security-hardening.ko.md) / [docs/security-hardening.md](docs/security-hardening.md)
+- 운영 지침: [docs/operations.ko.md](docs/operations.ko.md) / [docs/operations.md](docs/operations.md)
 - 릴리즈 절차: [docs/release.ko.md](docs/release.ko.md)
 - Android(Termux)에서 가동: [docs/termux-setup.ko.md](docs/termux-setup.ko.md) / [docs/termux-setup.md](docs/termux-setup.md)
 

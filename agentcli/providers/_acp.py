@@ -30,8 +30,18 @@ class AcpConnection:
         self._on_notification = on_notification
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(AcpError({"code": -32000, "message": "ACP transport closed"}))
+        self._pending.clear()
 
     async def request(self, method: str, params: dict) -> dict:
+        if self._closed:
+            raise AcpError({"code": -32000, "message": "ACP transport closed"})
         self._next_id += 1
         rid = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -67,10 +77,16 @@ class AcpConnection:
 
     async def _dispatch_request(self, msg: dict) -> None:
         result: dict = {}
-        if self._on_request is not None:
-            result = await self._on_request(msg["method"], msg.get("params") or {})
-        await self._write_line(json.dumps(
-            {"jsonrpc": "2.0", "id": msg["id"], "result": result}))
+        try:
+            if self._on_request is not None:
+                result = await self._on_request(msg["method"], msg.get("params") or {})
+        except PermissionError:
+            reply = {"error": {"code": -32001, "message": "File access denied"}}
+        except Exception:
+            reply = {"error": {"code": -32603, "message": "Client request failed"}}
+        else:
+            reply = {"result": result}
+        await self._write_line(json.dumps({"jsonrpc": "2.0", "id": msg["id"], **reply}))
 
     def _resolve(self, msg: dict) -> None:
         fut = self._pending.pop(msg.get("id"), None)

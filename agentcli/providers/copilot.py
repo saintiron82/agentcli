@@ -20,11 +20,14 @@ import platform
 import shutil
 import subprocess
 import time
+from contextlib import aclosing
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
+from ..auth_context import current_auth_profile, provider_environment, configured_health
 
 from .base import (LLMProvider, StreamState, build_session_prompt,
                    emit_invoke_debug, health_from_response, run_health_command,
-                   run_subprocess_async, validate_reasoning_defaults)
+                   run_subprocess_async, run_owned_command, validate_reasoning_defaults)
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, Message, LLMResponse,
                      ProviderHealth, TokenUsage, StreamChunk, classify_error)
 from ..utils import build_env
@@ -119,13 +122,20 @@ class CopilotProvider(LLMProvider):
                 message="Copilot CLI or gh CLI not found")
 
         version_cmd = [bin_path, "copilot", "version"] if use_gh else [bin_path, "version"]
-        version_proc = run_health_command(version_cmd, timeout=timeout)
+        version_proc = run_health_command(version_cmd, timeout=timeout,
+                                          env=provider_environment("copilot", build_env))
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if current_auth_profile() is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
 
         if use_gh:
             auth_proc = run_health_command(
                 [bin_path, "auth", "status"], timeout=timeout, cwd=cwd,
-                env=build_env())
+                env=provider_environment("copilot", build_env))
             auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
             if auth_proc.returncode != 0:
                 return ProviderHealth(
@@ -157,6 +167,8 @@ class CopilotProvider(LLMProvider):
                    output_format: str = "text",
                    alias: str = "",
                    resume_by_alias: bool = True,
+                   allowed_tools: list[str] | None = None,
+                   disallowed_tools: list[str] | None = None,
                    reasoning_args: list[str] | None = None) -> tuple[list[str] | None, bool]:
         """(cmd, use_gh) 반환. session_id 발급은 CLI가 담당, 우리는 stdout에서 파싱.
 
@@ -180,13 +192,16 @@ class CopilotProvider(LLMProvider):
 
         if model and not use_gh:
             cmd += ["--model", model]
-        if self._allow_all_tools:
+        # A per-call allowlist must not be neutralized by --allow-all-tools.
+        if self._allow_all_tools and allowed_tools is None:
             cmd.append("--allow-all-tools")
-        if self._allowed_tools:
-            for t in self._allowed_tools:
+        atools = self._allowed_tools if allowed_tools is None else allowed_tools
+        dtools = self._disallowed_tools if disallowed_tools is None else disallowed_tools
+        if atools:
+            for t in atools:
                 cmd += ["--allow-tool", t]
-        if self._disallowed_tools:
-            for t in self._disallowed_tools:
+        if dtools:
+            for t in dtools:
                 cmd += ["--deny-tool", t]
         if self._available_tools:
             cmd += ["--available-tools", ",".join(self._available_tools)]
@@ -205,7 +220,7 @@ class CopilotProvider(LLMProvider):
             if resume_by_alias:
                 cmd.append(f"--resume={alias}")
 
-        return cmd, use_gh
+        return prepare_subprocess_command(cmd), use_gh
 
     def _reasoning_flags(self, effort, thinking):
         """유효 effort/thinking → (copilot native 플래그, ReasoningResolution).
@@ -231,6 +246,8 @@ class CopilotProvider(LLMProvider):
                resume_by_alias: bool = True,
                debug: bool = False,
                debug_log_path: str | None = None,
+               allowed_tools: list[str] | None = None,
+               disallowed_tools: list[str] | None = None,
                effort: str | None = None,
                thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
@@ -238,6 +255,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
@@ -249,9 +268,9 @@ class CopilotProvider(LLMProvider):
 
         start = time.time()
         try:
-            result = subprocess.run(
+            result = run_owned_command(
                 cmd, capture_output=True, text=True, timeout=timeout,
-                stdin=subprocess.DEVNULL, env=build_env(), cwd=cwd)
+                stdin=subprocess.DEVNULL, env=provider_environment("copilot", build_env), cwd=cwd)
             latency = int((time.time() - start) * 1000)
             if debug:
                 emit_invoke_debug("copilot", cmd, result.returncode, latency,
@@ -261,8 +280,8 @@ class CopilotProvider(LLMProvider):
 
             if result.returncode != 0:
                 msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
-                logger.error("Copilot 실패 (code=%d): %s",
-                             result.returncode, msg)
+                logger.error("Copilot 실패 (code=%d, type=%s)",
+                             result.returncode, classify_error(msg))
                 resp = LLMResponse(
                     content="", provider=self.provider_id, model=model,
                     raw_stderr=result.stderr,
@@ -317,6 +336,8 @@ class CopilotProvider(LLMProvider):
                            resume_by_alias: bool = True,
                            debug: bool = False,
                            debug_log_path: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None,
                            effort: str | None = None,
                            thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
@@ -324,6 +345,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             logger.error("Copilot CLI를 찾을 수 없습니다")
@@ -337,7 +360,7 @@ class CopilotProvider(LLMProvider):
         try:
             stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
                 cmd, timeout=timeout, cwd=cwd,
-                env=build_env(), use_stdin_devnull=True)
+                env=provider_environment("copilot", build_env), use_stdin_devnull=True)
         except FileNotFoundError:
             logger.error("Copilot CLI를 찾을 수 없습니다")
             return LLMResponse(content="", provider=self.provider_id, model=model,
@@ -369,7 +392,7 @@ class CopilotProvider(LLMProvider):
 
         if rc != 0:
             msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Copilot 실패 (code=%d): %s", rc, msg)
+            logger.error("Copilot 실패 (code=%d, type=%s)", rc, classify_error(msg))
             resp = LLMResponse(
                 content="", provider=self.provider_id, model=model,
                 raw_stderr=stderr_txt,
@@ -406,6 +429,8 @@ class CopilotProvider(LLMProvider):
                            wall_timeout: int | None = None,
                            debug: bool = False,
                            debug_log_path: str | None = None,
+                           allowed_tools: list[str] | None = None,
+                           disallowed_tools: list[str] | None = None,
                            effort: str | None = None,
                            thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         """Copilot CLI --output-format json 스트리밍.
@@ -430,6 +455,8 @@ class CopilotProvider(LLMProvider):
         cmd, _ = self._build_cmd(prompt, model, session_id,
                                    output_format="json", alias=alias,
                                    resume_by_alias=resume_by_alias,
+                                   allowed_tools=allowed_tools,
+                                   disallowed_tools=disallowed_tools,
                                    reasoning_args=reasoning_args)
         if cmd is None:
             yield StreamChunk(type="error", content="Copilot CLI not found")
@@ -439,11 +466,12 @@ class CopilotProvider(LLMProvider):
             final_usage=TokenUsage(
                 prompt_tokens_reliable=False,
                 prompt_tokens_source="copilot_not_reported"))
-        async for chunk in self._run_stream_template(
+        async with aclosing(self._run_stream_template(
                 cmd, state, model=model, cwd=cwd, timeout=timeout,
                 idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                env=build_env(), debug=debug, debug_log_path=debug_log_path):
-            yield chunk
+                env=provider_environment("copilot", build_env), debug=debug, debug_log_path=debug_log_path)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def _dispatch_stream_event(self, evt: dict,
                                      state: StreamState) -> AsyncIterator[StreamChunk]:

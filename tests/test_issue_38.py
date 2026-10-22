@@ -69,7 +69,7 @@ def test_claude_invoke_ctor_effort_reaches_argv(mock_find, mock_run):
 
 @patch("agentcli.providers.codex.CodexProvider._find_binary",
        return_value="/usr/bin/codex")
-@patch("agentcli.providers.codex.subprocess.run")
+@patch("agentcli.providers.codex.run_owned_command")
 @patch("agentcli.providers.codex.build_env", return_value={"PATH": "/usr/bin"})
 def test_codex_invoke_ctor_effort_reaches_argv_clamped(mock_env, mock_run,
                                                        mock_find):

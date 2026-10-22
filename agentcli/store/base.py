@@ -50,6 +50,10 @@ class ConversationStore(ABC):
     @abstractmethod
     def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]: ...
 
+    def list_all_by_owner(self, owner: str) -> list[Conversation]:
+        """All handles for bulk operations; custom stores may override this."""
+        return self.list_by_owner(owner, limit=2**63 - 1)
+
     @abstractmethod
     def set_metadata(self, conversation_id: str, key: str, value) -> None:
         """Conversation.metadata의 특정 키를 갱신."""

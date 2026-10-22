@@ -15,13 +15,36 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from threading import RLock
+from pathlib import Path
+import os
+from functools import wraps
+from contextlib import contextmanager
 from .base import ConversationStore
 from ..types import Conversation, Message
+from .locking import synchronized_store
 
 
+def _read_snapshot(function):
+    @wraps(function)
+    def snapshot(self, *args, **kwargs):
+        own_transaction = not self._conn.in_transaction
+        if own_transaction:
+            self._conn.execute("BEGIN")
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            if own_transaction:
+                self._conn.rollback()
+    return snapshot
+
+
+@synchronized_store
 class SQLiteStore(ConversationStore):
     def __init__(self, db_path: str = ":memory:"):
         self._lock = RLock()
+        self._transaction_depth = 0
+        self._coordination_path = (os.path.normcase(str(Path(db_path).resolve()))
+                                   if str(db_path) != ":memory:" else None)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         if db_path != ":memory:":
@@ -31,6 +54,35 @@ class SQLiteStore(ConversationStore):
                 pass
         self._conn.execute("PRAGMA busy_timeout=5000;")
         self._create_tables()
+
+    def close(self):
+        """Close after all clients using this store have stopped."""
+        with self._lock:
+            self._conn.close()
+
+    @contextmanager
+    def transaction(self):
+        """Serialize an atomic write unit across local SQLite connections."""
+        with self._lock:
+            outer = self._transaction_depth == 0
+            if outer:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                if outer:
+                    self._conn.rollback()
+                raise
+            else:
+                if outer:
+                    self._conn.commit()
+            finally:
+                self._transaction_depth -= 1
+
+    def _commit(self):
+        if self._transaction_depth == 0:
+            self._conn.commit()
 
     def _create_tables(self):
         self._conn.executescript("""
@@ -90,7 +142,7 @@ class SQLiteStore(ConversationStore):
             CREATE INDEX IF NOT EXISTS idx_usage_alias ON usage_log(alias);
             CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_log(provider);
         """)
-        self._conn.commit()
+        self._commit()
         # Migrations — 구 스키마 호환
         for alter in (
             "ALTER TABLE messages ADD COLUMN agent TEXT DEFAULT ''",
@@ -103,7 +155,7 @@ class SQLiteStore(ConversationStore):
         ):
             try:
                 self._conn.execute(alter)
-                self._conn.commit()
+                self._commit()
             except sqlite3.OperationalError:
                 pass
 
@@ -133,18 +185,29 @@ class SQLiteStore(ConversationStore):
         conv_id = conversation_id or str(uuid.uuid4())
         existing = self.get(conv_id)
         if existing is not None:
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
             if alias and not existing.alias:
                 self.set_alias(conv_id, alias)
                 existing = self.get(conv_id)
             return existing
 
         now = datetime.now()
-        self._conn.execute(
-            """INSERT INTO conversations (id, owner, provider, model, alias,
-               created_at, updated_at) VALUES (?,?,?,?,?,?,?)""",
-            (conv_id, owner, provider, model, alias or "",
-             now.isoformat(), now.isoformat()))
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                """INSERT INTO conversations (id, owner, provider, model, alias,
+                   created_at, updated_at) VALUES (?,?,?,?,?,?,?)""",
+                (conv_id, owner, provider, model, alias or "",
+                 now.isoformat(), now.isoformat()))
+            self._commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            existing = self.find_by_alias(owner, alias) if alias else self.get(conv_id)
+            if existing is None:
+                raise
+            if existing.owner != owner:
+                raise PermissionError("Conversation ID is owned by another owner")
+            return existing
         return Conversation(id=conv_id, owner=owner, provider=provider,
                             model=model, created_at=now, updated_at=now,
                             alias=alias or "")
@@ -181,7 +244,7 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?",
             (datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def get_messages(self, conversation_id: str, limit: int = 0,
                      agent: str = "") -> list[Message]:
@@ -214,13 +277,18 @@ class SQLiteStore(ConversationStore):
                            (conversation_id,))
         self._conn.execute("DELETE FROM conversations WHERE id=?",
                            (conversation_id,))
-        self._conn.commit()
+        self._commit()
 
     def list_by_owner(self, owner: str, limit: int = 20) -> list[Conversation]:
         rows = self._conn.execute(
             "SELECT * FROM conversations WHERE owner=? ORDER BY updated_at DESC LIMIT ?",
             (owner, limit)).fetchall()
         return [self._row_to_conv(r) for r in rows]
+
+    def list_all_by_owner(self, owner: str) -> list[Conversation]:
+        rows = self._conn.execute(
+            "SELECT * FROM conversations WHERE owner=? ORDER BY updated_at DESC", (owner,)).fetchall()
+        return [self._row_to_conv(row) for row in rows]
 
     def set_metadata(self, conversation_id: str, key: str, value) -> None:
         row = self._conn.execute(
@@ -234,7 +302,7 @@ class SQLiteStore(ConversationStore):
             "UPDATE conversations SET metadata=?, updated_at=? WHERE id=?",
             (json.dumps(meta, ensure_ascii=False),
              datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def set_alias(self, conversation_id: str, alias: str) -> None:
         row = self._conn.execute(
@@ -250,7 +318,7 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET alias=?, updated_at=? WHERE id=?",
             (alias or "", datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
     def record_usage(self, conversation_id: str, *,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
@@ -280,8 +348,9 @@ class SQLiteStore(ConversationStore):
         self._conn.execute(
             "UPDATE conversations SET updated_at=? WHERE id=?",
             (datetime.now().isoformat(), conversation_id))
-        self._conn.commit()
+        self._commit()
 
+    @_read_snapshot
     def get_token_stats(self, owner: str = "", days: int = 7,
                         *, alias: str = "", provider: str = "",
                         model: str = "", agent: str = "",
@@ -311,76 +380,41 @@ class SQLiteStore(ConversationStore):
             where.append("u.agent = ?")
             params.append(agent)
 
-        sql = f"""
-            SELECT u.prompt_tokens, u.completion_tokens, u.total_tokens,
-                   u.cached_tokens, u.payload_prompt_tokens,
-                   u.prompt_tokens_reliable, u.prompt_tokens_source,
-                   u.latency_ms, u.provider, u.model, u.agent, u.alias,
-                   u.timestamp
-            FROM usage_log u {join}
-            WHERE {' AND '.join(where) if where else '1=1'}
-        """
-        rows = self._conn.execute(sql, params).fetchall()
+        source = (f"FROM usage_log u {join} "
+                  f"WHERE {' AND '.join(where) if where else '1=1'}")
+        sums = {
+            "total_tokens": "total_tokens", "total_prompt": "prompt_tokens",
+            "total_completion": "completion_tokens", "total_cached": "cached_tokens",
+            "total_payload_prompt": "payload_prompt_tokens", "total_latency_ms": "latency_ms",
+        }
+        aggregates = ", ".join(f"COALESCE(SUM(u.{column}), 0) AS {name}"
+                               for name, column in sums.items())
+        aggregates += (", COUNT(*) AS total_calls, "
+                       "COALESCE(SUM(CASE WHEN COALESCE(u.prompt_tokens_reliable, 0) = 0 "
+                       "THEN 1 ELSE 0 END), 0) AS prompt_tokens_unreliable_calls")
+        out = dict(self._conn.execute(f"SELECT {aggregates} {source}", params).fetchone())
+        axes = {
+            "provider": "COALESCE(NULLIF(u.provider, ''), 'unknown')",
+            "model": "COALESCE(NULLIF(u.model, ''), 'unknown')",
+            "alias": "COALESCE(NULLIF(u.alias, ''), '(no alias)')",
+            "agent": "COALESCE(NULLIF(u.agent, ''), '(no agent)')",
+            "day": "SUBSTR(COALESCE(u.timestamp, ''), 1, 10)",
+        }
 
-        total = {k: 0 for k in (
-            "total_tokens", "total_prompt", "total_completion",
-            "total_cached", "total_payload_prompt", "total_latency_ms",
-            "total_calls", "prompt_tokens_unreliable_calls")}
-        by_provider: dict[str, int] = {}
-        groups: dict[str, dict] = {}
+        def grouped(axis):
+            expression = axes.get(axis, "'unknown'")
+            return self._conn.execute(
+                f"SELECT {expression} AS group_key, {aggregates} {source} GROUP BY {expression}",
+                params).fetchall()
 
-        for r in rows:
-            total["total_tokens"] += r["total_tokens"]
-            total["total_prompt"] += r["prompt_tokens"]
-            total["total_completion"] += r["completion_tokens"]
-            total["total_cached"] += r["cached_tokens"] or 0
-            total["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
-            total["total_latency_ms"] += r["latency_ms"] or 0
-            total["total_calls"] += 1
-            if not bool(r["prompt_tokens_reliable"]):
-                total["prompt_tokens_unreliable_calls"] += 1
-            p = r["provider"] or "unknown"
-            by_provider[p] = by_provider.get(p, 0) + r["total_tokens"]
-            if group_by:
-                key = _sqlite_group_key(r, group_by)
-                if key not in groups:
-                    groups[key] = {k: 0 for k in (
-                        "total_tokens", "total_prompt", "total_completion",
-                        "total_cached", "total_payload_prompt",
-                        "total_latency_ms", "total_calls",
-                        "prompt_tokens_unreliable_calls")}
-                g = groups[key]
-                g["total_tokens"] += r["total_tokens"]
-                g["total_prompt"] += r["prompt_tokens"]
-                g["total_completion"] += r["completion_tokens"]
-                g["total_cached"] += r["cached_tokens"] or 0
-                g["total_payload_prompt"] += r["payload_prompt_tokens"] or 0
-                g["total_latency_ms"] += r["latency_ms"] or 0
-                g["total_calls"] += 1
-                if not bool(r["prompt_tokens_reliable"]):
-                    g["prompt_tokens_unreliable_calls"] += 1
-
-        out = dict(total)
-        out["by_provider"] = by_provider
+        provider_rows = grouped("provider")
+        out["by_provider"] = {row["group_key"]: row["total_tokens"] for row in provider_rows}
         if group_by:
             out["group_by"] = group_by
-            out["groups"] = groups
+            rows = provider_rows if group_by == "provider" else grouped(group_by)
+            out["groups"] = {row["group_key"]: {k: row[k] for k in out
+                              if k not in {"by_provider", "group_by"}} for row in rows}
         return out
 
 
 SQLiteSessionStore = SQLiteStore
-
-
-def _sqlite_group_key(row, axis: str) -> str:
-    if axis == "day":
-        ts = row["timestamp"] or ""
-        return ts[:10]
-    if axis == "provider":
-        return row["provider"] or "unknown"
-    if axis == "model":
-        return row["model"] or "unknown"
-    if axis == "alias":
-        return row["alias"] or "(no alias)"
-    if axis == "agent":
-        return row["agent"] or "(no agent)"
-    return "unknown"

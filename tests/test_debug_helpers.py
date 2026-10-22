@@ -67,7 +67,7 @@ def test_write_debug_trace_appends_jsonl(tmp_path):
     # 입력 필드 보존 + schema/call_id 자동 stamp
     assert recs[0]["a"] == 1 and recs[1]["b"] == "둘" and recs[1]["n"] == 2
     for r in recs:
-        assert r["schema"] == 1
+        assert r["schema"] == 2
         assert len(r["call_id"]) == 12
     # call_id 는 호출마다 고유
     assert recs[0]["call_id"] != recs[1]["call_id"]

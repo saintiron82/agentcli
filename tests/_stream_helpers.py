@@ -30,6 +30,9 @@ class FakeReadline:
         self._idx += 1
         return line
 
+    async def read(self, n=-1) -> bytes:
+        return await self.readline()
+
 
 class HangingReadline:
     """readline 호출 시 영원히 await — idle timeout 시뮬레이션용."""
@@ -58,7 +61,7 @@ def make_fake_proc(
     proc = MagicMock(spec=asyncio.subprocess.Process)
     proc.stdout = FakeReadline(stdout_lines or [])
     proc.stderr = MagicMock()
-    proc.stderr.read = AsyncMock(return_value=stderr_bytes)
+    proc.stderr.read = AsyncMock(side_effect=[stderr_bytes, b""])
     proc.returncode = returncode
     proc.wait = AsyncMock(return_value=returncode if returncode is not None else 0)
     proc.kill = MagicMock()

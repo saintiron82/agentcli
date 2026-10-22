@@ -148,7 +148,7 @@ def test_system_message_becomes_real_flag():
     cmd = call.args[0]
     assert "--append-system-prompt" in cmd
     assert cmd[cmd.index("--append-system-prompt") + 1] == "You are terse."
-    prompt_arg = cmd[cmd.index("-p") + 1]
+    prompt_arg = cmd[-1]
     assert prompt_arg == "hi"
     assert "System instructions:" not in prompt_arg
 
@@ -212,7 +212,7 @@ def test_stream_async_wires_system_flag_too():
     cmd = captured["cmd"]
     assert "--append-system-prompt" in cmd
     assert cmd[cmd.index("--append-system-prompt") + 1] == "Rules."
-    assert cmd[cmd.index("-p") + 1] == "go"
+    assert cmd[-2:] == ["--", "go"]
 
 
 def test_system_only_messages_fall_back_to_flattening():
@@ -220,7 +220,7 @@ def test_system_only_messages_fall_back_to_flattening():
     call = _capture_invoke([Message(role="system", content="only system")])
     cmd = call.args[0]
     assert "--append-system-prompt" not in cmd
-    assert "only system" in cmd[cmd.index("-p") + 1]
+    assert "only system" in cmd[-1]
 
 
 def test_redact_argv_hides_system_prompt_payload():

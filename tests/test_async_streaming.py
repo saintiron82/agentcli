@@ -113,17 +113,25 @@ def test_chat_async_cwd_propagation():
     assert p.last_cwd == "/repo/x"
 
 
-def test_chat_async_parallel_speedup():
-    """두 호출을 병렬로 돌리면 직렬보다 빠르다."""
-    import time
-    p = AsyncProvider()
+def test_chat_async_different_sessions_overlap():
+    """세 요청이 하나도 완료되지 않은 상태에서 모두 provider에 진입한다."""
+    entered, finish = asyncio.Event(), asyncio.Event()
+    class OverlapProvider(AsyncProvider):
+        calls = 0
+        async def invoke_async(self, messages, *, model="", timeout=120, session_id="", cwd=None):
+            self.calls += 1
+            if self.calls == 3:
+                entered.set()
+            await finish.wait()
+            return LLMResponse("async-ok", self.provider_id, model)
+    p = OverlapProvider()
     reg = ProviderRegistry()
     reg.register(p)
     reg.set_fallback_order(["asyncp"])
     client = LLMClient(store=MemoryStore(), registry=reg)
 
     async def parallel():
-        return await asyncio.gather(
+        calls = asyncio.gather(
             client.chat_async("a", provider="asyncp", owner="b",
                               conversation_id="conv-a"),
             client.chat_async("b", provider="asyncp", owner="b",
@@ -131,14 +139,14 @@ def test_chat_async_parallel_speedup():
             client.chat_async("c", provider="asyncp", owner="b",
                               conversation_id="conv-c"),
         )
-
-    t0 = time.perf_counter()
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert p.calls == 3 and not calls.done()
+        finally:
+            finish.set()
+        return await calls
     results = asyncio.run(parallel())
-    dt = time.perf_counter() - t0
     assert all(r.content == "async-ok" for r in results)
-    # 각 호출이 0.01s sleep. 병렬이면 ~0.01s, 직렬이면 ~0.03s.
-    # 여유 있게 0.025 이하면 병렬 성공.
-    assert dt < 0.025
 
 
 # ===== 3. LLMClient.chat_stream =====

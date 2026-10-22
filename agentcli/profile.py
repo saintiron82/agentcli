@@ -28,10 +28,12 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, TYPE_CHECKING
+from .filesystem import safe_workspace_path, reject_tree_links
 
 if TYPE_CHECKING:
     from .client import LLMClient
@@ -181,6 +183,18 @@ class AgentProfile:
            "skills_copied": [...]}
         """
         cwd = Path(cwd).expanduser().resolve()
+        if any(Path(fname).name != fname or fname in ("", ".", "..")
+               or Path(fname).is_absolute() for fname in files):
+            raise ValueError("materialize files must be workspace-root filenames")
+        for fname in (*files, "AGENTS.override.md"):
+            safe_workspace_path(cwd, cwd / fname)
+        if include_skills and self.skills_dir and self.skills_dir.exists():
+            safe_workspace_path(cwd, cwd / ".agents" / "skills")
+            reject_tree_links(self.skills_dir)
+            for skill_path in self.skills_dir.iterdir():
+                if skill_path.is_dir():
+                    destination = safe_workspace_path(cwd, cwd / ".agents" / "skills" / skill_path.name)
+                    self._check_skill_overlap(skill_path.resolve(), destination)
         cwd.mkdir(parents=True, exist_ok=True)
         inst_text = self.resolve_instructions()
         if not inst_text.strip():
@@ -207,13 +221,53 @@ class AgentProfile:
         skills_copied: list[str] = []
         if include_skills and self.skills_dir and self.skills_dir.exists():
             target_skills = cwd / ".agents" / "skills"
+            safe_workspace_path(cwd, target_skills)
             target_skills.mkdir(parents=True, exist_ok=True)
             for skill_path in self.skills_dir.iterdir():
                 if skill_path.is_dir():
                     dst = target_skills / skill_path.name
+                    safe_workspace_path(cwd, dst)
+                    source = skill_path.resolve()
+                    self._check_skill_overlap(source, dst)
+                    reject_tree_links(skill_path)
                     if dst.exists():
-                        shutil.rmtree(dst)
-                    shutil.copytree(skill_path, dst)
+                        marker = dst / ".agentcli-managed.json"
+                        safe_workspace_path(cwd, marker)
+                        try:
+                            with marker.open(encoding="utf-8") as marker_file:
+                                raw_marker = marker_file.read(2049)
+                            owned = len(raw_marker) <= 2048 and json.loads(raw_marker).get("managed_by") == "agentcli"
+                        except (OSError, ValueError, AttributeError):
+                            owned = False
+                        if not owned:
+                            skipped.append(str(dst))
+                            continue
+                        reject_tree_links(dst)
+                    staging = Path(tempfile.mkdtemp(prefix=".agentcli-skill-", dir=target_skills))
+                    preserve_backup = False
+                    try:
+                        replacement, previous = staging / "new", staging / "previous"
+                        shutil.copytree(skill_path, replacement, symlinks=True)
+                        reject_tree_links(replacement)
+                        (replacement / ".agentcli-managed.json").write_text(
+                            json.dumps({"managed_by": "agentcli", "profile": self.name}), encoding="utf-8")
+                        safe_workspace_path(cwd, dst)
+                        if dst.exists():
+                            dst.replace(previous)
+                        try:
+                            replacement.replace(dst)
+                        except BaseException:
+                            if previous.exists():
+                                try:
+                                    previous.replace(dst)
+                                except BaseException:
+                                    preserve_backup = True
+                                    raise RuntimeError(f"Skill recovery required; preserved backup: {previous}") from None
+                            raise
+                    finally:
+                        safe_workspace_path(cwd, staging)
+                        if not preserve_backup:
+                            shutil.rmtree(staging)
                     skills_copied.append(str(dst))
 
         return {
@@ -225,6 +279,12 @@ class AgentProfile:
             "cwd": str(cwd),
             "materialized_at": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _check_skill_overlap(source: Path, destination: Path):
+        if (source == destination or destination.is_relative_to(source)
+                or source.is_relative_to(destination)):
+            raise ValueError("Skill source and destination must not overlap")
 
     def _wrap_with_marker(self, text: str) -> str:
         src = str(self.source_dir) if self.source_dir else "<inline>"
@@ -242,12 +302,12 @@ class AgentProfile:
         if not target.exists():
             return True
         try:
-            first_chunk = target.read_text(encoding="utf-8", errors="replace")[:1024]
+            with target.open(encoding="utf-8", errors="replace") as source:
+                first_chunk = source.read(1024)
         except OSError:
             return False
-        if MANAGED_MARKER in first_chunk:
-            return True
-        return any(m in first_chunk for m in _LEGACY_MARKERS)
+        first_line = first_chunk.lstrip("\ufeff").splitlines()[0] if first_chunk else ""
+        return first_line.strip() in (MANAGED_MARKER, *_LEGACY_MARKERS)
 
     # ------- 호출 편의 -------
 
@@ -271,6 +331,16 @@ class AgentProfile:
             "system_prompt": self.resolve_instructions(),
         }
         kwargs.update({k: v for k, v in overrides.items() if v is not None})
+        options = {}
+        if self.allowed_tools:
+            options["allowed_tools"] = list(self.allowed_tools)
+        if self.disallowed_tools:
+            options["disallowed_tools"] = list(self.disallowed_tools)
+        if self.mcp_config:
+            options["mcp_config"] = self.mcp_config
+        options.update(kwargs.get("provider_options") or {})
+        if options:
+            kwargs["provider_options"] = options
         return kwargs
 
     async def chat_async(self, prompt: str, *,

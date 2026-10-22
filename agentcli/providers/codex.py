@@ -19,17 +19,21 @@ import pathlib
 import shutil
 import subprocess
 import time
+from contextlib import aclosing
 from typing import AsyncIterator
+from ..launchers import prepare_subprocess_command
+from ..auth import AuthProfileError
+from ..auth_context import current_auth_profile, provider_environment, configured_health
 
 from .base import (LLMProvider, PROMPT_STDIN_THRESHOLD, StreamState,
                    build_session_prompt, emit_invoke_debug,
                    estimate_payload_prompt_tokens, health_from_response,
-                   run_health_command, run_subprocess_async,
+                   run_health_command, run_subprocess_async, run_owned_command,
                    validate_reasoning_defaults)
 from ..types import (AccountUsage, ERROR_AUTH, ERROR_BINARY_MISSING, ERROR_TIMEOUT,
                      Message, LLMResponse, ProviderHealth, TokenUsage,
                      StreamChunk, classify_error)
-from ..utils import build_env
+from ..utils import _reported_token_count, build_env
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +133,7 @@ def _codex_run_kwargs(prompt: str, use_stdin: bool, *,
     지정한다(동기 경로만 다른 동작을 하지 않도록).
     """
     kwargs: dict = dict(capture_output=True, text=True, timeout=timeout,
-                        env=build_env(), cwd=cwd,
+                        env=provider_environment("codex", build_env), cwd=cwd,
                         encoding="utf-8", errors="replace")
     if use_stdin:
         kwargs["input"] = prompt
@@ -206,7 +210,8 @@ class CodexProvider(LLMProvider):
         """
         if not session_id:
             return None
-        root = pathlib.Path.home() / ".codex" / "sessions"
+        profile = current_auth_profile()
+        root = (profile.directory("codex") if profile else pathlib.Path.home() / ".codex") / "sessions"
         if not root.exists():
             return False
         # session_id 의 glob 메타문자(*,?,[)를 escape — 안 하면 '*' 가 아무 파일
@@ -218,6 +223,16 @@ class CodexProvider(LLMProvider):
                           oauth_token: str | None = None,
                           credentials_path: str | None = None) -> AccountUsage:
         from ..account_usage import codex_account_usage
+        profile = current_auth_profile()
+        if profile is not None:
+            if oauth_token is not None or credentials_path is not None:
+                raise AuthProfileError("Service usage lookup cannot override the auth profile")
+            from ..auth_context import validate_auth_options
+            validate_auth_options("codex")
+            if profile.codex_api_key is not None:
+                return AccountUsage(provider="codex", status="unsupported_auth",
+                                    message="API-key billing usage is not supported")
+            credentials_path = str(profile.directory("codex") / "auth.json")
         if oauth_token is not None:
             raise ValueError("Codex usage requires auth.json; use credentials_path.")
         return codex_account_usage(credentials_path=credentials_path, timeout=timeout)
@@ -233,11 +248,18 @@ class CodexProvider(LLMProvider):
                 error_type=ERROR_BINARY_MISSING,
                 message="codex CLI not found")
 
-        version_proc = run_health_command([bin_path, "--version"], timeout=timeout)
+        auth_env = provider_environment("codex", build_env)
+        version_proc = run_health_command([bin_path, "--version"], timeout=timeout, env=auth_env)
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if current_auth_profile() is not None:
+            if not probe:
+                return configured_health(self.provider_id, bin_path, version, version_proc.returncode)
+            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+            return health_from_response(self.provider_id, resp, binary=bin_path, version=version)
         auth_proc = run_health_command(
             [bin_path, "login", "status"], timeout=timeout, cwd=cwd,
-            env=build_env())
+            env=provider_environment("codex", build_env))
         auth_msg = ((auth_proc.stdout or "") + (auth_proc.stderr or "")).strip()
         if auth_proc.returncode == 124:
             return ProviderHealth(
@@ -308,6 +330,8 @@ class CodexProvider(LLMProvider):
             mcp_args += ["-c", f"mcp_servers.{name}={_toml_inline(cfg)}"]
         prompt_arg = "-" if prompt_via_stdin else prompt
         cmd = [bin_path, "exec"]
+        if current_auth_profile() is not None:
+            cmd += ["-c", 'cli_auth_credentials_store="file"']
         if session_id:
             cmd += ["resume", "--json"]
             if self._skip_git:
@@ -320,7 +344,7 @@ class CodexProvider(LLMProvider):
             # `--` 로 옵션 파싱 종료 — session_id/prompt 가 `-` 로 시작해도
             # 플래그로 해석되지 않는다 (untrusted 입력 주입 방지).
             cmd += ["--", session_id, prompt_arg]
-            return cmd
+            return prepare_subprocess_command(cmd)
         # 신규 세션
         cmd.append("--json")
         if self._skip_git:
@@ -342,7 +366,7 @@ class CodexProvider(LLMProvider):
         # `--` 로 옵션 파싱 종료 — prompt 가 `-` 로 시작해도 플래그로
         # 해석되지 않는다 (untrusted 입력 주입 방지).
         cmd += ["--", prompt_arg]
-        return cmd
+        return prepare_subprocess_command(cmd)
 
     def _reasoning_flags(self, effort, thinking):
         """유효 effort/thinking → (codex `-c` config args, ReasoningResolution).
@@ -379,121 +403,59 @@ class CodexProvider(LLMProvider):
         # Windows CreateProcess 32,767자 명령행 한계를 우회한다.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
-        cmd = self._build_cmd(prompt, model, cwd, session_id,
-                              sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy,
-                              mcp_config=mcp_config,
-                              reasoning_args=reasoning_args,
-                              prompt_via_stdin=use_stdin)
-        if cmd is None:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                session_id=session_id,
-                error="codex CLI not found",
-                error_type=ERROR_BINARY_MISSING,
-                exit_code=127)
-
-        start = time.time()
-        try:
-            result = subprocess.run(
-                cmd, **_codex_run_kwargs(prompt, use_stdin,
-                                         timeout=timeout, cwd=cwd))
-            latency = int((time.time() - start) * 1000)
+        start = time.monotonic()
+        total_usage = TokenUsage()
+        attempt_sid = session_id
+        def finish(content="", *, error="", error_type="", code=0, sid="", stderr=""):
+            response = LLMResponse(content=content, provider=self.provider_id, model=model,
+                                   tokens=total_usage, session_id=sid, error=error,
+                                   error_type=error_type, exit_code=code, raw_stderr=stderr,
+                                   latency_ms=int((time.monotonic() - start) * 1000))
+            response.reasoning = reasoning
+            return response
+        for attempt in range(2):
+            cmd = self._build_cmd(prompt, model, cwd, attempt_sid,
+                                  sandbox_mode=sandbox_mode, approval_policy=approval_policy,
+                                  mcp_config=mcp_config, reasoning_args=reasoning_args,
+                                  prompt_via_stdin=use_stdin)
+            if cmd is None:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
+            try:
+                result = run_owned_command(cmd, **_codex_run_kwargs(
+                    prompt, use_stdin, timeout=timeout, cwd=cwd))
+            except subprocess.TimeoutExpired:
+                if debug:
+                    emit_invoke_debug("codex", cmd, 124,
+                                      int((time.monotonic() - start) * 1000), "",
+                                      session_id=attempt_sid, path=debug_log_path)
+                return finish(error=f"timeout after {timeout}s", error_type="timeout",
+                              code=124, sid=attempt_sid)
+            except FileNotFoundError:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
             if debug:
-                emit_invoke_debug("codex", cmd, result.returncode, latency,
-                                  result.stderr or "", session_id=session_id,
-                                  path=debug_log_path)
-
+                emit_invoke_debug("codex", cmd, result.returncode,
+                                  int((time.monotonic() - start) * 1000), result.stderr or "",
+                                  session_id=attempt_sid, path=debug_log_path)
+            parsed = _parse_output(result.stdout or "", prompt)
+            total_usage.accumulate(parsed["usage"])
             if result.returncode != 0:
-                if session_id and _is_codex_stale(result.stderr):
-                    logger.warning(
-                        "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
-                    return self.invoke(
-                        messages, model=model, timeout=timeout,
-                        session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
-                        approval_policy=approval_policy, mcp_config=mcp_config,
-                        debug=debug, debug_log_path=debug_log_path,
-                        effort=effort, thinking=thinking)
-                msg = (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
-                logger.error("Codex 실패 (code=%d): %s",
-                             result.returncode, msg)
-                resp = LLMResponse(
-                    content="", provider=self.provider_id, model=model,
-                    raw_stderr=result.stderr,
-                    session_id=session_id,
-                    error=msg, error_type=classify_error(msg),
-                    exit_code=result.returncode)
-                resp.reasoning = reasoning
-                return resp
-
-            parsed = _parse_jsonl_events(result.stdout)
-            parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
-            parsed["usage"].prompt_tokens_reliable = False
-            parsed["usage"].prompt_tokens_source = "codex_cli_reported"
-            if _needs_initial_greeting_retry(parsed, session_id):
-                first_thread_id = parsed["thread_id"]
-                retry_result = subprocess.run(
-                    self._build_cmd(prompt, model, cwd, first_thread_id,
-                                    sandbox_mode=sandbox_mode,
-                                    approval_policy=approval_policy,
-                                    mcp_config=mcp_config,
-                                    reasoning_args=reasoning_args,
-                                    prompt_via_stdin=use_stdin),
-                    **_codex_run_kwargs(prompt, use_stdin,
-                                        timeout=timeout, cwd=cwd))
-                latency = int((time.time() - start) * 1000)
-                if retry_result.returncode != 0:
-                    msg = ((retry_result.stderr or "").strip()[:300]
-                           or f"exit={retry_result.returncode}")
-                    logger.error("Codex greeting retry 실패 (code=%d): %s",
-                                 retry_result.returncode, msg)
-                    resp = LLMResponse(
-                        content="", provider=self.provider_id, model=model,
-                        raw_stderr=retry_result.stderr,
-                        session_id=parsed["thread_id"],
-                        error=msg, error_type=classify_error(msg),
-                        exit_code=retry_result.returncode)
-                    resp.reasoning = reasoning
-                    return resp
-                parsed = _parse_jsonl_events(retry_result.stdout)
-                parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
-                parsed["usage"].prompt_tokens_reliable = False
-                parsed["usage"].prompt_tokens_source = "codex_cli_reported"
-                if not parsed["thread_id"]:
-                    parsed["thread_id"] = first_thread_id
-                result = retry_result
-            err = parsed.get("error", "")
-            resp = LLMResponse(
-                content=parsed["text"] if not err else "",
-                provider=self.provider_id, model=model,
-                tokens=parsed["usage"], latency_ms=latency,
-                raw_stderr=result.stderr,
-                session_id=parsed["thread_id"] or session_id,
-                error=err,
-                error_type=classify_error(err) if err else "",
-                exit_code=result.returncode,
-            )
-            resp.reasoning = reasoning
-            return resp
-        except subprocess.TimeoutExpired:
-            logger.error("Codex 타임아웃 (%d초)", timeout)
-            if debug:
-                emit_invoke_debug("codex", cmd, 124,
-                                  int((time.time() - start) * 1000), "",
-                                  session_id=session_id, path=debug_log_path)
-            resp = LLMResponse(content="", provider=self.provider_id, model=model,
-                               error=f"timeout after {timeout}s",
-                               error_type="timeout",
-                               exit_code=124)
-            resp.reasoning = reasoning
-            return resp
-        except FileNotFoundError:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="codex CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
+                if attempt == 0 and attempt_sid and _is_codex_stale(result.stderr):
+                    attempt_sid = ""
+                    continue
+                error = parsed["error"] or (result.stderr or "").strip()[:300] or f"exit={result.returncode}"
+                return finish(error=error, error_type=classify_error(error),
+                              code=result.returncode, sid=parsed["thread_id"] or attempt_sid,
+                              stderr=result.stderr)
+            if attempt == 0 and _needs_initial_greeting_retry(parsed, attempt_sid):
+                attempt_sid = parsed["thread_id"]
+                continue
+            error = parsed.get("error", "") or _greeting_recovery_error(parsed)
+            return finish(parsed["text"] if not error else "", error=error,
+                          error_type=classify_error(error) if error else "",
+                          code=result.returncode, sid=parsed["thread_id"] or attempt_sid,
+                          stderr=result.stderr)
 
     # ---------- 비동기 ----------
 
@@ -510,93 +472,64 @@ class CodexProvider(LLMProvider):
                            thinking: str | None = None) -> LLMResponse:
         prompt = build_session_prompt(messages)
         reasoning_args, reasoning = self._reasoning_flags(effort, thinking)
-        # issue #30: argv 로 넘기기엔 너무 큰 프롬프트는 stdin 으로 전달.
         prompt_bytes = prompt.encode("utf-8")
         use_stdin = len(prompt_bytes) > PROMPT_STDIN_THRESHOLD
-        cmd = self._build_cmd(prompt, model, cwd, session_id,
-                              sandbox_mode=sandbox_mode,
-                              approval_policy=approval_policy,
-                              mcp_config=mcp_config,
-                              reasoning_args=reasoning_args,
-                              prompt_via_stdin=use_stdin)
-        if cmd is None:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                session_id=session_id,
-                error="codex CLI not found",
-                error_type=ERROR_BINARY_MISSING,
-                exit_code=127)
+        attempt_sid = session_id
+        total_usage = TokenUsage()
+        start = time.monotonic()
 
-        start = time.time()
-        try:
-            # use_stdin_devnull/input_bytes 는 상호 배타적(run_subprocess_async
-            # 가드) — 큰 프롬프트는 input_bytes 로, 작은 프롬프트는 기존과
-            # byte-identical 하게 use_stdin_devnull=True 로 stdin 을 닫는다.
-            stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
-                cmd, timeout=timeout, cwd=cwd, env=build_env(),
-                use_stdin_devnull=not use_stdin,
-                input_bytes=prompt_bytes if use_stdin else None)
-        except FileNotFoundError:
-            logger.error("codex CLI를 찾을 수 없습니다")
-            return LLMResponse(content="", provider=self.provider_id, model=model,
-                                error="codex CLI not found",
-                                error_type=ERROR_BINARY_MISSING,
-                                exit_code=127)
-        if timed_out:
-            logger.error("Codex 타임아웃 (%d초)", timeout)
+        def finish(content="", *, error="", error_type="", code=0, sid="", stderr=""):
+            response = LLMResponse(
+                content=content, provider=self.provider_id, model=model,
+                tokens=total_usage, latency_ms=int((time.monotonic() - start) * 1000),
+                raw_stderr=stderr, session_id=sid, error=error,
+                error_type=error_type, exit_code=code)
+            response.reasoning = reasoning
+            return response
+
+        # Stale and greeting recovery share one bounded native retry.
+        for attempt in range(2):
+            cmd = self._build_cmd(
+                prompt, model, cwd, attempt_sid, sandbox_mode=sandbox_mode,
+                approval_policy=approval_policy, mcp_config=mcp_config,
+                reasoning_args=reasoning_args, prompt_via_stdin=use_stdin)
+            if cmd is None:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
+            try:
+                stdout_b, stderr_b, rc, timed_out = await run_subprocess_async(
+                    cmd, timeout=timeout, cwd=cwd,
+                    env=provider_environment("codex", build_env),
+                    use_stdin_devnull=not use_stdin,
+                    input_bytes=prompt_bytes if use_stdin else None)
+            except FileNotFoundError:
+                return finish(error="codex CLI not found", error_type=ERROR_BINARY_MISSING,
+                              code=127, sid=attempt_sid)
+            stderr = stderr_b.decode("utf-8", errors="replace")
             if debug:
-                emit_invoke_debug("codex", cmd, 124,
-                                  int((time.time() - start) * 1000), "",
-                                  session_id=session_id, path=debug_log_path)
-            resp = LLMResponse(content="", provider=self.provider_id,
-                               model=model, session_id=session_id,
-                               error=f"timeout after {timeout}s",
-                               error_type="timeout",
-                               exit_code=124)
-            resp.reasoning = reasoning
-            return resp
-        latency = int((time.time() - start) * 1000)
-        stderr_txt = stderr_b.decode("utf-8", errors="replace")
-        if debug:
-            emit_invoke_debug("codex", cmd, rc, latency, stderr_txt,
-                              session_id=session_id, path=debug_log_path)
-
-        if rc != 0:
-            if session_id and _is_codex_stale(stderr_txt):
-                logger.warning(
-                    "Codex 세션 %s 만료 — 새 세션으로 재시도", session_id[:8])
-                return await self.invoke_async(
-                    messages, model=model, timeout=timeout,
-                    session_id="", cwd=cwd, sandbox_mode=sandbox_mode,
-                    approval_policy=approval_policy, mcp_config=mcp_config,
-                    debug=debug, debug_log_path=debug_log_path,
-                    effort=effort, thinking=thinking)
-            msg = stderr_txt.strip()[:300] or f"exit={rc}"
-            logger.error("Codex 실패 (code=%d): %s", rc, msg)
-            resp = LLMResponse(
-                content="", provider=self.provider_id, model=model,
-                raw_stderr=stderr_txt, session_id=session_id,
-                error=msg, error_type=classify_error(msg),
-                exit_code=rc)
-            resp.reasoning = reasoning
-            return resp
-
-        stdout_txt = stdout_b.decode("utf-8", errors="replace")
-        parsed = _parse_jsonl_events(stdout_txt)
-        err = parsed.get("error", "")
-        resp = LLMResponse(
-            content=parsed["text"] if not err else "",
-            provider=self.provider_id, model=model,
-            tokens=parsed["usage"], latency_ms=latency,
-            raw_stderr=stderr_txt,
-            session_id=parsed["thread_id"] or session_id,
-            error=err,
-            error_type=classify_error(err) if err else "",
-            exit_code=rc,
-        )
-        resp.reasoning = reasoning
-        return resp
+                emit_invoke_debug(
+                    "codex", cmd, 124 if timed_out else rc,
+                    int((time.monotonic() - start) * 1000), stderr,
+                    session_id=attempt_sid, path=debug_log_path)
+            if timed_out:
+                return finish(error=f"timeout after {timeout}s", error_type="timeout",
+                              code=124, sid=attempt_sid, stderr=stderr)
+            parsed = _parse_output(stdout_b.decode("utf-8", errors="replace"), prompt)
+            total_usage.accumulate(parsed["usage"])
+            if rc != 0:
+                if attempt == 0 and attempt_sid and _is_codex_stale(stderr):
+                    attempt_sid = ""
+                    continue
+                error = parsed["error"] or stderr.strip()[:300] or f"exit={rc}"
+                return finish(error=error, error_type=classify_error(error),
+                              code=rc, sid=parsed["thread_id"] or attempt_sid, stderr=stderr)
+            if attempt == 0 and _needs_initial_greeting_retry(parsed, attempt_sid):
+                attempt_sid = parsed["thread_id"]
+                continue
+            error = parsed.get("error", "") or _greeting_recovery_error(parsed)
+            return finish(parsed["text"] if not error else "", error=error,
+                          error_type=classify_error(error) if error else "",
+                          code=rc, sid=parsed["thread_id"] or attempt_sid, stderr=stderr)
 
     # ---------- 스트리밍 ----------
 
@@ -644,6 +577,8 @@ class CodexProvider(LLMProvider):
         # 만료된 thread 로 resume 하면 출력 없이 즉시 실패하므로, 첫 청크가
         # stale-session 에러일 때만 새 세션으로 1회 재시도한다 (claude 동일 패턴).
         attempt_sid = session_id
+        total_usage = TokenUsage()
+        deadline = time.monotonic() + wall_timeout if wall_timeout is not None else None
         for _attempt in range(2):
             cmd = self._build_cmd(prompt, model, cwd, attempt_sid,
                                   sandbox_mode=sandbox_mode,
@@ -661,19 +596,49 @@ class CodexProvider(LLMProvider):
                     prompt_tokens_reliable=False,
                     prompt_tokens_source="codex_cli_reported"))
             retry_stale = False
+            retry_greeting = False
             emitted = False
-            async for chunk in self._run_stream_template(
+            async with aclosing(self._run_stream_template(
                     cmd, state, model=model, cwd=cwd, timeout=timeout,
-                    idle_timeout=idle_timeout, wall_timeout=wall_timeout,
-                    env=build_env(), debug=debug, debug_log_path=debug_log_path,
-                    input_bytes=prompt_bytes if use_stdin else None):
-                if (attempt_sid and not emitted
-                        and chunk.type == "error"
-                        and _is_codex_stale(chunk.content)):
-                    retry_stale = True
-                    break
-                emitted = True
-                yield chunk
+                    idle_timeout=idle_timeout,
+                    wall_timeout=max(0, deadline - time.monotonic()) if deadline is not None else None,
+                    env=provider_environment("codex", build_env), debug=debug, debug_log_path=debug_log_path,
+                    input_bytes=prompt_bytes if use_stdin else None)) as stream:
+                async for chunk in stream:
+                    if (attempt_sid and not emitted and _attempt == 0
+                            and chunk.type == "error" and _is_codex_stale(chunk.content)):
+                        retry_stale = True
+                        break
+                    if chunk.type == "error":
+                        state.extra["failed"] = True
+                        observed = TokenUsage()
+                        observed.accumulate(total_usage)
+                        observed.accumulate(chunk.usage or state.final_usage or TokenUsage())
+                        chunk.usage = observed
+                    if chunk.type in ("tool_use", "tool_result"):
+                        state.extra["side_effects"] = True
+                    if chunk.type == "done":
+                        total_usage.accumulate(chunk.usage or state.final_usage or TokenUsage())
+                        parsed = {"text": "".join(state.text_parts),
+                                  "thread_id": state.final_session_id,
+                                  "ignored_initial_greeting": state.extra.get("ignored_initial_greeting"),
+                                  "error": state.extra.get("failed"),
+                                  "side_effects": state.extra.get("side_effects")}
+                        if _attempt == 0 and _needs_initial_greeting_retry(parsed, attempt_sid):
+                            retry_greeting = True
+                            break
+                        recovery_error = _greeting_recovery_error(parsed)
+                        if recovery_error:
+                            yield StreamChunk(type="error", content=recovery_error,
+                                              session_id=state.final_session_id, usage=total_usage,
+                                              data={"error_type": "unknown", "exit_code": 0})
+                            return
+                        chunk.usage = total_usage
+                    emitted = True
+                    yield chunk
+            if retry_greeting:
+                attempt_sid = state.final_session_id
+                continue
             if not retry_stale:
                 return
             logger.warning(
@@ -695,6 +660,7 @@ class CodexProvider(LLMProvider):
             if itype == "agent_message":
                 text = item.get("text", "")
                 if _is_codex_initial_greeting(text) and not state.text_parts:
+                    state.extra["ignored_initial_greeting"] = True
                     return  # 초기 인사 무시
                 if text:
                     state.text_parts.append(text)
@@ -731,6 +697,12 @@ class CodexProvider(LLMProvider):
 
 # ---------- JSONL 이벤트 파싱 유틸 ----------
 
+def _parse_output(stdout: str, prompt: str) -> dict:
+    parsed = _parse_jsonl_events(stdout)
+    parsed["usage"].payload_prompt_tokens = estimate_payload_prompt_tokens(prompt)
+    return parsed
+
+
 def _parse_jsonl_events(stdout: str) -> dict:
     """codex exec --json stdout 전체를 파싱하여 text/thread_id/usage/error 추출.
 
@@ -748,6 +720,7 @@ def _parse_jsonl_events(stdout: str) -> dict:
     cached_tokens = 0
     error_msg = ""
     ignored_initial_greeting = False
+    side_effects = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -763,30 +736,36 @@ def _parse_jsonl_events(stdout: str) -> dict:
         etype = evt.get("type", "")
         if etype == "thread.started":
             tid = evt.get("thread_id")
-            if tid:
+            if isinstance(tid, str) and tid:
                 thread_id = tid
         elif etype == "item.completed":
             item = evt.get("item") or {}
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("command_execution", "tool_call"):
+                side_effects = True
             if item.get("type") == "agent_message":
                 t = item.get("text", "")
-                if t:
+                if isinstance(t, str) and t:
                     if _is_codex_initial_greeting(t) and not text_parts:
                         ignored_initial_greeting = True
                         continue
                     text_parts.append(t)
         elif etype == "turn.completed":
-            u = evt.get("usage") or {}
-            prompt_tokens += int(u.get("input_tokens") or 0)
-            completion_tokens += int(u.get("output_tokens") or 0)
-            cached_tokens += int(u.get("cached_input_tokens") or 0)
+            u = evt.get("usage")
+            if not isinstance(u, dict):
+                continue
+            prompt_tokens += _reported_token_count(u.get("input_tokens"))
+            completion_tokens += _reported_token_count(u.get("output_tokens"))
+            cached_tokens += _reported_token_count(u.get("cached_input_tokens"))
         elif etype == "error":
             msg = evt.get("message", "")
-            if msg:
+            if isinstance(msg, str) and msg:
                 error_msg = msg
         elif etype == "turn.failed":
-            err = evt.get("error") or {}
-            msg = err.get("message", "")
-            if msg:
+            err = evt.get("error")
+            msg = err.get("message", "") if isinstance(err, dict) else err
+            if isinstance(msg, str) and msg:
                 error_msg = msg
 
     usage = TokenUsage(
@@ -803,6 +782,7 @@ def _parse_jsonl_events(stdout: str) -> dict:
         "usage": usage,
         "error": error_msg,
         "ignored_initial_greeting": ignored_initial_greeting,
+        "side_effects": side_effects,
     }
 
 
@@ -817,4 +797,12 @@ def _needs_initial_greeting_retry(parsed: dict, session_id: str) -> bool:
         and not parsed.get("text")
         and bool(parsed.get("thread_id"))
         and not parsed.get("error")
+        and not parsed.get("side_effects")
     )
+
+
+def _greeting_recovery_error(parsed: dict) -> str:
+    if (parsed.get("ignored_initial_greeting") and not parsed.get("text")
+            and not parsed.get("error")):
+        return "Codex recovery exhausted without an answer"
+    return ""

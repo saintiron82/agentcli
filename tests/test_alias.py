@@ -230,7 +230,7 @@ def test_provider_without_alias_param_still_works():
 
 # ===== Copilot --name 전달 =====
 
-@patch("agentcli.providers.copilot.subprocess.run")
+@patch("agentcli.providers.copilot.run_owned_command")
 @patch("agentcli.providers.copilot.build_env", return_value={"PATH": "/usr/bin"})
 @patch("agentcli.providers.copilot.CopilotProvider._find_binary",
        return_value=("/usr/bin/copilot", False))

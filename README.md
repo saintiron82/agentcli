@@ -48,7 +48,7 @@ Three CLIs in the "agentic CLI" category have converged on similar primitives bu
 |---|---|---|---|
 | Session | `--session-id`, `--resume <sid>` | `codex exec resume <sid>` | `--resume=<sid>`, `--name=<alias>` |
 | Streaming | `--output-format stream-json` | `--json` JSONL | `--output-format json` JSONL |
-| Sandbox/permission | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-a <policy>` | `--allow-tool`, `--deny-tool`, `--add-dir` |
+| Sandbox/permission | `--permission-mode`, `--allowedTools` | `-s <mode>`, `-c approval_policy=...` | `--allow-tool`, `--deny-tool`, `--add-dir` |
 | Session storage | `~/.claude/projects/<cwd>/<sid>.jsonl` | `~/.codex/sessions/…/<sid>.jsonl` | managed by Copilot CLI |
 
 `agentcli` normalizes all three into one contract so apps can switch, parallelize, or combine them without rewriting per-CLI glue.
@@ -65,6 +65,41 @@ quickly, so early adopters should pin versions and expect minor breaking changes
 before 1.0.
 
 For a fuller product boundary, see [docs/positioning.md](docs/positioning.md).
+
+### Security hardening in v0.7.6
+
+Version 0.7.6 includes the hardening developed on `fix/security-hardening`.
+See [the change report](docs/security-hardening.md)
+and [the operating runbook](docs/operations.md).
+
+- Conversations require the same `owner` and canonical workspace. Cross-owner
+  `inject_context` needs an explicit host `context_authorizer`; `owner` is not authentication.
+- Profile tool/MCP policies are forwarded. Unsupported security options and
+  incompatible restricted fallbacks fail closed. Changing Codex resume policy
+  requires `new_session=True`.
+  Claude's default `env="explicit"` is restricted too: `fallback=True` does not
+  authorize switching to another native provider without equivalent policy.
+- Windows batch shims launch their interpreter directly; unknown wrappers are
+  rejected. User skills are preserved during materialization.
+- Kiro exposes explicit filesystem flags and a 1 MiB default file cap.
+- Same-session calls coordinate across clients/modes and local SQLite processes;
+  multi-server writers require host coordination and native history availability.
+- Explicit `wall_timeout` is shared across retries; default `timeout` remains
+  per attempt. Tool side effects are not rolled back. Cleanup and lease waiting
+  can exceed the execution budget. Debug traces use schema 2 with payload omission.
+
+### Independent service authentication
+
+Bind each service's client with `LLMClient(..., auth_profile=AuthProfile(...))`.
+Profiles separate credentials and native CLI directories without switching the
+shared machine login or modifying global environment variables. Rotation and
+disabling affect only that client's future calls; active calls retain their
+snapshot. Claude OAuth/API keys, Codex API keys/profile-local auth.json, and
+explicit Copilot GitHub tokens are supported. Kiro is not supported in profile mode.
+
+See [service authentication](docs/service-auth.md) for setup, concurrency examples,
+credential rotation and security boundaries. Clients without a profile retain
+legacy shared authentication; existing services are not automatically migrated.
 
 ## Design principle
 
@@ -112,7 +147,7 @@ transcripts.
 pip install agentcli-py
 
 # Until then, install directly from the public GitHub repository:
-pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.5"
+pip install "agentcli-py @ git+https://github.com/saintiron82/agentcli.git@v0.7.6"
 
 # For local development:
 pip install -e /path/to/agentcli
@@ -452,9 +487,18 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 | claude-only options | `env` (tier), `lean`, `isolated`, `partial_messages` | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a
-per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr
+per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr-length
 trace. `debug_log_path` appends JSON-Lines records (each stamped with a `schema`
 version and `call_id`). kiro (ACP) has no debug instrumentation.
+
+On the security-hardening branch, trace schema 2 omits prompt, system-prompt,
+MCP/config payloads and raw stderr, using length markers instead. Automatic
+provider-failure logs record error categories and exit codes, not error bodies.
+CLI arguments, returned responses and error classification are unchanged.
+`LLMResponse.error`, `raw_stderr` and error chunks remain private diagnostic
+data: do not automatically publish or log them. Traces still contain session
+IDs, paths and tool/event names; restrict access. Existing schema 1 logs are not
+rewritten. See [security hardening status](docs/security-hardening.md).
 
 | Provider | `supports_sessions` | `supports_streaming` | Session ID source |
 |---|---|---|---|
@@ -631,8 +675,9 @@ registry.register(KiroProvider(
 The constructor flags above are fixed per provider instance. To switch tools /
 permissions / MCP servers **per call** — e.g. flip the *same* conversation from
 read-only to acting — pass `provider_options` to `chat` / `chat_async` /
-`chat_stream`. Each key is forwarded only to providers whose call accepts it, so
-one provider's options are harmlessly ignored on fallback to another.
+`chat_stream`. Unsupported security controls raise `ValueError`; restricted
+fallback is allowed only when policy equivalence is known. Other unsupported
+non-security keys are ignored. Codex policy changes require a fresh session.
 
 ```python
 # Read turn: planning permission, no external tools.
@@ -835,10 +880,10 @@ client.chat(report_text, provider="claude",
 ```
 
 When a call is mysteriously slow, `debug=True` (optionally with
-`debug_log_path`) appends Claude's `--debug`, logs the prompt-redacted argv, and
+`debug_log_path`) appends Claude's `--debug`, logs the payload-redacted argv, and
 for streaming records a per-chunk timeline so a tool loop or init stall is
 visible. A `debug_log_path` appends a JSON-Lines trace (argv, chunk timeline,
-stderr, elapsed) you can inspect after reproducing the slow call.
+stderr length, elapsed) you can inspect after reproducing the slow call.
 
 ```python
 async for chunk in client.chat_stream(prompt, provider="claude",
@@ -863,7 +908,10 @@ async for chunk in client.chat_stream(prompt, provider="claude",
 ```
 
 `env` / `lean` / `isolated` / `debug` / `partial_messages` are
-Claude-specific; other providers ignore them on fallback.
+provider-specific controls. Unsupported security options are rejected and
+fallback must preserve the policy. Unknown non-security diagnostic keys can
+still be ignored. `debug` is also supported by Codex/Copilot;
+`partial_messages` remains Claude-specific.
 
 ### Tracking running CLIs (diagnostics)
 
@@ -946,20 +994,27 @@ The test suite covers session routing, async/streaming parity, alias resolution,
 
 ## Status
 
+- **0.7.6** — security hardening, service authentication isolation, session and stream lifecycle repairs, and structured CLI failure preservation (#81/#82).
+- **0.7.5** — account quota lookup, structured output, and modern Codex CLI compatibility.
+
 - **0.5.1** — Claude native session resume on macOS/Linux (stateless only on Windows, #4), explicit history modes (`new_session`, working `inject_context`), Copilot stream error normalization, same-conversation call serialization, Codex `--` argument hardening.
 - **0.4.3** — Claude provider declared stateless: `-p` mode no longer pairs with `--resume`, fixing a 5-minute Windows hang (#4).
 - **0.4.2** — Codex bootstrap greeting filtering and one-time resume retry for greeting-only first turns.
 - **0.4.1** — Windows Codex binary resolution and explicit provider token usage reliability metadata.
 - **0.4.0** — product-facing polish: safe health output, standardized stream errors, pre-output stream fallback, alias status, and metadata-only session cleanup.
 - Runtime deps: **none**.
-- Tested on macOS and Windows 11; Linux should work (same CLI invocation path). CI runs ubuntu/macOS. copilot on Windows requires the `gh copilot` wrapper.
+- Existing CI covers Linux/macOS. A manual Windows security workflow covers
+  Python 3.11/3.14; local Windows tests cover native launchers and npm shims.
+  Copilot supports its standalone CLI or the `gh copilot` wrapper.
 
 ## Documentation
 
 - Korean README: [README.ko.md](README.ko.md)
 - Product positioning: [docs/positioning.md](docs/positioning.md) / [docs/positioning.ko.md](docs/positioning.ko.md)
 - Release checklist: [docs/release.md](docs/release.md) / [docs/release.ko.md](docs/release.ko.md)
-- v0.7.1 release note: [docs/releases/v0.7.1.md](docs/releases/v0.7.1.md) / [docs/releases/v0.7.1.ko.md](docs/releases/v0.7.1.ko.md)
+- v0.7.6 release note: [docs/releases/v0.7.6.md](docs/releases/v0.7.6.md) / [docs/releases/v0.7.6.ko.md](docs/releases/v0.7.6.ko.md)
+- Security hardening: [docs/security-hardening.md](docs/security-hardening.md) / [docs/security-hardening.ko.md](docs/security-hardening.ko.md)
+- Operating runbook: [docs/operations.md](docs/operations.md) / [docs/operations.ko.md](docs/operations.ko.md)
 - Run on Android (Termux): [docs/termux-setup.md](docs/termux-setup.md) / [docs/termux-setup.ko.md](docs/termux-setup.ko.md)
 
 ## License
