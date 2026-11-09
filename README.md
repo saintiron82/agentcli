@@ -474,17 +474,17 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 # -> ["lean"]   (sandbox_mode is supported, lean is not)
 ```
 
-| Capability | claude | codex | copilot | kiro |
-|---|---|---|---|---|
-| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
-| `streaming` | ✅ | ✅ | ✅ | ✅ |
-| `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ |
-| `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ |
-| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ |
-| `effort` (reasoning intensity) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
-| `thinking` (visibility) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
-| claude-only options | `env` (tier), `lean`, `isolated`, `partial_messages` | — | — | — |
+| Capability | claude | codex | copilot | kiro | exaone (unofficial) |
+|---|---|---|---|---|---|
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (block) | ✅ (native delta) | ❌ | ❌ |
+| `session_recovery` (auto-reopen) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `debug` (chunk-timeline trace) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `effort` (reasoning intensity) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — | `low`/`high`/`max` (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) |
+| `thinking` (visibility) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — | — (always streamed) |
+| claude-only options | `env` (tier), `lean`, `isolated`, `partial_messages` | — | — | — | — |
 
 `debug` instruments both paths on claude/codex/copilot: streaming records a
 per-chunk timeline, and `invoke`/`invoke_async` record an argv/rc/latency/stderr-length
@@ -508,6 +508,42 @@ rewritten. See [security hardening status](docs/security-hardening.md).
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` result `sessionId`; transport = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider` drives `kiro-cli acp` (line-delimited JSON-RPC 2.0) as one-shot turns per call: `initialize` → first turn `session/new` / resume `session/load(stored sessionId)` → `session/prompt` → `session/update` stream. Token usage comes from `usage_update` notifications; permissions are auto-answered via `session/request_permission` (`trust_all`/`trust_tools`). Authentication uses `KIRO_API_KEY` (or `kiro-cli login`).
+
+#### Unofficial providers
+
+`ExaoneProvider` (`provider_id="exaone"`) is **unofficial and opt-in**. K-EXAONE
+has no vendor CLI, so it drives exaone-cli (separate repository, not yet
+published), an unofficial
+CLI (not an LG AI Research product) that calls the EXAONE API and owns the
+session history. agentcli talks to `exaone acp` exactly like `kiro-cli acp`. It
+is not in `create_default_registry()` or the fallback order:
+
+```python
+from agentcli.providers.exaone import ExaoneProvider
+registry.register(ExaoneProvider())            # model k-exaone_v2.5 by default
+client.chat("...", provider="exaone", effort="high")
+```
+
+Authentication is the `EXAONE_API_KEY` environment variable, or
+`AuthProfile(exaone_api_key=...)` in service mode. Limits: conversation only (no
+tools or file access yet), no per-call key, no quota lookup, no debug trace.
+Tool, file and permission callbacks are off by default.
+
+- **Model.** The model is passed as `--model=<id>`; aliases such as `default`
+  resolve to `k-exaone_v2.5`. On direct provider calls `LLMResponse.model`
+  carries the resolved id, unlike claude/codex/copilot, which echo the raw
+  argument.
+- **Without a profile (legacy path).** The child gets the host environment as
+  is, including `EXAONE_API_KEY`, `EXAONE_BASE_URL` and `~/.exaone-cli`. A direct
+  `provider.invoke()` outside a profile-bound client uses host auth. Under a
+  profile `EXAONE_BASE_URL` cannot be set, so the default endpoint is always used.
+- **`health_check()`.** If `exaone --version` fails the status is `cli_error`;
+  with no key it is `auth_required`. Under an auth profile without `probe` it is
+  `configured`. In legacy mode with a key and no `probe` it is `ok` with
+  `auth_ok=None` (key set but unverified). `probe=True` runs one real turn and
+  consumes tokens. It is safe inside an event loop (it runs on a worker
+  thread) but still blocks the caller; in async hosts call it via
+  `asyncio.to_thread`.
 
 `ClaudeProvider` runs `claude -p` with native session resume on every platform:
 the first call mints a fresh `--session-id`, the library stores it, and later

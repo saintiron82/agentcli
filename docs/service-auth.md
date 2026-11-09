@@ -64,6 +64,7 @@ performance record below and explains request-local credential/path snapshots.
 | Claude | `claude_oauth_token` OR `claude_api_key`; otherwise local `claude/.credentials.json` | `CLAUDE_CONFIG_DIR=<root>/claude` |
 | Codex | `codex_api_key`; otherwise local `codex/auth.json` | `CODEX_HOME=<root>/codex`, file credential storage forced |
 | Copilot | explicit `github_token` | `COPILOT_HOME=<root>/copilot`, `GH_CONFIG_DIR=<root>/gh` |
+| EXAONE (unofficial) | explicit `exaone_api_key` | `EXAONE_HOME=<root>/exaone`; host `EXAONE_BASE_URL` is not inherited |
 | Kiro/custom providers | unsupported in this version | rejected; no global-auth fallback |
 
 Native CLI conventions are documented by
@@ -79,6 +80,10 @@ refresh them. Copilot requires an explicit token rather than OS keychain/gh disc
 The standalone Copilot CLI is preferred; a gh wrapper may need its extension
 installed in the profile-specific gh directory. Never provision it by switching
 the shared machine login.
+
+EXAONE has no login; only an explicit API key is accepted, never the host
+`EXAONE_API_KEY`. Profiles prepared before this version must call `prepare()`
+again to create the `exaone` directory.
 
 ## Environment and lifecycle rules
 

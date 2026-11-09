@@ -24,6 +24,11 @@ _EFFORT_MAP = {
     "codex":   {"minimal": ("minimal", False), "low": ("low", False),
                 "medium": ("medium", False), "high": ("high", False),
                 "xhigh": ("high", True), "max": ("high", True)},
+    # EXAONE (unofficial, via exaone-cli) has low/high/max. medium rounds up:
+    # equidistant from low and high, and under-reasoning is the worse failure.
+    "exaone":  {"minimal": ("low", True), "low": ("low", False),
+                "medium": ("high", True), "high": ("high", False),
+                "xhigh": ("max", True), "max": ("max", False)},
 }
 # copilot thinking 은 불리언 — "on" 은 --enable-reasoning-summaries 를 뜻하는
 # sentinel(값 없는 플래그). claude 는 토글이 없어 표가 비어 있다(미지원).
@@ -33,6 +38,8 @@ _THINKING_MAP = {
                 "detailed": ("on", True)},
     "codex":   {"off": ("none", False), "concise": ("concise", False),
                 "detailed": ("detailed", False)},
+    # EXAONE always reasons and always streams it; no visibility toggle.
+    "exaone":  {},
 }
 
 
