@@ -12,6 +12,7 @@ import contextlib
 import logging
 import shutil
 import time
+from abc import abstractmethod
 from contextlib import aclosing
 from pathlib import Path
 from typing import AsyncIterator
@@ -20,6 +21,7 @@ from ..auth_context import provider_environment
 from ..filesystem import safe_workspace_path
 from ..launchers import prepare_subprocess_command
 from ..processes import attach_process_job
+from ..reasoning import ReasoningResolution, needs_event, to_dict
 from ..types import (ERROR_BINARY_MISSING, LLMResponse, Message, StreamChunk, TokenUsage,
                      classify_error)
 from ..utils import build_env
@@ -28,13 +30,22 @@ from .base import (LLMProvider, _drain_stderr, _kill_process_group, _new_session
                    build_session_prompt)
 from .base import estimate_payload_prompt_tokens as _estimate
 
-logger = logging.getLogger(__name__)
-
 # ACP protocol constants
 _PROTOCOL_VERSION = 1
 _DONE = object()  # 큐 종료 센티넬
 
+# session/update kinds that carry conversation content. The ACP spec makes an
+# agent replay the stored conversation as these during session/load; received
+# before session/prompt they are history, not output of this turn. usage_update
+# is dropped there too so replayed usage does not overwrite this turn's usage.
+_PRE_PROMPT_DROPPED = frozenset({
+    "user_message_chunk", "agent_message_chunk", "agent_thought_chunk",
+    "tool_call", "tool_call_update", "usage_update",
+})
 
+
+# `source` defaults to Kiro's value so the original two-argument call
+# `_map_session_update(update, usage)` (imported from providers.kiro) keeps working.
 def _map_session_update(update: dict, usage: TokenUsage,
                         source: str = "kiro_cli_reported") -> list[StreamChunk]:
     """ACP session/update.update 1개를 정규화 청크로 변환 + usage 누적.
@@ -63,7 +74,19 @@ def _map_session_update(update: dict, usage: TokenUsage,
 
 
 class AcpProvider(LLMProvider):
-    """Base for providers that drive an `<binary> acp` style agent over stdio."""
+    """Base for providers that drive an `<binary> acp` style agent over stdio.
+
+    Subclass contract:
+      Required: class attributes `provider_id`, `binary_name`, `usage_source`;
+        methods `_command(binary, model, reasoning)`, `health_check`, `list_models`.
+      Optional: `_legacy_environment()` (child env when no auth profile is bound)
+        and `_map_update(update, usage)` (extra per-update mapping).
+      A subclass that adds call options (for example `effort` / `thinking`) must
+      override `invoke`, `invoke_async` and `stream_async` explicitly, because
+      capabilities are derived from those signatures, and must forward the
+      resolved reasoning to `_invoke` / `_stream`. `_stream` emits the reasoning
+      event itself, so those overrides need no other behavior.
+    """
 
     supports_sessions = True
     supports_streaming = True
@@ -90,13 +113,22 @@ class AcpProvider(LLMProvider):
     # Subclass hooks
     # ------------------------------------------------------------------
 
-    def _command(self, binary: str, model: str, reasoning) -> list[str]:
-        """argv for one turn. `reasoning` is a ReasoningResolution or None."""
-        raise NotImplementedError
+    @abstractmethod
+    def _command(self, binary: str, model: str,
+                 reasoning: "ReasoningResolution | None") -> list[str]:
+        """argv for one turn."""
 
     def _legacy_environment(self) -> dict:
         """Child env when no auth profile is bound."""
         return build_env()
+
+    def _child_env(self) -> dict:
+        """Environment for the agent subprocess (and subclass health checks)."""
+        return provider_environment(self.provider_id, self._legacy_environment)
+
+    @property
+    def _logger(self) -> logging.Logger:
+        return logging.getLogger(f"agentcli.providers.{self.provider_id}")
 
     def _map_update(self, update: dict, usage: TokenUsage) -> list[StreamChunk]:
         return _map_session_update(update, usage, self.usage_source)
@@ -199,6 +231,11 @@ class AcpProvider(LLMProvider):
 
     async def _stream(self, messages, *, model, timeout, session_id, cwd,
                       idle_timeout, wall_timeout, reasoning) -> AsyncIterator[StreamChunk]:
+        # The one place the reasoning event is emitted, so _invoke and
+        # stream_async callers see identical chunks.
+        if reasoning is not None and needs_event(reasoning):
+            yield StreamChunk(type="event", data={"reasoning": to_dict(reasoning),
+                                                  "provider": self.provider_id})
         if not self._find_binary():
             yield StreamChunk(type="error", content=f"{self.binary_name} not found",
                               data={"error_type": ERROR_BINARY_MISSING,
@@ -229,7 +266,8 @@ class AcpProvider(LLMProvider):
                     with contextlib.suppress(Exception, asyncio.CancelledError):
                         await task
 
-    def _subprocess_conn_factory(self, model: str, cwd: str | None, reasoning=None):
+    def _subprocess_conn_factory(self, model: str, cwd: str | None,
+                                 reasoning: "ReasoningResolution | None" = None):
         """Return (factory, state) for spawning the real agent subprocess.
 
         factory(on_request, on_notification) -> AcpConnection
@@ -250,8 +288,7 @@ class AcpProvider(LLMProvider):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd, env=provider_environment(self.provider_id, self._legacy_environment),
-                    limit=8 * 1024 * 1024,
+                    cwd=cwd, env=self._child_env(), limit=8 * 1024 * 1024,
                     **_new_session_kwargs())
                 attach_process_job(proc)
                 proc_box["proc"] = proc
@@ -270,7 +307,7 @@ class AcpProvider(LLMProvider):
                 proc_box["reader"] = asyncio.create_task(reader())
                 if proc.stderr is not None:
                     proc_box["stderr"] = asyncio.create_task(
-                        _drain_stderr(proc.stderr, [], logger, self.provider_id, debug=False))
+                        _drain_stderr(proc.stderr, [], self._logger, self.provider_id, debug=False))
                 return proc
 
             async def write_line(line: str) -> None:
@@ -299,15 +336,18 @@ class AcpProvider(LLMProvider):
         usage = TokenUsage(payload_prompt_tokens=_estimate(prompt),
                            prompt_tokens_reliable=False,
                            prompt_tokens_source=self.usage_source)
-        # "prompting" flips to True right before session/prompt is sent. The
-        # ACP spec makes agents replay the whole conversation as session/update
-        # during session/load; those replayed updates are history, not output
-        # of this turn, so they are dropped.
+        # "prompting" flips to True right before session/prompt is sent. Until
+        # then, content updates (_PRE_PROMPT_DROPPED) are replayed history from
+        # session/load and are dropped; every other kind (available_commands_update,
+        # current_mode_update, ...) is forwarded as before.
         state = {"session_id": session_id, "prompting": False}
 
         async def on_notification(method: str, params: dict) -> None:
-            if method == "session/update" and state["prompting"]:
-                for ch in self._map_update(params.get("update") or {}, usage):
+            if method == "session/update":
+                update = params.get("update") or {}
+                if not state["prompting"] and update.get("sessionUpdate") in _PRE_PROMPT_DROPPED:
+                    return
+                for ch in self._map_update(update, usage):
                     await queue.put(ch)
 
         async def on_request(method: str, params: dict) -> dict:
@@ -344,9 +384,7 @@ class AcpProvider(LLMProvider):
                     "sessionId": state["session_id"],
                     "prompt": [{"type": "text", "text": prompt}]})
                 await queue.put((_DONE, res.get("stopReason", "")))
-            except AcpError as exc:
-                await queue.put((_DONE, exc))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001  (AcpError included)
                 await queue.put((_DONE, exc))
 
         start = time.monotonic()
@@ -460,7 +498,7 @@ class AcpProvider(LLMProvider):
             raise PermissionError("File reads are disabled")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None or not target.is_file():
-            logger.warning("%s fs/read 거부", self.provider_id)
+            self._logger.warning("%s fs/read 거부", self.provider_id)
             return {"content": ""}
         try:
             with target.open("rb") as source:
@@ -488,7 +526,7 @@ class AcpProvider(LLMProvider):
             raise ValueError("File content exceeds max_file_bytes or is not text")
         target = self._within_cwd(params.get("path", ""), cwd)
         if target is None:
-            logger.warning("%s fs/write 거부", self.provider_id)
+            self._logger.warning("%s fs/write 거부", self.provider_id)
             raise PermissionError("File write outside the workspace is denied")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
