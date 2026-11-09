@@ -53,6 +53,15 @@ Strings that today say "kiro-cli not found" / "kiro stream error" become
 `f"{binary_name} not found"` / `f"{provider_id} stream error"` — same text for
 Kiro.
 
+Bug fix carried by the extraction: per the ACP spec an agent **replays the
+whole conversation as `session/update` notifications during `session/load`**.
+The current Kiro driver maps every `session/update` it receives during the turn,
+so on resume the replayed history would be emitted as new `text`/`thinking`
+chunks and folded into the response. The base driver drops `session/update`
+notifications that arrive before `session/prompt` is sent. This also fixes
+Kiro (its scripted test agent does not replay, so existing tests are
+unaffected); a new test with a replaying agent pins it.
+
 Guard: the full existing Kiro test suite (`test_kiro_provider.py`,
 `test_kiro_coverage.py`, `test_kiro_security.py`, ACP helpers, registry and
 capability tests) must pass **without edits**. `kiro.py` re-imports any moved
@@ -81,8 +90,10 @@ class ExaoneProvider(AcpProvider):
   value is passed as `--reasoning-effort`; the `done` chunk carries the
   `ReasoningResolution` like the other providers.
 - `thinking` is unsupported (EXAONE always reasons; reasoning is always streamed
-  as `thinking` chunks). Passing `thinking` → the existing "unsupported level"
-  error path (empty thinking map, same as Claude).
+  as `thinking` chunks). The empty thinking map makes `resolve_thinking` return
+  `supported=False` (no exception), exactly like Claude: it is reported in
+  `LLMResponse.reasoning` and as a streaming `event` chunk, never applied.
+  `invoke`/`stream_async` therefore accept both `effort` and `thinking`.
 - `list_models()` → `[{"id": "k-exaone_v2.5", "name": "K-EXAONE 2.5",
   "aliases": ["default"]}]`. Model selector is passed through non-strictly
   (unknown IDs are forwarded; the API decides).
