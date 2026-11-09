@@ -124,11 +124,15 @@ worse failure). Thinking map for `exaone`: empty (unsupported).
 ## 6. Health check
 
 - Binary missing → `binary_missing` (same as Kiro).
-- `exaone --version` → version string.
-- `auth_ok`: `True` if the effective child env has a non-empty
-  `EXAONE_API_KEY`, else `False` with message "EXAONE_API_KEY not set". No
-  network call unless `probe=True`, in which case one minimal turn is run
-  (consumes tokens; documented).
+- `exaone --version` → version string; a nonzero exit is `cli_error`.
+- No key in the effective child env → `auth_required`, `auth_ok=False`,
+  message "EXAONE_API_KEY not set".
+- Key present, no probe: under an auth profile, `configured_health` (same as
+  Codex/Copilot, `status="configured"`); without a profile, `ok=True`,
+  `auth_ok=None` (set but unverified).
+- `probe=True` runs one minimal turn (consumes tokens; documented). It is
+  safe to call from inside a running event loop (the probe runs on a worker
+  thread with the copied context, so the auth profile scope is kept).
 - Works with and without an auth profile.
 
 ## 7. Service auth profile
@@ -148,9 +152,16 @@ worse failure). Thinking map for `exaone`: empty (unsupported).
   EXAONE variable.
 - `binding` unchanged in shape; the key is never in `public_dict()`.
 
-Without a profile (legacy path): the child inherits the host env via
-`build_env`, so a host `EXAONE_API_KEY` and `~/.exaone-cli` are used — same
-model as Kiro and the other legacy providers, documented.
+Without a profile (legacy path): the child inherits the host environment as is
+(`dict(os.environ)`; unlike `build_env` it never adds a token via
+`gh auth token`), so a host `EXAONE_API_KEY`, `EXAONE_BASE_URL` and
+`~/.exaone-cli` are used — the same model as the other legacy providers, and
+documented. A direct `provider.invoke()` outside a profile-bound client
+therefore uses host auth.
+
+Under a profile, `EXAONE_BASE_URL` cannot be set (the `EXAONE_` prefix guard
+blocks it in `extra_env`), so profiles always use the default endpoint. An
+explicit `exaone_base_url` field is a possible later extension.
 
 Per-call API key: not offered in this version.
 
