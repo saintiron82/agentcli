@@ -512,7 +512,8 @@ rewritten. See [security hardening status](docs/security-hardening.md).
 #### Unofficial providers
 
 `ExaoneProvider` (`provider_id="exaone"`) is **unofficial and opt-in**. K-EXAONE
-has no vendor CLI, so it drives exaone-cli (separate repository), an unofficial
+has no vendor CLI, so it drives exaone-cli (separate repository, not yet
+published), an unofficial
 CLI (not an LG AI Research product) that calls the EXAONE API and owns the
 session history. agentcli talks to `exaone acp` exactly like `kiro-cli acp`. It
 is not in `create_default_registry()` or the fallback order:
@@ -540,8 +541,9 @@ Tool, file and permission callbacks are off by default.
   with no key it is `auth_required`. Under an auth profile without `probe` it is
   `configured`. In legacy mode with a key and no `probe` it is `ok` with
   `auth_ok=None` (key set but unverified). `probe=True` runs one real turn and
-  consumes tokens. It is blocking even inside an event loop, because it runs on
-  a worker thread; in async hosts call it via `asyncio.to_thread`.
+  consumes tokens. It is safe inside an event loop (it runs on a worker
+  thread) but still blocks the caller; in async hosts call it via
+  `asyncio.to_thread`.
 
 `ClaudeProvider` runs `claude -p` with native session resume on every platform:
 the first call mints a fresh `--session-id`, the library stores it, and later

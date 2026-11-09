@@ -632,7 +632,7 @@ stderr 원문을 길이 표시로 바꾼다. 자동 provider 실패 로그에는
 
 `ExaoneProvider`(`provider_id="exaone"`)는 **비공식이며 직접 등록해야 합니다**.
 K-EXAONE에는 공식 CLI가 없어서, EXAONE API를 호출하고 세션 히스토리를 직접 관리하는
-별도의 비공식 CLI exaone-cli(별도 저장소, LG AI연구원 제품 아님)를 구동합니다.
+별도의 비공식 CLI exaone-cli(별도 저장소, 아직 공개 전, LG AI연구원 제품 아님)를 구동합니다.
 agentcli는 `kiro-cli acp`와 같은 방식으로 `exaone acp`와 통신합니다.
 `create_default_registry()`와 fallback 순서에는 들어가지 않습니다.
 
@@ -657,8 +657,8 @@ client.chat("...", provider="exaone", effort="high")
   `auth_required`입니다. 인증 프로필에서 `probe` 없이 호출하면 `configured`입니다.
   legacy 모드에서 키가 있고 `probe`가 없으면 `ok`이며 `auth_ok=None`(키는 설정됐으나
   검증 안 됨)입니다. `probe=True`는 실제 턴을 한 번 실행하며 토큰을 소비합니다.
-  워커 스레드에서 실행되므로 이벤트 루프 안에서도 블로킹입니다. async 호스트에서는
-  `asyncio.to_thread`로 호출하십시오.
+  워커 스레드에서 실행되므로 이벤트 루프 안에서도 호출할 수 있지만, 호출한 쪽은 끝날
+  때까지 막힙니다. async 호스트에서는 `asyncio.to_thread`로 호출하십시오.
 
 `ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 spawn 경로도 CLI가 읽을 수 있는 stdin을 열어두지 않습니다 — 서브프로세스 헬퍼가 `stdin=DEVNULL`을 설정하거나, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30)입니다. 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
 

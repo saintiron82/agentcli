@@ -87,8 +87,9 @@ class ExaoneProvider(AcpProvider):
   Kiro; re-evaluated in stage 2).
 - `invoke` / `stream_async` gain `effort: str | None = None` (call value wins,
   constructor default otherwise, via `_resolve_reasoning`). The resolved native
-  value is passed as `--reasoning-effort`; the `done` chunk carries the
-  `ReasoningResolution` like the other providers.
+  value is passed as `--reasoning-effort`. The resolution is set on
+  `LLMResponse.reasoning`, and a clamp or unsupported level is announced by an
+  `event` chunk emitted first by the shared ACP driver.
 - `thinking` is unsupported (EXAONE always reasons; reasoning is always streamed
   as `thinking` chunks). The empty thinking map makes `resolve_thinking` return
   `supported=False` (no exception), exactly like Claude: it is reported in
@@ -194,7 +195,7 @@ Offline:
   (`write_fake_cli_launcher`) implementing the ACP subset: new session, resume
   via `session/load`, stale-ID recovery, thought/text chunk order, usage,
   stop reason, command line contains `--model`/`--reasoning-effort` with the
-  mapped value, `thinking` rejected, each error prefix → `error_type`,
+  mapped value, `thinking` reported unsupported, each error prefix → `error_type`,
   binary missing, not in default registry.
 - Auth profile: env contains only the profile key and `EXAONE_HOME`; host
   `EXAONE_API_KEY` / `EXAONE_BASE_URL` not leaked; `extra_env` rejects

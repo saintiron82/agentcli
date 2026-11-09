@@ -33,11 +33,14 @@
 - **Unofficial, opt-in `ExaoneProvider`.** Drives the separate exaone-cli
   (separate repository; `exaone acp`, ACP over stdio) for K-EXAONE 2.5.
   Sessions, streaming (`thinking` + `text`), usage, `effort` mapped to
-  `low`/`high`/`max` (`medium`→`high`, `xhigh`→`max`, reported as clamped).
+  `low`/`high`/`max` (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`,
+  reported as clamped).
   Not registered by default. The model is passed as `--model=<id>` with aliases
   resolved, so direct provider calls report the resolved id in
   `LLMResponse.model`. Service profiles gain `exaone_api_key` and a private
-  `EXAONE_HOME`; profiles prepared earlier must call `prepare()` again.
+  `EXAONE_HOME`; profiles prepared earlier must call `prepare()` again before
+  using exaone. Service profiles now reject any `EXAONE_*` variable in
+  `extra_env` (a profile that passed one there fails at construction).
   `health_check()` reports `cli_error` when `exaone --version` fails,
   `configured` under a profile without `probe`, and `ok` with `auth_ok=None`
   for a legacy-mode key without `probe`; `probe=True` runs one real turn.

@@ -15,7 +15,7 @@ Conventions for every task:
 - Worktree `D:\BProject\agentcli\agentcli-exaone`, branch `feat/exaone-provider`. Run commands from there.
 - `pytest` means the agentcli dev environment (`pip install -e ".[dev]"` in this worktree if not done).
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- Do not bump the version. Do not use the words "고아"/"orphan".
+- Do not bump the version. Follow the CLAUDE.md terminology rule.
 - Korean and English docs change together.
 
 ---
