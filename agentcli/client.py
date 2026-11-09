@@ -459,7 +459,7 @@ class LLMClient:
         if self._auth_profile is None or profile.binding != self._auth_profile.binding:
             raise AuthProfileError("Rotation must preserve the service profile identity and root")
         if any(profile.method(pid) != self._auth_profile.method(pid)
-               for pid in ("claude", "codex", "copilot")):
+               for pid in ("claude", "codex", "copilot", "exaone")):
             raise AuthProfileError("Rotation cannot change authentication methods")
         profile._check_marker()
         self._auth_profile = profile

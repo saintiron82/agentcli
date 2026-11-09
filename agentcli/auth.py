@@ -18,7 +18,7 @@ _BASE_ENV = frozenset({"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
                       "TZ", "TERM", "COLORTERM", "NO_COLOR", "CI", "SSL_CERT_FILE",
                       "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "HTTP_PROXY",
                       "ALL_PROXY", "NO_PROXY"})
-_AUTH_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "AGENTCLI_CLAUDE_", "COPILOT_", "CODEX_")
+_AUTH_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "AGENTCLI_CLAUDE_", "COPILOT_", "CODEX_", "EXAONE_")
 _RESERVED_ENV = frozenset({"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
                           "LOCALAPPDATA", "XDG_CONFIG_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL",
                           "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
@@ -39,6 +39,7 @@ class AuthProfile:
     github_token: str | None = field(default=None, repr=False)
     disabled_providers: frozenset[str] = field(default_factory=frozenset)
     extra_env: Mapping[str, str] = field(default_factory=dict, repr=False)
+    exaone_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         additions = dict(self.extra_env)
@@ -49,7 +50,7 @@ class AuthProfile:
                 raise AuthProfileError("Invalid or reserved service environment override")
         object.__setattr__(self, "extra_env", MappingProxyType(additions))
         disabled = frozenset(self.disabled_providers)
-        if not disabled.issubset({"claude", "codex", "copilot"}):
+        if not disabled.issubset({"claude", "codex", "copilot", "exaone"}):
             raise AuthProfileError("Invalid disabled provider")
         object.__setattr__(self, "disabled_providers", disabled)
         if not isinstance(self.profile_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", self.profile_id):
@@ -61,7 +62,8 @@ class AuthProfile:
             raise AuthProfileError("Auth profile root must not be a filesystem root")
         safe_workspace_path(path.parent, path)
         object.__setattr__(self, "root", str(path.resolve()))
-        for name in ("claude_oauth_token", "claude_api_key", "codex_api_key", "github_token"):
+        for name in ("claude_oauth_token", "claude_api_key", "codex_api_key", "github_token",
+                     "exaone_api_key"):
             token = getattr(self, name)
             if token is not None:
                 if (not isinstance(token, str) or not token.strip()
@@ -76,7 +78,7 @@ class AuthProfile:
         return {"profile_id": self.profile_id, "root": os.path.normcase(self.root)}
 
     def directory(self, provider):
-        if provider not in ("claude", "codex", "copilot", "gh", "home"):
+        if provider not in ("claude", "codex", "copilot", "exaone", "gh", "home"):
             raise AuthProfileError("Provider does not support service authentication profiles")
         root = Path(self.root)
         return safe_workspace_path(root, root / provider)
@@ -113,7 +115,7 @@ class AuthProfile:
         finally:
             Path(temporary).unlink(missing_ok=True)
         self._check_marker()
-        for provider in ("claude", "codex", "copilot", "gh", "home"):
+        for provider in ("claude", "codex", "copilot", "exaone", "gh", "home"):
             path = self.directory(provider)
             path.mkdir(mode=0o700, exist_ok=True)
             self._check_private(path)
@@ -151,6 +153,8 @@ class AuthProfile:
             return "api_key" if self.codex_api_key is not None else "file"
         if provider == "copilot":
             return "github_token"
+        if provider == "exaone":
+            return "api_key"
         raise AuthProfileError("Provider does not support service authentication profiles")
 
     def claude_credentials(self):
@@ -182,6 +186,8 @@ class AuthProfile:
             return auth
         elif provider == "copilot" and self.github_token is None:
             raise AuthProfileError("Service GitHub token is required; gh/global login is not used")
+        elif provider == "exaone" and self.exaone_api_key is None:
+            raise AuthProfileError("Service EXAONE API key is required; the host EXAONE_API_KEY is not used")
         return {}
 
     def environment(self, provider):
@@ -220,6 +226,9 @@ class AuthProfile:
             env["COPILOT_GITHUB_TOKEN"] = self.github_token
             env["GH_TOKEN"] = self.github_token
             env["GITHUB_TOKEN"] = self.github_token
+        elif provider == "exaone":
+            env["EXAONE_HOME"] = str(self.directory("exaone"))
+            env["EXAONE_API_KEY"] = self.exaone_api_key
         return env
 
     def public_dict(self):
