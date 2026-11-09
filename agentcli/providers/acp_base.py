@@ -40,7 +40,7 @@ _DONE = object()  # 큐 종료 센티넬
 # is dropped there too so replayed usage does not overwrite this turn's usage.
 _PRE_PROMPT_DROPPED = frozenset({
     "user_message_chunk", "agent_message_chunk", "agent_thought_chunk",
-    "tool_call", "tool_call_update", "usage_update",
+    "tool_call", "tool_call_update", "usage_update", "plan",
 })
 
 

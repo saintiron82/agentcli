@@ -121,6 +121,8 @@ class ScriptedAgent:
             await self._text(sid, "agent_message_chunk", "OLD ANSWER")
             await self._update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1"})
             await self._update(sid, {"sessionUpdate": "usage_update", "used": 999, "size": 1000})
+            await self._update(sid, {"sessionUpdate": "plan", "entries": [
+                {"content": "old step", "priority": "medium", "status": "completed"}]})
             if self._load_fails:
                 await self._send({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": -32002, "message": "session not found"}})
@@ -171,6 +173,14 @@ async def test_stale_load_fallback_leaks_no_replay():
     assert done.type == "done" and done.content == "NEW"
     assert done.session_id == "new-sid"
     assert done.usage.prompt_tokens == 0  # replayed usage_update was not folded
+
+
+@pytest.mark.asyncio
+async def test_plan_replayed_during_load_is_dropped():
+    chunks = await _turn(KiroProvider(), "prev-sid", scripted_factory())
+    assert [(c.type, c.content) for c in chunks if c.type != "done"] == [("text", "NEW")]
+    assert not any(c.type == "event" and c.data.get("sessionUpdate") == "plan" for c in chunks)
+    assert chunks[-1].session_id == "prev-sid"
 
 
 @pytest.mark.asyncio
