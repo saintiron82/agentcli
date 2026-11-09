@@ -64,6 +64,7 @@ alias가 필요하며 자동으로 가져오지 않습니다. metadata에는 프
 | Claude | `claude_oauth_token` 또는 `claude_api_key`; 없으면 로컬 `claude/.credentials.json` | `CLAUDE_CONFIG_DIR=<root>/claude` |
 | Codex | `codex_api_key`; 없으면 로컬 `codex/auth.json` | `CODEX_HOME=<root>/codex`, 파일 인증 저장 강제 |
 | Copilot | 명시적 `github_token` | `COPILOT_HOME=<root>/copilot`, `GH_CONFIG_DIR=<root>/gh` |
+| EXAONE (비공식) | 명시적 `exaone_api_key` | `EXAONE_HOME=<root>/exaone`; 호스트 `EXAONE_BASE_URL`은 상속하지 않음 |
 | Kiro·커스텀 provider | 이번 버전 미지원 | 거부하며 공용 인증으로 전환하지 않음 |
 
 네이티브 CLI 규약은
@@ -78,6 +79,10 @@ Claude 파일 인증은 access token으로 읽으며 AgentCli는 갱신하지 �
 OS keychain·gh 인증 검색 대신 명시적인 토큰이 필요합니다. standalone Copilot을
 권장하며 gh wrapper는 서비스별 gh 경로에 extension 설치가 필요할 수 있습니다.
 공용 머신 로그인을 전환하는 방식으로 준비하지 마십시오.
+
+EXAONE에는 로그인이 없어 명시적인 API 키만 받고 호스트의 `EXAONE_API_KEY`는 쓰지
+않습니다. 이 버전 이전에 준비한 프로필은 `prepare()`를 다시 호출해 `exaone`
+디렉터리를 만들어야 합니다.
 
 ## 환경·수명 규칙
 

@@ -594,17 +594,17 @@ client.unsupported_options("codex", {"lean": True, "sandbox_mode": "..."})
 # -> ["lean"]   (sandbox_mode 는 지원, lean 은 미지원)
 ```
 
-| Capability | claude | codex | copilot | kiro |
-|---|---|---|---|---|
-| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ |
-| `streaming` | ✅ | ✅ | ✅ | ✅ |
-| `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ |
-| `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ |
-| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ |
-| `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ |
-| `effort` (입력 다이얼) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — |
-| `thinking` (출력 가시성) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — |
-| claude 전용 옵션 | `env`(티어), `lean`, `isolated`, `partial_messages` | — | — | — |
+| Capability | claude | codex | copilot | kiro | exaone (비공식) |
+|---|---|---|---|---|---|
+| `sessions` (resume) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `streaming` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `token_streaming` | ✅ (`partial_messages`) | ❌ (블록) | ✅ (네이티브 delta) | ❌ | ❌ |
+| `session_recovery` (자동 재개) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `session_liveness` (`session_alive`) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `debug` (청크 타임라인 trace) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `effort` (입력 다이얼) | `low`–`max` | `minimal`–`high` (`xhigh`/`max`→`high`) | `minimal`–`max` | — | `low`/`high`/`max` (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) |
+| `thinking` (출력 가시성) | — | `off`/`concise`/`detailed` | boolean (`concise`=`detailed`) | — | — (항상 스트리밍) |
+| claude 전용 옵션 | `env`(티어), `lean`, `isolated`, `partial_messages` | — | — | — | — |
 
 `debug` 는 claude/codex/copilot 의 **양쪽 경로**를 계측한다: 스트리밍은 청크
 타임라인을, `invoke`/`invoke_async` 는 argv·rc·latency·stderr 길이 trace 를 남긴다.
@@ -627,6 +627,38 @@ stderr 원문을 길이 표시로 바꾼다. 자동 provider 실패 로그에는
 | `KiroProvider` | ✅ (ACP `session/load`) | ✅ | `session/new` 결과의 `sessionId`; 전송 계층 = ACP JSON-RPC over stdio (`kiro-cli acp`) |
 
 `KiroProvider`는 `kiro-cli acp`(줄 단위 JSON-RPC 2.0)를 호출당 1회 one-shot turn으로 구동합니다: `initialize` → 첫 턴 `session/new` / 재개 `session/load(저장된 sessionId)` → `session/prompt` → `session/update` 스트림. 토큰 usage는 `usage_update` 알림에서, 권한은 `session/request_permission` 자동응답(`trust_all`/`trust_tools`)으로 처리합니다. 인증은 `KIRO_API_KEY`(또는 `kiro-cli login`).
+
+#### 비공식 provider
+
+`ExaoneProvider`(`provider_id="exaone"`)는 **비공식이며 직접 등록해야 합니다**.
+K-EXAONE에는 공식 CLI가 없어서, EXAONE API를 호출하고 세션 히스토리를 직접 관리하는
+별도의 비공식 CLI exaone-cli(별도 저장소, LG AI연구원 제품 아님)를 구동합니다.
+agentcli는 `kiro-cli acp`와 같은 방식으로 `exaone acp`와 통신합니다.
+`create_default_registry()`와 fallback 순서에는 들어가지 않습니다.
+
+```python
+from agentcli.providers.exaone import ExaoneProvider
+registry.register(ExaoneProvider())            # 기본 모델 k-exaone_v2.5
+client.chat("...", provider="exaone", effort="high")
+```
+
+인증은 `EXAONE_API_KEY` 환경 변수, 서비스 모드에서는
+`AuthProfile(exaone_api_key=...)`입니다. 제한: 대화만 지원(도구·파일 접근 없음),
+호출별 키 없음, 사용량 조회 없음, debug trace 없음. 도구·파일·권한 콜백은 기본으로 꺼져 있습니다.
+
+- **모델.** 모델은 `--model=<id>`로 전달되며 `default` 같은 별칭은 `k-exaone_v2.5`로
+  해석됩니다. provider를 직접 호출하면 `LLMResponse.model`에 해석된 id가 담깁니다.
+  입력값을 그대로 돌려주는 claude/codex/copilot과 다릅니다.
+- **프로필 없이 쓸 때(legacy 경로).** 자식 프로세스는 호스트 환경을 그대로 받습니다.
+  `EXAONE_API_KEY`, `EXAONE_BASE_URL`, `~/.exaone-cli`도 포함됩니다. 프로필에 묶인
+  client 밖에서 `provider.invoke()`를 직접 호출하면 호스트 인증을 씁니다. 프로필 안에서는
+  `EXAONE_BASE_URL`을 지정할 수 없어 항상 기본 엔드포인트를 사용합니다.
+- **`health_check()`.** `exaone --version`이 실패하면 `cli_error`, 키가 없으면
+  `auth_required`입니다. 인증 프로필에서 `probe` 없이 호출하면 `configured`입니다.
+  legacy 모드에서 키가 있고 `probe`가 없으면 `ok`이며 `auth_ok=None`(키는 설정됐으나
+  검증 안 됨)입니다. `probe=True`는 실제 턴을 한 번 실행하며 토큰을 소비합니다.
+  워커 스레드에서 실행되므로 이벤트 루프 안에서도 블로킹입니다. async 호스트에서는
+  `asyncio.to_thread`로 호출하십시오.
 
 `ClaudeProvider`는 모든 플랫폼에서 `claude -p`로 네이티브 세션 resume을 지원합니다: 첫 호출에서 `--session-id`를 발급하고, 이후 같은 conversation에서는 `--resume <sid>`로 재개합니다(Claude Code 2.1.x에서 검증). 과거 Windows hang(issue #4)은 인터랙티브 **stdin** 대기가 원인이었는데, 지금은 어느 spawn 경로도 CLI가 읽을 수 있는 stdin을 열어두지 않습니다 — 서브프로세스 헬퍼가 `stdin=DEVNULL`을 설정하거나, 8,000 UTF-8 바이트 초과 프롬프트는 write 후 즉시 닫는 `stdin=PIPE`(issue #30)입니다. 따라서 그 대기가 발생할 수 없어 Windows 가드를 제거했고(issue #27), Windows 11 / Claude Code 2.1.220에서 end-to-end 검증했습니다(일반·8KB 초과 stdin·MCP-on resume 모두 세션 연속성 유지, hang 없음).
 

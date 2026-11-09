@@ -3,6 +3,13 @@
 ## unreleased
 
 ### Fixed
+- **ACP resume no longer re-emits history.** Per the ACP spec an agent replays
+  the conversation as `session/update` during `session/load`. The driver now
+  drops content-kind updates and `plan`/`usage_update` received before
+  `session/prompt`, so a resumed Kiro (or EXAONE) turn returns only the new
+  answer and replayed usage cannot overwrite this turn's usage. Other update
+  kinds received at that point are still forwarded. The ACP driver moved to
+  `providers/acp_base.py`; `KiroProvider`'s API and logger name are unchanged.
 - **codex works again on codex-cli 0.149+ — `--full-auto` demoted to a
   no-op (issue #76).** 0.149 removed the flag outright (0.139 only warned
   deprecated), and with `full_auto=True` as the constructor default —
@@ -23,6 +30,17 @@
   `-c approval_policy="<value>"` (accepted on 0.139.0, verified live).
 
 ### Added
+- **Unofficial, opt-in `ExaoneProvider`.** Drives the separate exaone-cli
+  (separate repository; `exaone acp`, ACP over stdio) for K-EXAONE 2.5.
+  Sessions, streaming (`thinking` + `text`), usage, `effort` mapped to
+  `low`/`high`/`max` (`medium`→`high`, `xhigh`→`max`, reported as clamped).
+  Not registered by default. The model is passed as `--model=<id>` with aliases
+  resolved, so direct provider calls report the resolved id in
+  `LLMResponse.model`. Service profiles gain `exaone_api_key` and a private
+  `EXAONE_HOME`; profiles prepared earlier must call `prepare()` again.
+  `health_check()` reports `cli_error` when `exaone --version` fails,
+  `configured` under a profile without `probe`, and `ok` with `auth_ok=None`
+  for a legacy-mode key without `probe`; `probe=True` runs one real turn.
 - **Structured-output guarantee — `output_schema` (issue #72).** The
   missing half of the "AI as a component" contract: input plumbing was
   done, output shape wasn't — every consuming app hand-rolled fence
