@@ -54,7 +54,7 @@ def test_invalid_exaone_key_rejected(tmp_path, bad):
 def test_profile_prepared_before_exaone_existed_needs_prepare_again(tmp_path):
     p = prof(tmp_path, exaone_api_key="K")
     (Path(p.root) / "exaone").rmdir()
-    with pytest.raises(AuthProfileError):
+    with pytest.raises(AuthProfileError, match=r"EXAONE directory is missing; call prepare\(\) again"):
         p.environment("exaone")
     p.prepare()
     assert p.environment("exaone")["EXAONE_API_KEY"] == "K"
@@ -68,3 +68,24 @@ def test_rotation_keeps_exaone_method(tmp_path):
     p = prof(tmp_path, exaone_api_key="K1")
     client = LLMClient(MemoryStore(), ProviderRegistry(), auth_profile=p)
     client.set_auth_profile(replace(p, exaone_api_key="K2"))  # same method: allowed
+    assert client._auth_profile.environment("exaone")["EXAONE_API_KEY"] == "K2"
+
+
+def test_rotation_to_no_exaone_key_does_not_fall_back_to_host(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from agentcli import LLMClient, MemoryStore
+    from agentcli.providers.registry import ProviderRegistry
+    monkeypatch.setenv("EXAONE_API_KEY", "HOST_KEY")
+    p = prof(tmp_path, exaone_api_key="K1")
+    client = LLMClient(MemoryStore(), ProviderRegistry(), auth_profile=p)
+    client.set_auth_profile(replace(p, exaone_api_key=None))  # method is still api_key
+    with pytest.raises(AuthProfileError):
+        client._auth_profile.environment("exaone")
+
+
+def test_missing_directory_message_is_only_for_exaone(tmp_path):
+    p = prof(tmp_path, codex_api_key="K")
+    (Path(p.root) / "codex").rmdir()
+    with pytest.raises(AuthProfileError, match="Service authentication directory is unavailable"):
+        p.environment("codex")

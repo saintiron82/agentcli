@@ -174,6 +174,9 @@ class AuthProfile:
             raise AuthProfileError("Authentication for this service provider is disabled")
         self._check_marker()
         self.method(provider)
+        if provider == "exaone" and not self.directory("exaone").is_dir():
+            # Profiles prepared before exaone support existed lack this directory.
+            raise AuthProfileError("Service EXAONE directory is missing; call prepare() again")
         self._check_private(self.directory(provider))
         if provider == "claude" and self.claude_api_key is None:
             return self.claude_credentials()

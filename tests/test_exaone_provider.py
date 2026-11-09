@@ -24,6 +24,9 @@ with open(LOG, "a", encoding="utf-8") as fh:
                          "home": os.environ.get("EXAONE_HOME"),
                          "base": os.environ.get("EXAONE_BASE_URL"),
                          "gh": os.environ.get("GITHUB_TOKEN")}) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("exaone 0.0.0-fake")
+    sys.exit(1 if MODE == "version_fail" else 0)
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\\n")
@@ -116,7 +119,7 @@ def test_new_session_streams_thinking_text_usage_and_reports_clamp(fake_exaone, 
     assert (done.usage.prompt_tokens, done.usage.completion_tokens, done.usage.total_tokens) == (12, 5, 17)
     assert done.usage.prompt_tokens_source == "exaone_cli_reported"
     call = calls(log)[0]
-    assert call["argv"] == ["acp", "--model", "k-exaone_v2.5", "--reasoning-effort", "high"]
+    assert call["argv"] == ["acp", "--model=k-exaone_v2.5", "--reasoning-effort=high"]
     assert call["key"] == "HOST_KEY" and call["gh"] is None
 
 
@@ -140,7 +143,7 @@ def test_invoke_folds_and_reports_reasoning(fake_exaone, tmp_path):
     assert (r.content, r.error, r.session_id) == ("Hello", "", NEW_ID)
     assert r.reasoning.effort.applied == "max"
     assert r.reasoning.thinking.supported is False
-    assert calls(log)[-1]["argv"][-2:] == ["--reasoning-effort", "max"]
+    assert calls(log)[-1]["argv"][-1] == "--reasoning-effort=max"
 
 
 def test_no_effort_means_no_flag_and_model_override(fake_exaone, tmp_path):
@@ -148,8 +151,22 @@ def test_no_effort_means_no_flag_and_model_override(fake_exaone, tmp_path):
     p = provider(binary)
     p.invoke([Message(role="user", content="hi")], cwd=str(tmp_path))
     p.invoke([Message(role="user", content="hi")], model="other-model", cwd=str(tmp_path))
-    assert calls(log)[0]["argv"] == ["acp", "--model", "k-exaone_v2.5"]
-    assert calls(log)[1]["argv"] == ["acp", "--model", "other-model"]
+    assert calls(log)[0]["argv"] == ["acp", "--model=k-exaone_v2.5"]
+    assert calls(log)[1]["argv"] == ["acp", "--model=other-model"]
+
+
+def test_model_alias_resolves_and_dash_model_stays_one_token(fake_exaone, tmp_path):
+    binary, log = fake_exaone()
+    r = provider(binary).invoke([Message(role="user", content="hi")], model="default",
+                                cwd=str(tmp_path))
+    assert r.model == "k-exaone_v2.5"
+    provider(binary, model="default").invoke([Message(role="user", content="hi")],
+                                             cwd=str(tmp_path))
+    chunks = stream(provider(binary), model="--help", cwd=str(tmp_path))
+    assert chunks[-1].type == "done"
+    assert [c["argv"] for c in calls(log)] == [
+        ["acp", "--model=k-exaone_v2.5"], ["acp", "--model=k-exaone_v2.5"],
+        ["acp", "--model=--help"]]
 
 
 @pytest.mark.parametrize("message,expected", [
@@ -215,10 +232,98 @@ def test_health_without_key_is_auth_required(fake_exaone, monkeypatch):
     assert (h.ok, h.status, h.auth_ok, h.error_type) == (False, "auth_required", False, ERROR_AUTH)
 
 
-def test_health_with_key_is_ok(fake_exaone):
+def test_health_with_key_is_ok_but_unverified(fake_exaone):
     binary, _ = fake_exaone()
     h = provider(binary).health_check()
-    assert (h.ok, h.status, h.auth_ok) == (True, "ok", True)
+    assert (h.ok, h.status, h.auth_ok) == (True, "ok", None)
+    assert h.version == "exaone 0.0.0-fake"
+    assert h.message == "EXAONE_API_KEY set; use probe=True to verify it"
+
+
+def test_health_version_failure_is_cli_error(fake_exaone):
+    binary, _ = fake_exaone(mode="version_fail")
+    h = provider(binary).health_check()
+    assert (h.ok, h.status, h.auth_ok, h.exit_code) == (False, "cli_error", None, 1)
+
+
+def profile_client(binary, tmp_path):
+    auth = AuthProfile("svc", str(tmp_path / "svc"), exaone_api_key="PROFILE_KEY").prepare()
+    reg = ProviderRegistry()
+    reg.register(provider(binary))
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    return LLMClient(MemoryStore(), reg, auth_profile=auth), str(ws)
+
+
+def assert_profile_child(call, tmp_path, key="PROFILE_KEY"):
+    assert call["key"] == key
+    assert call["home"] == str((tmp_path / "svc").resolve() / "exaone")
+    assert call["base"] is None
+
+
+def test_health_under_profile_without_probe_is_configured(fake_exaone, tmp_path):
+    binary, log = fake_exaone()
+    client, _ = profile_client(binary, tmp_path)
+    h = client.health_check("exaone")
+    assert (h.ok, h.status, h.auth_ok) == (True, "configured", None)
+    assert_profile_child(calls(log)[-1], tmp_path)
+
+
+def test_probe_inside_running_loop_uses_profile(fake_exaone, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAONE_BASE_URL", "https://host-proxy.example/v1")
+    binary, log = fake_exaone()
+    client, ws = profile_client(binary, tmp_path)
+
+    async def main():
+        return client.health_check("exaone", probe=True, cwd=ws)
+
+    h = asyncio.run(main())
+    assert h.ok is True, h
+    assert calls(log)[-1]["argv"][0] == "acp"
+    assert_profile_child(calls(log)[-1], tmp_path)
+
+
+def test_probe_inside_running_loop_without_profile(fake_exaone, tmp_path):
+    binary, log = fake_exaone()
+
+    async def main():
+        return provider(binary).health_check(probe=True, cwd=str(tmp_path))
+
+    h = asyncio.run(main())
+    assert h.ok is True, h
+    assert calls(log)[-1]["key"] == "HOST_KEY"
+
+
+def test_profile_reaches_child_via_chat_async(fake_exaone, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAONE_BASE_URL", "https://host-proxy.example/v1")
+    binary, log = fake_exaone()
+    client, ws = profile_client(binary, tmp_path)
+    r = asyncio.run(client.chat_async("hi", provider="exaone", cwd=ws))
+    assert r.error == "" and r.content == "Hello"
+    assert_profile_child(calls(log)[-1], tmp_path)
+
+
+def test_profile_reaches_child_via_chat_stream(fake_exaone, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAONE_BASE_URL", "https://host-proxy.example/v1")
+    binary, log = fake_exaone()
+    client, ws = profile_client(binary, tmp_path)
+
+    async def collect():
+        return [c async for c in client.chat_stream("hi", provider="exaone", cwd=ws)]
+
+    chunks = asyncio.run(collect())
+    assert [c.content for c in chunks if c.type == "text"] == ["Hello"]
+    assert_profile_child(calls(log)[-1], tmp_path)
+
+
+def test_rotated_profile_key_reaches_child(fake_exaone, tmp_path):
+    from dataclasses import replace
+    binary, log = fake_exaone()
+    client, ws = profile_client(binary, tmp_path)
+    client.set_auth_profile(replace(client._auth_profile, exaone_api_key="ROTATED_KEY"))
+    r = client.chat("hi", provider="exaone", cwd=ws)
+    assert r.error == ""
+    assert_profile_child(calls(log)[-1], tmp_path, key="ROTATED_KEY")
 
 
 def test_health_binary_missing():

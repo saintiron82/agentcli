@@ -5,11 +5,14 @@ conversation history; this provider only runs `exaone acp` turns. Opt-in: it is
 not part of create_default_registry().
 """
 import asyncio
+import contextvars
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing
 from typing import AsyncIterator
 
 from ..auth import AuthProfileError
+from ..auth_context import configured_health, current_auth_profile
 from ..types import (ERROR_AUTH, ERROR_BINARY_MISSING, LLMResponse, Message, ProviderHealth,
                      StreamChunk, TokenUsage)
 from .acp_base import AcpProvider
@@ -46,18 +49,25 @@ class ExaoneProvider(AcpProvider):
 
     # -- hooks --------------------------------------------------------------
     def _command(self, binary: str, model: str, reasoning) -> list[str]:
+        # `--flag=value` single tokens: a value starting with "-" cannot be
+        # parsed by exaone-cli (argparse) as another flag.
         cmd = [binary, "acp"]
         if model:
-            cmd += ["--model", model]
+            cmd.append(f"--model={model}")
         effort = reasoning.effort if reasoning is not None else None
         if effort is not None and effort.applied:
-            cmd += ["--reasoning-effort", effort.applied]
+            cmd.append(f"--reasoning-effort={effort.applied}")
         return cmd
 
     def _legacy_environment(self) -> dict:
-        # Host env as is; unlike build_env() this never runs `gh auth token`,
-        # so no GitHub token is handed to exaone-cli.
+        # Host env passes through as with the other legacy providers, but unlike
+        # build_env() this never ADDS a token obtained via `gh auth token`.
         return dict(os.environ)
+
+    def _effective_model(self, model: str) -> str:
+        """Call argument or constructor default, aliases resolved (non-strict)."""
+        selector = model or self._model
+        return self.resolve_model(selector) if selector else ""
 
     def _map_update(self, update: dict, usage: TokenUsage) -> list[StreamChunk]:
         chunks = super()._map_update(update, usage)
@@ -87,7 +97,7 @@ class ExaoneProvider(AcpProvider):
                            effort: str | None = None,
                            thinking: str | None = None) -> LLMResponse:
         _, _, reasoning = self._resolve_reasoning(effort, thinking)
-        return await self._invoke(messages, model=model, timeout=timeout,
+        return await self._invoke(messages, model=self._effective_model(model), timeout=timeout,
                                   session_id=session_id, cwd=cwd, reasoning=reasoning)
 
     async def stream_async(self, messages: list[Message], *,
@@ -99,7 +109,8 @@ class ExaoneProvider(AcpProvider):
                            thinking: str | None = None) -> AsyncIterator[StreamChunk]:
         _, _, reasoning = self._resolve_reasoning(effort, thinking)
         async with aclosing(self._stream(
-                messages, model=model, timeout=timeout, session_id=session_id, cwd=cwd,
+                messages, model=self._effective_model(model), timeout=timeout,
+                session_id=session_id, cwd=cwd,
                 idle_timeout=idle_timeout, wall_timeout=wall_timeout,
                 reasoning=reasoning)) as stream:
             async for chunk in stream:
@@ -128,16 +139,34 @@ class ExaoneProvider(AcpProvider):
                 message=str(exc))
         version_proc = run_health_command([binary, "--version"], timeout=timeout, env=env)
         version = (version_proc.stdout or version_proc.stderr).strip()
+        if version_proc.returncode:
+            return configured_health(self.provider_id, binary, version, version_proc.returncode)
         if not (env.get("EXAONE_API_KEY") or "").strip():
             return ProviderHealth(
                 provider=self.provider_id, ok=False, status="auth_required",
                 available=True, binary=binary, version=version, auth_ok=False,
                 error_type=ERROR_AUTH, message="EXAONE_API_KEY not set")
         if probe:
-            resp = self.invoke([Message(role="user", content="Reply exactly OK.")],
-                               timeout=timeout, cwd=cwd)
+            resp = self._probe(timeout=timeout, cwd=cwd)
             return health_from_response(self.provider_id, resp, binary=binary, version=version)
+        if current_auth_profile() is not None:
+            return configured_health(self.provider_id, binary, version, version_proc.returncode)
         return ProviderHealth(
             provider=self.provider_id, ok=True, status="ok", available=True,
-            binary=binary, version=version, auth_ok=True,
-            message="EXAONE_API_KEY configured; use probe=True to verify it")
+            binary=binary, version=version, auth_ok=None,
+            message="EXAONE_API_KEY set; use probe=True to verify it")
+
+    def _probe(self, *, timeout: int, cwd: str | None) -> LLMResponse:
+        """One minimal turn. Safe inside a running event loop: invoke() uses
+        asyncio.run, so it then runs on a worker thread in a copied context,
+        which keeps the request's auth profile scope."""
+        def call() -> LLMResponse:
+            return self.invoke([Message(role="user", content="Reply exactly OK.")],
+                               timeout=timeout, cwd=cwd)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return call()
+        ctx = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(ctx.run, call).result()
